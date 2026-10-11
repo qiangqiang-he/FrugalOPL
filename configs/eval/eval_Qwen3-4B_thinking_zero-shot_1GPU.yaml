@@ -1,5 +1,7 @@
-extends: eval_Qwen3-4B_thinking_1GPU.yaml
-
+# Evaluation profile; inherits only common defaults.
+extends: ../common/eval_thinking_1GPU.yaml
 run:
   name: eval_qwen3_4b_aime_2024_thinking_zero_shot
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-4B
   output_dir: outputs/Qwen3-4B_thinking/zero-shot

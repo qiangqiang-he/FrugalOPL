@@ -495,6 +495,9 @@ class Controller:
                 "policy_version": self._last_policy_version,
                 "questions": questions,
                 "answers": answers,
+                # Preserve prompt-level metadata (for example privileged
+                # solutions) without teaching the framework algorithm fields.
+                "records": copy.deepcopy(records),
             }
             serialized.append(pickle.dumps(signals, protocol=pickle.HIGHEST_PROTOCOL))
             new_entries.append((batch_id, {"sequence": sequence, "record_count": len(records)}))
@@ -668,6 +671,7 @@ class Controller:
                     "policy_version": self._last_policy_version,
                     "questions": questions,
                     "answers": answers,
+                    "records": copy.deepcopy(records),
                 }
                 lpush = getattr(client, "lpush", None)
                 if not callable(lpush):

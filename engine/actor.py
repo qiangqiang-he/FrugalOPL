@@ -866,8 +866,8 @@ class Actor:
         if not isinstance(produced, Mapping):
             raise TypeError(f"Actor plugin hook {hook_name!r} must return a mapping.")
         additions = dict(produced)
-        if "questions" in additions or "answers" in additions:
-            raise ValueError(f"Actor plugin hook {hook_name!r} may not replace Controller questions or answers.")
+        if any(key in additions for key in ("questions", "answers", "records")):
+            raise ValueError(f"Actor plugin hook {hook_name!r} may not replace Controller questions, answers, or records.")
         if "traj" in additions:
             raise ValueError(f"Actor plugin hook {hook_name!r} may not create 'traj'; Actor owns generic rollouts.")
 
@@ -912,17 +912,18 @@ class Actor:
     def process_evaluation_batch(self, signals: Signals) -> Signals:
         """Compatibility entry point for Redis-delivered evaluation batches.
 
-        Controller's existing evaluation contract is a pair of ``questions``
-        and ``answers`` lists.  The public offline API below deliberately
-        accepts complete records instead, which lets a template request any
-        matching dataset field such as ``{solution}`` or ``{answer}``.
+        Controller preserves complete dataset records so templates can use
+        any original field. Older callers without ``records`` retain the
+        question/answer compatibility path.
         """
 
         source = self._validate_controller_signals(signals)
-        records = [
-            {"question": question, "answer": answer}
-            for question, answer in zip(source["questions"], source["answers"])
-        ]
+        records = source.get("records")
+        if records is None:
+            records = [
+                {"question": question, "answer": answer}
+                for question, answer in zip(source["questions"], source["answers"])
+            ]
         generated = self.generate_evaluation_rollouts(records)
         result: Signals = dict(source)
         result["traj"] = generated["traj"]
@@ -1163,7 +1164,18 @@ class Actor:
 
     @staticmethod
     def _validate_controller_signals(signals: Signals) -> Signals:
-        controller_questions_and_answers(signals)
+        questions, answers = controller_questions_and_answers(signals)
+        if "records" in signals:
+            records = signals["records"]
+            if not isinstance(records, list) or len(records) != len(questions):
+                raise ValueError("Controller records must be a list aligned with questions and answers.")
+            if any(
+                not isinstance(record, Mapping)
+                or record.get("question") != questions[index]
+                or record.get("answer") != answers[index]
+                for index, record in enumerate(records)
+            ):
+                raise ValueError("Controller records must preserve the matching question and answer fields.")
         return dict(signals)
 
     def _normalize_return_signals(

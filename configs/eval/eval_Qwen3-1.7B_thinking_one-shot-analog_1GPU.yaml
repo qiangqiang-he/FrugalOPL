@@ -1,7 +1,7 @@
+# Evaluation profile; inherits only common defaults.
 extends:
-  - eval_Qwen3-1.7B_thinking_1GPU.yaml
-  - eval_one-shot-analog.yaml
-
+- ../common/eval_thinking_1GPU.yaml
+- ../common/eval_one-shot-analog.yaml
 run:
   name: eval_qwen3_1_7b_aime_2024_thinking_one_shot_analog
   output_dir: outputs/Qwen3-1.7B_thinking/one-shot-analog

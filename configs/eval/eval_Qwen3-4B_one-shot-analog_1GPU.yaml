@@ -1,7 +1,12 @@
+# Evaluation profile; inherits only common defaults.
 extends:
-  - eval_Qwen3-4B_1GPU.yaml
-  - eval_one-shot-analog.yaml
-
+- ../common/eval_1GPU.yaml
+- ../common/eval_one-shot-analog.yaml
 run:
   name: eval_qwen3_4b_aime_2024_one_shot_analog_dialogue
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-4B
   output_dir: outputs/Qwen3-4B_Nothinking/one-shot-analog-dialogue
+actor:
+  engine:
+    gpu_memory_utilization: 0.58

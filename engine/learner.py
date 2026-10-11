@@ -11,9 +11,9 @@ dictionaries and call two worker-local helpers inherited from
     shard no-grad probe work across ranks and small physical chunks.
 
 ``self.compute_logits(batch, mode=...)``
-    Runs only inside ``compute_objective`` on the current training
-    micro-batch.  It returns token-aligned signals, never full-vocabulary
-    logits.
+    Scores a complete logical batch without gradients in the signal hook,
+    or the current single-rollout micro-batch inside ``compute_objective``.
+    It returns token-aligned signals, never full-vocabulary logits.
 
 No algorithm code receives a Learner, Redis client, rank, CUDA device, or
 DeepSpeed engine.
@@ -501,13 +501,15 @@ class Learner:
         self.gpu_id = gpu_id
         self.gpu_gate = gpu_gate if gpu_gate is not None else GpuGate(physical_gpu_id=gpu_id)
         self.device = torch.device(device) if device is not None else self._default_device()
-        self.plugin = plugin
+        self.plugin: AlgorithmPlugin | None = None
         self.tokenizer: object | None = None
         self.model: torch.nn.Module | None = None
         self.model_engine: object | None = None
         self.optimizer: object | None = None
         self.lr_scheduler: object | None = None
         self.lora_enabled = bool(_mapping(self.policy_cfg.get("lora", {}), "run.policy.lora").get("enabled", False))
+        if plugin is not None:
+            self.set_plugin(plugin)
         self.global_step = 0
         self._initialized = False
         self._model_on_gpu = False
@@ -541,6 +543,8 @@ class Learner:
     def set_plugin(self, plugin: AlgorithmPlugin) -> None:
         if not isinstance(plugin, AlgorithmPlugin):
             raise TypeError("plugin must inherit AlgorithmPlugin.")
+        if plugin.requires_frozen_reference and not self.lora_enabled:
+            raise ValueError(f"{type(plugin).__name__} requires LoRA to keep its reference Teacher fixed.")
         self.plugin = plugin
 
     def queue_keys(self) -> dict[str, str]:
@@ -1034,7 +1038,7 @@ class Learner:
         gathered: list[list[tuple[int, float, float]] | None]
         if _distributed_active():
             gathered = [None for _ in range(self.world_size)]
-            dist.all_gather_object(gathered, local_results, device=self.device)
+            dist.all_gather_object(gathered, local_results)
         else:
             gathered = [local_results]
 
@@ -1241,6 +1245,70 @@ class Learner:
         if callable(head):
             return head
         raise RuntimeError("Learner model must expose an lm_head.")
+
+    def _plugin_collect_logits(
+        self,
+        batch: Signals,
+        *,
+        mode: str,
+        prompts: Sequence[str] | None,
+        prompt_ids: object | None,
+        return_signals: Mapping[str, object] | None,
+    ) -> Signals:
+        """Score a logical batch before training and restore ragged CPU order."""
+
+        if mode not in {"reference", "policy_no_grad"}:
+            raise ValueError("Learner signal collection permits only no-gradient compute_logits modes.")
+        if prompts is not None and prompt_ids is not None:
+            raise ValueError("Use either prompts or prompt_ids, not both.")
+        logical = self._normalize_logical_signals(batch)
+        total = int(logical["rollout_count"])
+        required = _normalize_logit_signals(return_signals)
+        overrides: list[torch.Tensor] | None = None
+        if prompts is not None:
+            if isinstance(prompts, (str, bytes)) or not isinstance(prompts, Sequence):
+                raise TypeError("prompts must be a sequence of rendered prompt strings.")
+            if len(prompts) != total:
+                raise ValueError("Signal-hook prompts must contain one rendered prompt per rollout.")
+        if prompt_ids is not None:
+            overrides = _as_ragged_token_list(prompt_ids, "prompt_ids")
+            if len(overrides) != total:
+                raise ValueError("Signal-hook prompt_ids must contain one prompt per rollout.")
+
+        local: list[tuple[int, dict[str, torch.Tensor]]] = []
+        with self._bounded_sdpa_context():
+            for index in _balanced_indices(total, self.world_size, self.rank):
+                micro_batch = self._build_rollout_micro_batch(logical, index)
+                computed = self._plugin_compute_logits(
+                    micro_batch,
+                    mode=mode,
+                    prompts=[prompts[index]] if prompts is not None else None,
+                    prompt_ids=[overrides[index]] if overrides is not None else None,
+                    return_signals=required,
+                )
+                local.append((index, {
+                    key: value.detach().cpu().squeeze(0).contiguous()
+                    for key, value in computed.items()
+                }))
+
+        gathered: list[object | None]
+        if _distributed_active():
+            gathered = [None for _ in range(self.world_size)]
+            dist.all_gather_object(gathered, local)
+        else:
+            gathered = [local]
+        ordered: list[dict[str, torch.Tensor] | None] = [None] * total
+        for rank_results in gathered:
+            for index, signals in rank_results or []:
+                if not 0 <= index < total or ordered[index] is not None:
+                    raise RuntimeError("Learner collected duplicate or invalid rollout indices.")
+                ordered[index] = signals
+        if any(signals is None for signals in ordered):
+            raise RuntimeError("Learner signal collection did not return every rollout.")
+        keys = tuple(ordered[0])
+        if any(set(signals) != set(keys) for signals in ordered):
+            raise RuntimeError("Learner signal collection returned inconsistent fields across rollouts.")
+        return {key: [signals[key] for signals in ordered] for key in keys}
 
     def _plugin_compute_logits(
         self,
@@ -1557,7 +1625,7 @@ class Learner:
         # Controller fields are prompt-level metadata even when P happens to
         # equal R, so never infer rollout alignment from their coincidental
         # length.
-        if key in {"questions", "answers", "actor_metrics"}:
+        if key in {"questions", "answers", "records", "actor_metrics"}:
             return copy.deepcopy(value)
         if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.size(0)) == total:
             return value.detach().cpu()[rollout_index : rollout_index + 1].contiguous()
@@ -1758,7 +1826,6 @@ class Learner:
                     "metric_sums": metric_sums,
                     "metric_weights": metric_weights,
                 },
-                device=self.device,
             )
             objective_sum = 0.0
             objective_weight = 0.0

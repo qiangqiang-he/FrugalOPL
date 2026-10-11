@@ -9,6 +9,8 @@ tokens.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 
 MATH_PROMPT = r"""Solve the problem step by step. Put the final answer in \boxed{{...}}.
 
@@ -53,6 +55,23 @@ MATH_ONESHOT_MESSAGES = (
 
 
 
+def render_prompt_from_record(template: str, record: Mapping[str, object], /) -> str:
+    """Fill named placeholders from a complete item without filtering its data.
+
+    Python's ordinary format-map semantics use only the fields referenced by
+    the template. Extra fields, including nested metadata, remain untouched.
+    """
+
+    if not isinstance(template, str):
+        raise TypeError("Prompt templates must be strings.")
+    if not isinstance(record, Mapping):
+        raise TypeError("Prompt records must be mappings.")
+    try:
+        return template.format_map(record)
+    except KeyError as error:
+        raise ValueError(f"Missing prompt variable {error.args[0]!r}.") from error
+
+
 def render_prompt(template: str, /, **variables: str) -> str:
     """Render a prompt template from non-empty named text variables.
 
@@ -83,4 +102,5 @@ __all__ = [
     "MATH_ONESHOT_MESSAGES",
     "OPSD_TEACHER_PROMPT",
     "render_prompt",
+    "render_prompt_from_record",
 ]

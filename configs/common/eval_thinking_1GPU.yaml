@@ -1,0 +1,13 @@
+# Shared Thinking-mode evaluation defaults; experiments select their own model and outputs.
+extends: eval_1GPU.yaml
+actor:
+  engine:
+    max_model_len: 24576
+    gpu_memory_utilization: 0.78
+  evaluation:
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    enable_thinking: true
+    save_rollouts: true
+    generation:
+      max_response_length: 20480

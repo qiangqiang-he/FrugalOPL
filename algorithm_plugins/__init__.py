@@ -11,6 +11,7 @@ from .plugin_registry import (
 from .actor_test_plugin import ActorTestPlugin
 from .grpo_plugin import GRPOPlugin
 from .pg_opd_plugin import PGOPDPlugin
+from .pg_opsd_plugin import PGOPSDPlugin
 from .rlvr_plugin import RLVRPlugin
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "GRPOPlugin",
     "Metrics",
     "PGOPDPlugin",
+    "PGOPSDPlugin",
     "RLVRPlugin",
     "Signals",
     "plugin_class_from_name",

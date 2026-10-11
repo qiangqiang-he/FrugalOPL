@@ -144,8 +144,16 @@ def plugin_factory_from_config(config: Mapping[str, object]) -> ConfiguredPlugin
 
     if not isinstance(config, Mapping):
         raise TypeError("config must be a mapping.")
+    plugin_name = _configured_plugin_name(config)
+    plugin_class = plugin_class_from_name(plugin_name)
+    if plugin_class.requires_frozen_reference:
+        run = config.get("run", {})
+        policy = run.get("policy", {}) if isinstance(run, Mapping) else {}
+        lora = policy.get("lora", {}) if isinstance(policy, Mapping) else {}
+        if not isinstance(lora, Mapping) or lora.get("enabled") is not True:
+            raise ValueError(f"{plugin_name} requires run.policy.lora.enabled=true to keep its reference Teacher fixed.")
     return plugin_factory_from_name(
-        _configured_plugin_name(config),
+        plugin_name,
         resolve_algorithm_runtime_config(config),
     )
 

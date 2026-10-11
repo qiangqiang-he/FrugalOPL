@@ -46,6 +46,16 @@ class _PluginRuntime(Protocol):
         return_signals: Mapping[str, object] | None,
     ) -> Signals: ...
 
+    def _plugin_collect_logits(
+        self,
+        batch: Signals,
+        *,
+        mode: str,
+        prompts: Sequence[str] | None,
+        prompt_ids: object | None,
+        return_signals: Mapping[str, object] | None,
+    ) -> Signals: ...
+
 
 @dataclass(frozen=True)
 class _PluginScope:
@@ -99,6 +109,8 @@ class AlgorithmPlugin:
     logical batch outside the plugin.  Plugins need implement only the methods
     named by their own pipeline.
     """
+
+    requires_frozen_reference: bool = False
 
     @classmethod
     def from_runtime_config(
@@ -169,9 +181,14 @@ class AlgorithmPlugin:
         ``mode``.  It then uses the Teacher's sole no-grad forward and returns
         detached, rollout-aligned signals for the complete logical batch.
 
-        Learner calls are available only while the configured objective runs.
-        Their supplied ``batch`` contains exactly one rollout: all model
-        tensors retain an explicit leading dimension of ``1`` and contain no
+        In the Learner signal hook, only ``reference`` and ``policy_no_grad``
+        are allowed. They score the complete logical batch and return ragged
+        lists of detached CPU tensors in rollout order; prompt overrides have
+        one entry per rollout. The engine owns sharding and single-rollout
+        forwards, so the plugin does not split the batch itself.
+
+        During the configured objective, ``batch`` contains exactly one
+        rollout: all model tensors retain a leading dimension of ``1`` and contain no
         cross-rollout padding.  Prompt and response masks remain present for
         a uniform signal interface, and are all ``True``. Plugins never
         manage batch size, device, gradient accumulation, or distributed
@@ -213,8 +230,16 @@ class AlgorithmPlugin:
                 "mode must be 'reference', 'policy_no_grad', or 'policy_grad'; "
                 f"got {mode!r}."
             )
-        if scope.phase != "objective":
-            raise RuntimeError("compute_logits() is only available in the configured Learner objective.")
+        if scope.phase == "collect":
+            if mode == "policy_grad":
+                raise RuntimeError("policy_grad compute_logits() is only available in the configured Learner objective.")
+            return scope.runtime._plugin_collect_logits(
+                dict(batch),
+                mode=mode,
+                prompts=prompts,
+                prompt_ids=prompt_ids,
+                return_signals=dict(return_signals) if return_signals is not None else None,
+            )
         return scope.runtime._plugin_compute_logits(
             dict(batch),
             mode=mode,

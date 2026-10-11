@@ -1,25 +1,2 @@
-# Shared Qwen3-1.7B Thinking-mode evaluation settings.
-# Individual condition files extend this preset and only choose their prompt
-# condition plus a distinct run/output name.
-
-extends: ../common/eval_1GPU.yaml
-
-run:
-  policy:
-    model_name_or_path: ~/projects/models/Qwen3-1.7B
-
-actor:
-  engine:
-    # 20,480 generated tokens plus room for the rendered user prompt and
-    # Qwen chat-template tokens.  The 0.78 reservation stays below the
-    # requested 42 GB whole-device ceiling on the local 48 GB GPU.
-    max_model_len: 24576
-    gpu_memory_utilization: 0.78
-
-  evaluation:
-    rollouts_per_batch: 64
-    rollouts_per_prompt: 8
-    enable_thinking: true
-    save_rollouts: true
-    generation:
-      max_response_length: 20480
+# Evaluation profile; inherits only common defaults.
+extends: ../common/eval_thinking_1GPU.yaml

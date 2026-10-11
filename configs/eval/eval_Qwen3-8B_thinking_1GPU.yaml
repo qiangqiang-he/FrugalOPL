@@ -1,18 +1,7 @@
-# Shared Qwen3-8B Thinking-mode settings.  The base 8B evaluation owns the
-# model path and standard AIME rollout contract; this overlay changes only the
-# Thinking-specific generation and vLLM capacity settings.
-
-extends: eval_Qwen3-8B_1GPU.yaml
-
-actor:
-  engine:
-    # 20,480 generated tokens plus prompt/chat-template room.
-    # 0.78 reserves 38,329 MiB on the local 49,140 MiB GPU, retaining more
-    # than the mandatory 3 GB safety floor at Actor startup.
-    max_model_len: 24576
-    gpu_memory_utilization: 0.78
-
-  evaluation:
-    enable_thinking: true
-    generation:
-      max_response_length: 20480
+# Evaluation profile; inherits only common defaults.
+extends: ../common/eval_thinking_1GPU.yaml
+run:
+  name: eval_qwen3_8b_aime_2024_zero_shot
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-8B
+  output_dir: outputs/Qwen3-8B_Nothinking/zero-shot

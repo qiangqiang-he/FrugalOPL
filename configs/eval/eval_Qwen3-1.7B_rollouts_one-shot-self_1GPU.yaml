@@ -1,12 +1,10 @@
-# Save one response per problem with that problem's worked solution as example.
-extends: eval_Qwen3-1.7B_one-shot-self_1GPU.yaml
-
+# Evaluation profile; inherits only common defaults.
+extends:
+- ../common/eval_1GPU.yaml
+- ../common/eval_one-shot-self.yaml
 run:
   name: qwen3_1_7b_rollouts_one_shot_self
   output_dir: outputs/Qwen3-1.7B_rollouts/one-shot-self
-
 actor:
   evaluation:
-    rollouts_per_batch: 64
     rollouts_per_prompt: 1
-    save_rollouts: true

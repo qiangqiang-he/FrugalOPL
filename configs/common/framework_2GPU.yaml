@@ -76,8 +76,8 @@ worker_defaults:
 controller:
   max_steps: 2
   train_prompt_batch_size: 2
-  # Keep up to four logical batches in flight so Actor can submit their
-  # rollouts together in one vLLM generation turn.
+  # Keep four logical batches in flight; Actor and Learner each process two
+  # batches per turn on their dedicated devices.
   max_inflight_batches: 4
   queue_poll_timeout_sec: 1
   # Controller owns dataset loading and turns records into Worker signals.
@@ -99,15 +99,17 @@ actor:
     # This capacity leaves prompt/template room for the default 16384-token
     # evaluation completion ceiling.
     max_model_len: 20480
-    # Actor has GPU 0 to itself, so reserve 90% for vLLM while retaining the
-    # mandatory 3 GB free-memory safety floor.
-    gpu_memory_utilization: 0.90
+    # Dedicated 24 GiB RTX 4090: vLLM reserves about 19.2 GiB, leaving 4.8 GiB
+    # for CUDA/runtime allocations and the default 3 GiB free-memory floor.
+    # Startup checks use actual free memory and refuse an unsafe reservation.
+    gpu_memory_utilization: 0.80
     tensor_parallel_size: 1
     # CUDA Graph capture is the default vLLM generation path.
     enforce_eager: false
-    # One independent vLLM Actor process is launched per gpu_ids entry.  After
-    # taking the shared-GPU Gate, it processes this many logical batches.
-    max_batches_per_turn: 4
+    # One independent vLLM Actor process is launched per gpu_ids entry.
+    # For GRPO b32n4, two logical batches produce at most 256 rollouts per turn;
+    # vLLM schedules those requests within the fixed KV-cache reservation.
+    max_batches_per_turn: 2
     collect_timeout_sec: 0.03
     # Default 0 returns only the sampled token's logprob for pi_old.  An
     # algorithm can explicitly request up to 16 candidates for overlap work.
@@ -149,9 +151,9 @@ learner:
     timeout_sec: 3600
   execution:
     forward_chunk_size: 512
-    # Teacher and Learner share GPU 1.  Learner releases the Gate after this
-    # many complete logical batches so Teacher can acquire it next.
-    max_batches_per_turn: 4
+    # Two complete logical batches per turn. GRPO has no Teacher, so Learner
+    # owns GPU 1; teacher-based algorithms may still share this device.
+    max_batches_per_turn: 2
     gradient_checkpointing: true
     # Framework-owned post-accumulation gradient clipping.  Zero disables it.
     clip_grad_norm: 0.0

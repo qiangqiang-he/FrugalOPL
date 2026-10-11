@@ -1,0 +1,11 @@
+# Shared one-shot analog prompt and dataset overlay.
+run:
+  prompts:
+    evaluation: MATH_ONESHOT_MESSAGES
+actor:
+  evaluation:
+    datasets:
+      aime_2024:
+        path: data/AIME-2024-one-shot-analog.json
+        prompt: evaluation
+        max_examples: null
