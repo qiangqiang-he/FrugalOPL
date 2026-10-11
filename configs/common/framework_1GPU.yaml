@@ -1,0 +1,166 @@
+# Self-contained single-GPU framework configuration for local FrugalOPL
+# development.  It defines generic Worker defaults and their placement, but
+# deliberately does not define an algorithm or signal pipeline.  Each training
+# configuration owns its ordered pipeline, plugin hooks, objective, and
+# algorithm-specific sampling settings.
+
+run:
+  name: frugalopl_base
+  group: null
+  seed: 42
+  prompts:
+    train: MATH_PROMPT
+    evaluation: MATH_PROMPT
+
+  storage:
+    output_root: outputs
+    # null derives <output_root>/<run.name>/tmp/_tmp_lora.  Learner publishes
+    # adapters there and Actor reads adapters from the same location.
+    lora_adapter_root: null
+
+  # SwanLab credentials are deliberately never stored in configuration.
+  swanlab:
+    enabled: false
+    project: FrugalOPL-Official
+    workspace: qhe
+    mode: online
+
+  redis:
+    url: redis://localhost:6379/0
+    key_prefix: frugalopl
+    clear_run_keys_on_start: true
+    serializer: pickle
+
+  runtime:
+    process_start_method: spawn
+    # This project-wide safety floor is enforced by Worker code.
+    minimum_free_gpu_memory_gb: 3
+    restart:
+      enabled: true
+      worker_restart_delay_sec: 5
+      manager_poll_interval_sec: 2
+
+  # Actor and Learner load this same policy model.  Teacher inherits it when
+  # teacher.model_name_or_path is null.
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-4B
+    dtype: bfloat16
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+      dropout: 0.0
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+
+# A pipeline still declares every concrete Teacher by its own ID (for example
+# teachera or teacherb). These class defaults give every such node the local
+# one-GPU placement unless that node overrides it.
+worker_defaults:
+  Teacher:
+    gpu_ids: [0]
+    max_sequence_length: 10496
+    forward:
+      chunk_size: 512
+      max_batches_per_turn: 4
+
+controller:
+  max_steps: 2
+  train_prompt_batch_size: 2
+  # Keep up to four logical batches in flight so Actor can submit their
+  # rollouts together in one vLLM generation turn.
+  max_inflight_batches: 4
+  queue_poll_timeout_sec: 1
+  # Controller owns dataset loading and turns records into Worker signals.
+  # These local development paths are independent of GPU topology.
+  data:
+    train:
+      name: gsm8k
+      path: tests/data/gsm8k_train.json
+    eval:
+      name: gsm8k
+      path: tests/data/gsm8k_test.json
+    max_prompt_length: 2048
+    max_response_length: 8192
+
+actor:
+  gpu_ids: [0]
+
+  engine:
+    # This capacity leaves prompt/template room for the default 16384-token
+    # evaluation completion ceiling.
+    max_model_len: 20480
+    # Reserve a bounded Actor envelope so the co-located Learner retains
+    # memory headroom and the mandatory 3 GB free-memory floor remains usable.
+    gpu_memory_utilization: 0.30
+    tensor_parallel_size: 1
+    # CUDA Graph capture is the default vLLM generation path.
+    enforce_eager: false
+    # One independent vLLM Actor process is launched per gpu_ids entry.  After
+    # taking the shared-GPU Gate, it processes this many logical batches.
+    max_batches_per_turn: 4
+    collect_timeout_sec: 0.03
+    # Default 0 returns only the sampled token's logprob for pi_old.  An
+    # algorithm can explicitly request up to 16 candidates for overlap work.
+    logprobs:
+      default: 0
+      max: 16
+
+  lora:
+    enabled: true
+    # vLLM adapter capacity; it must be at least run.policy.lora.rank.
+    max_rank: 64
+
+  # Controller dispatches an eval task with data and policy_version only.
+  # Actor reads these generation settings without invoking an AlgorithmPlugin.
+  evaluation:
+    enabled: true
+    before_training: true
+    interval_steps: 50
+    max_examples: null
+    # One Actor evaluation batch contains 64 rollouts.  The Controller derives
+    # its prompt count from this value and rollouts_per_prompt.
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      max_response_length: 16384
+
+learner:
+  gpu_ids: [0]
+
+  # 2048 prompt tokens + the 8192-token training response limit, plus a
+  # reserve for packed head/tail answer probes.
+  max_sequence_length: 10496
+  distributed:
+    backend: nccl
+    master_addr: 127.0.0.1
+    master_port: 29573
+    timeout_sec: 3600
+  execution:
+    forward_chunk_size: 512
+    # On a shared local GPU, Learner releases the Gate after this many
+    # complete logical batches so Actor or Teacher can acquire it next.
+    max_batches_per_turn: 4
+    gradient_checkpointing: true
+    # Framework-owned post-accumulation gradient clipping.  Zero disables it.
+    clip_grad_norm: 0.0
+  # Algorithms choose an objective; Learner owns these generic optimizer
+  # mechanics and publishes its LoRA after every update.
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.0
+  scheduler:
+    type: constant
+  checkpoint:
+    max_keep: 4

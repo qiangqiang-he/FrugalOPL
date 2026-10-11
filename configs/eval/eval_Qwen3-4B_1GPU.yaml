@@ -1,0 +1,16 @@
+# Full AIME-2024 evaluation for Qwen3-4B on one local GPU.
+# All generation settings inherit eval_1GPU.yaml.  The slightly lower vLLM
+# allocation is a hard whole-device guardrail: with the current desktop
+# baseline it keeps observed usage below 35 GB.
+
+extends: ../common/eval_1GPU.yaml
+
+run:
+  name: eval_qwen3_4b_aime_2024_zero_shot
+  output_dir: outputs/Qwen3-4B_Nothinking/zero-shot
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-4B
+
+actor:
+  engine:
+    gpu_memory_utilization: 0.58

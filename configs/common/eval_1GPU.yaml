@@ -1,0 +1,74 @@
+# Single-GPU offline evaluation overlay for framework_1GPU.yaml.
+#
+# The evaluator launches only Actor on GPU 0.  It extends the matching
+# framework_1GPU.yaml profile for Actor placement; algorithm plugins,
+# Learner, and Teacher are deliberately not constructed by utils/eval.py.
+# ``utils/eval.py`` resolves this relative path before it launches Actor.
+
+extends: framework_1GPU.yaml
+
+run:
+  name: eval_qwen3_1_7b_aime_2024_zero_shot
+  # Keep all evaluation artifacts under outputs.  A multi-dataset evaluation
+  # creates one child directory per dataset below this model-specific root.
+  output_dir: outputs/Qwen3-1.7B_Nothinking/zero-shot
+  # Prompt aliases refer to string templates exported by utils.prompts.  Add
+  # aliases here when different evaluation datasets need different task text.
+  prompts:
+    evaluation: MATH_PROMPT
+
+  # Evaluation explicitly names the base policy.  An explicit empty LoRA path
+  # means evaluate this original model without any adapter.
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-1.7B
+
+actor:
+  gpu_ids: [0]
+
+  engine:
+    # Keep the local one-GPU evaluation allocation conservative.  Actor still
+    # refuses to start if this would leave less than the mandatory 3 GB floor.
+    gpu_memory_utilization: 0.60
+    # Context capacity only; the no-thinking completion ceiling is set below.
+    max_model_len: 20480
+    tensor_parallel_size: 1
+
+  lora:
+    # Set this to an adapter directory to evaluate an exported LoRA.  null,
+    # an empty path, an invalid path, or a failed adapter load all fall back to
+    # the original base model.
+    path: null
+
+  evaluation:
+    enabled: true
+    before_training: true
+    interval_steps: null
+    max_examples: null
+
+    # This is an upper bound on total responses in one vLLM call, not the
+    # number of questions.  With eight repeats, evaluation sends at most eight
+    # questions per request.  Keep it at 64 for local evaluation efficiency.
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    # Qwen3's tokenizer receives enable_thinking=False through
+    # apply_chat_template, producing no-thinking completions by default.
+    enable_thinking: false
+
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      # No-thinking evaluations use a 16384-token completion ceiling.
+      # The dedicated Thinking presets explicitly override this to 20480.
+      max_response_length: 16384
+
+    # Persist every full trajectory so each evaluation can be inspected or
+    # re-scored later from details.json, rather than retaining aggregates only.
+    save_rollouts: true
+
+    # Every dataset names a prompt alias from run.prompts.  More datasets can
+    # be appended without changing Actor or the evaluation code.
+    datasets:
+      aime_2024:
+        path: data/AIME-2024.json
+        prompt: evaluation
+        max_examples: null

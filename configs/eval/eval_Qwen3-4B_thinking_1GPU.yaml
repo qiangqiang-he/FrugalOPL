@@ -1,0 +1,8 @@
+# Shared Qwen3-4B Thinking-mode evaluation settings.  This deliberately uses
+# the same rollout and memory envelope as the 1.7B run for a fair comparison.
+
+extends: eval_Qwen3-1.7B_thinking_1GPU.yaml
+
+run:
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-4B

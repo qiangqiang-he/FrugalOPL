@@ -1,0 +1,16 @@
+# Full AIME-2024 evaluation for Qwen3-8B on one local GPU.
+# All generation settings inherit eval_1GPU.yaml.  This conservative vLLM
+# allocation is a hard whole-device guardrail: the 8B model's initial 0.58
+# run approached the 35 GB limit, so 0.55 leaves a verified safety margin.
+
+extends: ../common/eval_1GPU.yaml
+
+run:
+  name: eval_qwen3_8b_aime_2024_zero_shot
+  output_dir: outputs/Qwen3-8B_Nothinking/zero-shot
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-8B
+
+actor:
+  engine:
+    gpu_memory_utilization: 0.55

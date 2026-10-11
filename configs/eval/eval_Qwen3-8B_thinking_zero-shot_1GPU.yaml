@@ -1,0 +1,5 @@
+extends: eval_Qwen3-8B_thinking_1GPU.yaml
+
+run:
+  name: eval_qwen3_8b_aime_2024_thinking_zero_shot
+  output_dir: outputs/Qwen3-8B_thinking/zero-shot

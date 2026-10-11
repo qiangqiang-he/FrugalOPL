@@ -1,0 +1,7 @@
+extends:
+  - ../common/eval_1GPU.yaml
+  - eval_one-shot-self.yaml
+
+run:
+  name: eval_qwen3_1_7b_aime_2024_one_shot_self_dialogue
+  output_dir: outputs/Qwen3-1.7B_Nothinking/one-shot-self-dialogue

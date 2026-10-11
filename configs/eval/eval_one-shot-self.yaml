@@ -1,0 +1,14 @@
+# One-shot delta: use the evaluated problem and its worked solution itself as
+# the example.  It deliberately has no ``extends`` for safe composition.
+
+run:
+  prompts:
+    evaluation: MATH_ONESHOT_MESSAGES
+
+actor:
+  evaluation:
+    datasets:
+      aime_2024:
+        path: data/AIME-2024-one-shot-self.json
+        prompt: evaluation
+        max_examples: null

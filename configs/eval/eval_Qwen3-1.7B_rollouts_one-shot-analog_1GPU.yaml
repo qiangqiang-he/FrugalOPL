@@ -1,0 +1,12 @@
+# Save one response per problem with its paired analog worked example.
+extends: eval_Qwen3-1.7B_one-shot-analog_1GPU.yaml
+
+run:
+  name: qwen3_1_7b_rollouts_one_shot_analog
+  output_dir: outputs/Qwen3-1.7B_rollouts/one-shot-analog
+
+actor:
+  evaluation:
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 1
+    save_rollouts: true

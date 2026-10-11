@@ -1,0 +1,12 @@
+# Save one zero-shot response per AIME-2024 problem for downstream evaluation.
+extends: ../common/eval_1GPU.yaml
+
+run:
+  name: qwen3_1_7b_rollouts_zero_shot
+  output_dir: outputs/Qwen3-1.7B_rollouts/zero-shot
+
+actor:
+  evaluation:
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 1
+    save_rollouts: true

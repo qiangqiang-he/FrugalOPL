@@ -1,0 +1,145 @@
+# Local single-GPU PG-OPD run with a Qwen3-4B Student and the standard
+# rank-64 LoRA policy.  It is deliberately separate from the 1.7B-Student
+# configuration so their checkpoints, output paths, and SwanLab runs cannot
+# be mixed.
+
+extends: ../../common/framework_1GPU.yaml
+
+pipeline:
+  - id: controller
+    class: Controller
+
+  - id: actor
+    class: Actor
+    plugin_hook: collect_actor_signals
+    cpu_offload: false
+
+  - id: teacher
+    class: Teacher
+    plugin_hook: collect_teacher_signals
+    cpu_offload: false
+
+  - id: learner
+    class: Learner
+    plugin_hook: collect_learner_signals
+    objective_fn: compute_objective
+    cpu_offload: false
+
+run:
+  name: pg_opd_qwen3_4b_instruct_2507_to_4b_dapo17k_r64_100steps
+  group: pg-opd
+  seed: 42
+  policy:
+    # Actor and Learner both inherit this Student checkpoint.  Teacher keeps
+    # the instruction-tuned 4B checkpoint below as the reference model.
+    model_name_or_path: ~/projects/models/Qwen3-4B
+    dtype: bfloat16
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+      dropout: 0.0
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+  prompts:
+    train: MATH_PROMPT
+    evaluation: MATH_PROMPT
+
+controller:
+  max_steps: 100
+  # Preserve 32 questions x 4 Student rollouts per update.
+  train_prompt_batch_size: 32
+  # Keep exactly one logical batch resident while the three 4B Workers share
+  # the one local GPU.
+  max_inflight_batches: 1
+  data:
+    train:
+      name: dapo_17k
+      path: data/DAPO-17k.json
+    eval:
+      - name: aime24
+        path: data/AIME-2024.json
+      - name: amc23
+        path: data/AMC-2023.json
+    max_prompt_length: 2048
+    max_response_length: 4096
+
+actor:
+  gpu_ids: [0]
+  engine:
+    # 16,384 evaluation tokens plus prompt/template room.
+    max_model_len: 18432
+    # 27% gives vLLM enough KV cache for the complete 18,432-token context
+    # once CUDA Graph pools are included in its profiler estimate.
+    gpu_memory_utilization: 0.27
+    tensor_parallel_size: 1
+    enforce_eager: false
+    max_batches_per_turn: 1
+    collect_timeout_sec: 0.03
+    logprobs:
+      default: 0
+      max: 16
+  lora:
+    enabled: true
+    max_rank: 64
+  evaluation:
+    enabled: true
+    before_training: true
+    interval_steps: 20
+    # The Controller turns 64 / 8 into at most 8 questions per vLLM
+    # evaluation call, so each call stays at or below 64 rollouts.
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    save_rollouts: false
+    generation:
+      temperature: 0.7
+      top_p: 0.95
+      max_response_length: 16384
+
+teacher:
+  gpu_ids: [0]
+  model_name_or_path: ~/projects/models/Qwen3-4B-Instruct-2507
+  dtype: bfloat16
+  # Training prompt budget (2048) + response ceiling (4096), with headroom.
+  max_sequence_length: 8192
+  forward:
+    # Small chunks constrain the Teacher's transient lm-head allocation.
+    chunk_size: 128
+    max_batches_per_turn: 1
+
+learner:
+  gpu_ids: [0]
+  max_sequence_length: 8192
+  execution:
+    # Small chunks and checkpointing constrain the 4B Student's peak usage.
+    forward_chunk_size: 128
+    max_batches_per_turn: 1
+    gradient_checkpointing: true
+    clip_grad_norm: 1.0
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.0
+  scheduler:
+    type: constant
+  checkpoint:
+    max_keep: 4
+
+algorithm:
+  plugin: PGOPDPlugin
+  algo_name: pg_opd
+  enable_thinking: false
+  training_sampling:
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 4096
+    n: 4
+  advantage_clip: 10.0

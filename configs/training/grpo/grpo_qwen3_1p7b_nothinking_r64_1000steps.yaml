@@ -1,0 +1,11 @@
+# Keep the DeepSeek experiment's data, sampling, optimization and GPU layout.
+extends: grpo_deepseek_r1_distill_qwen_1p5b_r64_1000steps.yaml
+
+run:
+  name: grpo_qwen3_1p7b_nothinking_dapo17k_r64_4096_b32n4_1000steps
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-1.7B
+
+algorithm:
+  # The same chat-template mode applies to training and every evaluation.
+  enable_thinking: false
