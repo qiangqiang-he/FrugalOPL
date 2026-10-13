@@ -29,6 +29,11 @@ run:
   name: pg_opd_qwen3_4b_instruct_2507_to_4b_dapo17k_r64_100steps_2GPU
   group: pg-opd
   seed: 42
+  runtime:
+    # This is a managed server run, not a local desktop session.  Do not
+    # reserve a fixed free-memory floor: true CUDA allocation failures, rather
+    # than a copied 3 GiB desktop guard, determine the usable capacity.
+    minimum_free_gpu_memory_gb: 0
   swanlab:
     enabled: true
   policy:
@@ -76,9 +81,9 @@ actor:
   engine:
     # 16,384 evaluation tokens plus prompt/template room.
     max_model_len: 18432
-    # GPU 0 is dedicated to vLLM.  This mirrors the two-GPU framework budget:
-    # on a 24 GiB 4090, 80% leaves more than the mandatory 3 GB reserve while
-    # providing enough KV-cache blocks for the 18,432-token context.
+    # GPU 0 is dedicated to vLLM.  This 80% allocation cap provides enough
+    # KV-cache blocks for the 18,432-token context while retaining runtime
+    # allocation room; it is not a fixed free-memory safety reserve.
     gpu_memory_utilization: 0.80
     tensor_parallel_size: 1
     enforce_eager: false

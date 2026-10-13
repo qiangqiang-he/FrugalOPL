@@ -219,8 +219,8 @@ def gpu_memory_headroom_is_safe(
         raise ValueError("GPU memory values must be non-negative with a positive total.")
     if not 0 < gpu_memory_utilization < 1:
         raise ValueError("actor.engine.gpu_memory_utilization must be strictly between 0 and 1.")
-    if minimum_free_gb < 3:
-        raise ValueError("minimum_free_gpu_memory_gb may not be lower than the 3 GB safety floor.")
+    if minimum_free_gb < 0:
+        raise ValueError("minimum_free_gpu_memory_gb must be non-negative.")
     minimum_free_bytes = int(minimum_free_gb * 1024**3)
     planned_reservation = math.ceil(total_bytes * gpu_memory_utilization)
     return free_bytes - planned_reservation >= minimum_free_bytes
@@ -716,13 +716,13 @@ class Actor:
             raise ValueError("actor.engine.gpu_memory_utilization must be strictly between 0 and 1.")
         if int(self.engine_cfg.get("max_model_len", 0)) <= 0:
             raise ValueError("actor.engine.max_model_len must be positive.")
-        if float(self.runtime_cfg.get("minimum_free_gpu_memory_gb", 3)) < 3:
-            raise ValueError("run.runtime.minimum_free_gpu_memory_gb may not be below 3 GB.")
+        if float(self.runtime_cfg.get("minimum_free_gpu_memory_gb", 3)) < 0:
+            raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
 
     def _minimum_free_gpu_memory_gb(self) -> float:
         minimum = float(self.runtime_cfg.get("minimum_free_gpu_memory_gb", 3))
-        if minimum < 3:
-            raise ValueError("run.runtime.minimum_free_gpu_memory_gb may not be below 3 GB.")
+        if minimum < 0:
+            raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
         return minimum
 
     def _validate_memory_before_engine_creation(self) -> None:
@@ -1910,8 +1910,8 @@ class ActorManager:
                 "actor.engine.tensor_parallel_size must be 1; use multiple actor.gpu_ids for multi-GPU Actors."
             )
         minimum = float(runtime_cfg.get("minimum_free_gpu_memory_gb", 3))
-        if minimum < 3:
-            raise ValueError("run.runtime.minimum_free_gpu_memory_gb may not be below 3 GB.")
+        if minimum < 0:
+            raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
         start_method = str(runtime_cfg.get("process_start_method", "spawn"))
         self._context = mp.get_context(start_method)
         self.stop_event = self._context.Event()

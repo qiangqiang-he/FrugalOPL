@@ -33,6 +33,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import traceback
 from collections.abc import Callable, Mapping, Sequence
@@ -797,13 +798,13 @@ class Learner:
         if self.device.type != "cuda":
             return
         minimum = float(self.runtime_cfg.get("minimum_free_gpu_memory_gb", 3))
-        if minimum < 3:
-            raise ValueError("run.runtime.minimum_free_gpu_memory_gb may not be below 3 GB.")
+        if minimum < 0:
+            raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
         free, _total = self._gpu_memory_info()
         if free < int(minimum * 1024**3):
             raise MemoryError(
                 f"Refusing to initialize Learner: GPU has only {free / 1024**3:.2f} GB free; "
-                f"the required safety floor is {minimum:.2f} GB."
+                f"the configured minimum free memory is {minimum:.2f} GB."
             )
 
     def _validate_runtime_memory_after_load(self) -> None:
@@ -814,7 +815,7 @@ class Learner:
         if free < int(minimum * 1024**3):
             raise MemoryError(
                 f"Learner initialization left only {free / 1024**3:.2f} GB free; "
-                f"the required safety floor is {minimum:.2f} GB."
+                f"the configured minimum free memory is {minimum:.2f} GB."
             )
 
     def _gpu_memory_info(self) -> tuple[int, int]:
@@ -877,8 +878,8 @@ class Learner:
         if self.device.type != "cuda" or not torch.cuda.is_available():
             return
         minimum_gb = float(self.runtime_cfg.get("minimum_free_gpu_memory_gb", 3))
-        if minimum_gb < 3:
-            raise ValueError("run.runtime.minimum_free_gpu_memory_gb may not be below 3 GB.")
+        if minimum_gb < 0:
+            raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
         free, _total = self._gpu_memory_info()
         required = int(minimum_gb * 1024**3) + self._model_size_bytes()
         if free < required:
@@ -2117,6 +2118,7 @@ class Learner:
             completed_count = 0
             model_load_seconds = 0.0
             model_offload_seconds = 0.0
+            handoff_memory: tuple[dict[str, float] | None, dict[str, float] | None] | None = None
             completed: list[tuple[Signals, float]] = []
             try:
                 model_load_seconds = self._activate_model()
@@ -2148,15 +2150,35 @@ class Learner:
                 try:
                     if self.cpu_offload:
                         model_offload_seconds += self._offload_model()
+                    else:
+                        # A non-offloaded Learner intentionally keeps its
+                        # parameters and optimizer state resident between
+                        # turns.  When a peer Worker shares this physical
+                        # card, release only the transient final gradients
+                        # and PyTorch allocator cache before handing over the
+                        # permit; do not migrate persistent training state.
+                        handoff_memory = self._release_shared_gpu_turn_memory(
+                            suppress_errors=sys.exc_info()[0] is not None,
+                        )
                 finally:
                     # Offload can fail; do not strand a shared-GPU peer.
                     gate_hold_seconds = time.perf_counter() - turn_started
                     self.gpu_gate.release()
+                handoff_suffix = ""
+                if handoff_memory is not None:
+                    before, after = handoff_memory
+                    if before is not None and after is not None:
+                        handoff_suffix = (
+                            ", handoff_allocator_mib="
+                            f"allocated {before['allocated_mib']:.1f}->{after['allocated_mib']:.1f}, "
+                            f"reserved {before['reserved_mib']:.1f}->{after['reserved_mib']:.1f}, "
+                            f"free {before['free_mib']:.1f}->{after['free_mib']:.1f}"
+                        )
                 print(
                     f"[Learner {self.node_id} rank {self.rank} GPU {self.gpu_id}] turn batches="
                     f"{completed_count}/{len(raw_batches)}, gate_wait={gate_wait_seconds:.3f}s, "
                     f"gate_hold={gate_hold_seconds:.3f}s, model_load={model_load_seconds:.3f}s, "
-                    f"model_offload={model_offload_seconds:.3f}s.",
+                    f"model_offload={model_offload_seconds:.3f}s{handoff_suffix}.",
                     flush=True,
                 )
                 self.gpu_gate.yield_after_release(stop_event, delay_sec=2.0)
@@ -2166,6 +2188,67 @@ class Learner:
 
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
+
+    def _cuda_memory_snapshot_mib(self) -> dict[str, float] | None:
+        """Return a cheap per-device allocator snapshot for handoff telemetry."""
+
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
+            return {
+                "allocated_mib": torch.cuda.memory_allocated(self.device) / 1024**2,
+                "reserved_mib": torch.cuda.memory_reserved(self.device) / 1024**2,
+                "free_mib": free_bytes / 1024**2,
+            }
+        except Exception:
+            # Memory telemetry must never interfere with releasing a shared
+            # GPU permit.  The cleanup itself remains mandatory below.
+            return None
+
+    def _release_shared_gpu_turn_memory(
+        self,
+        *,
+        suppress_errors: bool,
+    ) -> tuple[dict[str, float] | None, dict[str, float] | None] | None:
+        """Return transient CUDA memory before a shared-GPU Learner handoff.
+
+        This deliberately does *not* offload the model or optimizer.  It only
+        drops the final turn's gradients and returns allocator-cache blocks so
+        the next Worker can use them.  CPU-offload already performs equivalent
+        cleanup while moving state, so doing it again here would add a second
+        synchronization to every turn.
+        """
+
+        if (
+            self.cpu_offload
+            or not bool(getattr(self.gpu_gate, "is_shared", False))
+            or self.device.type != "cuda"
+            or not torch.cuda.is_available()
+        ):
+            return None
+
+        before = self._cuda_memory_snapshot_mib()
+        cleanup_error: BaseException | None = None
+        for action in (self._zero_grad, self._synchronize_cuda, torch.cuda.empty_cache):
+            try:
+                action()
+            except BaseException as error:
+                # Keep running the remaining cleanup actions.  In particular,
+                # a faulty optimizer.zero_grad must not prevent cache release
+                # before a Teacher or Actor can acquire this shared GPU.
+                if cleanup_error is None:
+                    cleanup_error = error
+        after = self._cuda_memory_snapshot_mib()
+
+        if cleanup_error is not None:
+            if suppress_errors:
+                print(
+                    "[Learner] Shared-GPU handoff cleanup failed while another "
+                    f"turn error is propagating: {cleanup_error}",
+                    flush=True,
+                )
+            else:
+                raise cleanup_error
+        return before, after
 
     def _with_worker_timing(
         self,
@@ -2288,8 +2371,8 @@ class LearnerManager:
         if not self.gpu_ids:
             raise ValueError("learner.gpu_ids must contain at least one GPU id.")
         minimum = float(runtime_cfg.get("minimum_free_gpu_memory_gb", 3))
-        if minimum < 3:
-            raise ValueError("run.runtime.minimum_free_gpu_memory_gb may not be below 3 GB.")
+        if minimum < 0:
+            raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
         self._context = mp.get_context(str(runtime_cfg.get("process_start_method", "spawn")))
         self.stop_event = self._context.Event()
         self.processes: dict[int, object] = {}

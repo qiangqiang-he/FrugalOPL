@@ -82,11 +82,16 @@ def _gpu_memory_info(gpu_id: int) -> tuple[int, int]:
 
 
 def _minimum_free_bytes(runtime_cfg: Mapping[str, object]) -> int:
-    """Return the mandatory device-wide free-memory floor."""
+    """Return the configured device-wide free-memory reserve.
+
+    Local configurations keep their 3 GiB safety reserve.  A managed server
+    run may explicitly set this to zero so allocation failures, rather than a
+    fabricated local-desktop threshold, determine whether it OOMs.
+    """
 
     minimum_gb = float(runtime_cfg.get("minimum_free_gpu_memory_gb", 3))
-    if minimum_gb < 3:
-        raise ValueError("run.runtime.minimum_free_gpu_memory_gb may not be below 3 GB.")
+    if minimum_gb < 0:
+        raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
     minimum = int(minimum_gb * 1024**3)
     return minimum
 
@@ -246,7 +251,7 @@ class Teacher:
         return elapsed
 
     def _validate_model_load_headroom(self, model: torch.nn.Module) -> None:
-        """Keep the device-wide floor intact before any CPU-resident model moves in."""
+        """Keep the configured device-wide reserve after a model moves in."""
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
             return
@@ -307,7 +312,7 @@ class Teacher:
         if free < minimum:
             raise MemoryError(
                 f"Refusing to initialize Teacher: GPU has only {free / 1024**3:.2f} GB free; "
-                f"the required safety floor is {minimum / 1024**3:.2f} GB."
+                f"the configured free-memory reserve is {minimum / 1024**3:.2f} GB."
             )
 
     def _validate_memory_after_load(self) -> None:
@@ -318,7 +323,7 @@ class Teacher:
         if free < minimum:
             raise MemoryError(
                 f"Teacher initialization left only {free / 1024**3:.2f} GB free; "
-                f"the required safety floor is {minimum / 1024**3:.2f} GB."
+                f"the configured free-memory reserve is {minimum / 1024**3:.2f} GB."
             )
 
     def _require_model(self) -> torch.nn.Module:
@@ -912,8 +917,8 @@ class TeacherManager:
             raise ValueError("teacher.gpu_ids may not contain duplicates.")
         if not self.gpu_ids:
             raise ValueError("teacher.gpu_ids must contain at least one GPU id.")
-        if float(runtime_cfg.get("minimum_free_gpu_memory_gb", 3)) < 3:
-            raise ValueError("run.runtime.minimum_free_gpu_memory_gb may not be below 3 GB.")
+        if float(runtime_cfg.get("minimum_free_gpu_memory_gb", 3)) < 0:
+            raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
         self._context = mp.get_context(str(runtime_cfg.get("process_start_method", "spawn")))
         self.stop_event = self._context.Event()
         self.processes: dict[int, object] = {}
