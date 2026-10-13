@@ -1,0 +1,153 @@
+# Two-GPU PG-OPD run with a Qwen3-4B Student and a Qwen3-4B-Instruct-2507
+# Teacher.  Actor is isolated on GPU 0; Teacher and Learner share GPU 1.
+
+extends: ../../common/framework_2GPU.yaml
+
+pipeline:
+  - id: controller
+    class: Controller
+
+  - id: actor
+    class: Actor
+    plugin_hook: collect_actor_signals
+    cpu_offload: false
+
+  - id: teacher
+    class: Teacher
+    plugin_hook: collect_teacher_signals
+    cpu_offload: true
+
+  - id: learner
+    class: Learner
+    plugin_hook: collect_learner_signals
+    objective_fn: compute_objective
+    cpu_offload: false
+
+run:
+  # The resolved output directory is outputs/<run.name>, so all artifacts are
+  # namespaced with 2GPU as well.
+  name: pg_opd_qwen3_4b_instruct_2507_to_4b_dapo17k_r64_100steps_2GPU_amc23_20
+  group: pg-opd
+  seed: 42
+  runtime:
+    # This is a managed server run, not a local desktop session.  Do not
+    # reserve a fixed free-memory floor: true CUDA allocation failures, rather
+    # than a copied 3 GiB desktop guard, determine the usable capacity.
+    minimum_free_gpu_memory_gb: 0
+  swanlab:
+    enabled: true
+  policy:
+    # Actor and Learner both inherit this Student checkpoint.  Teacher keeps
+    # the instruction-tuned 4B checkpoint below as the reference model.
+    model_name_or_path: ~/projects/models/Qwen3-4B
+    dtype: bfloat16
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+      dropout: 0.0
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+  prompts:
+    train: MATH_PROMPT
+    evaluation: MATH_PROMPT
+
+controller:
+  max_steps: 100
+  # Preserve 32 questions x 4 Student rollouts per update.
+  train_prompt_batch_size: 32
+  # Actor can generate on GPU 0 while Teacher/Learner advance work on GPU 1.
+  max_inflight_batches: 4
+  data:
+    train:
+      name: dapo_17k
+      path: data/DAPO-17k.json
+    eval:
+      # Fixed first 20 records from the canonical 40-question AMC 2023 set.
+      - name: amc23_20
+        path: data/AMC-2023-20.json
+    max_prompt_length: 2048
+    max_response_length: 4096
+
+actor:
+  gpu_ids: [0]
+  engine:
+    # 16,384 evaluation tokens plus prompt/template room.
+    max_model_len: 18432
+    # GPU 0 is dedicated to vLLM.  This 80% allocation cap provides enough
+    # KV-cache blocks for the 18,432-token context while retaining runtime
+    # allocation room; it is not a fixed free-memory safety reserve.
+    gpu_memory_utilization: 0.80
+    tensor_parallel_size: 1
+    enforce_eager: false
+    max_batches_per_turn: 2
+    collect_timeout_sec: 0.03
+    logprobs:
+      default: 0
+      max: 16
+  lora:
+    enabled: true
+    max_rank: 64
+  evaluation:
+    enabled: true
+    # Run the real 20-question AMC23 baseline and log it to this new SwanLab run.
+    before_training: true
+    # The Controller snapshots the completed adapter and evaluates it every
+    # 10 updates.  Each evaluation remains at the 64-rollout limit.
+    interval_steps: 10
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    save_rollouts: false
+    generation:
+      temperature: 0.7
+      top_p: 0.95
+      max_response_length: 16384
+
+teacher:
+  gpu_ids: [1]
+  model_name_or_path: ~/projects/models/Qwen3-4B-Instruct-2507
+  dtype: bfloat16
+  # Training prompt budget (2048) + response ceiling (4096), with headroom.
+  max_sequence_length: 8192
+  forward:
+    # Restore the requested 256-token lm-head chunking.  The Teacher is moved
+    # to CPU between turns, leaving the shared card available to the Learner.
+    chunk_size: 256
+    max_batches_per_turn: 2
+
+learner:
+  gpu_ids: [1]
+  max_sequence_length: 8192
+  execution:
+    # Restore the requested 256-token lm-head chunking.
+    forward_chunk_size: 256
+    max_batches_per_turn: 2
+    gradient_checkpointing: true
+    clip_grad_norm: 1.0
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.0
+  scheduler:
+    type: constant
+  checkpoint:
+    max_keep: 4
+
+algorithm:
+  plugin: PGOPDPlugin
+  algo_name: pg_opd
+  enable_thinking: false
+  training_sampling:
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 4096
+    n: 4
+  advantage_clip: 10.0

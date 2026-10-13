@@ -1,0 +1,82 @@
+[
+  {
+    "question": "Cities $A$ and $B$ are $45$ miles apart. Alicia lives in $A$ and Beth lives in $B$. Alicia bikes towards $B$ at 18 miles per hour. Leaving at the same time, Beth bikes toward $A$ at 12 miles per hour. How many miles from City $A$ will they be when they meet?",
+    "answer": 27.0
+  },
+  {
+    "question": "Positive real numbers $x$ and $y$ satisfy $y^3=x^2$ and $(y-x)^2=4y^2$. What is $x+y$?",
+    "answer": 36.0
+  },
+  {
+    "question": "What is the degree measure of the acute angle formed by lines with slopes $2$ and $\\frac{1}{3}$?",
+    "answer": 45.0
+  },
+  {
+    "question": "What is the value of\n\\[2^3 - 1^3 + 4^3 - 3^3 + 6^3 - 5^3 + \\dots + 18^3 - 17^3?\\]",
+    "answer": 3159.0
+  },
+  {
+    "question": "In a table tennis tournament every participant played every other participant exactly once. Although there were twice as many right-handed players as left-handed players, the number of games won by left-handed players was $40\\%$ more than the number of games won by right-handed players. (There were no ties and no ambidextrous players.) What is the total number of games played?",
+    "answer": 36.0
+  },
+  {
+    "question": "How many complex numbers satisfy the equation $z^5=\\overline{z}$, where $\\overline{z}$ is the conjugate of the complex number $z$?",
+    "answer": 7.0
+  },
+  {
+    "question": "Consider the set of complex numbers $z$ satisfying $|1+z+z^{2}|=4$. The maximum value of the imaginary part of $z$ can be written in the form $\\tfrac{\\sqrt{m}}{n}$, where $m$ and $n$ are relatively prime positive integers. What is $m+n$?",
+    "answer": 21.0
+  },
+  {
+    "question": "Flora the frog starts at 0 on the number line and makes a sequence of jumps to the right. In any one jump, independent of previous jumps, Flora leaps a positive integer distance $m$ with probability $\\frac{1}{2^m}$.\nWhat is the probability that Flora will eventually land at 10? Write the answer as a simplified fraction $\\frac{m}{n}$, find $m+n$",
+    "answer": 3.0
+  },
+  {
+    "question": "What is the product of all solutions to the equation\n\\[\\log_{7x}2023\\cdot \\log_{289x}2023=\\log_{2023x}2023\\]",
+    "answer": 1.0
+  },
+  {
+    "question": "The weight of $\\frac{1}{3}$ of a large pizza together with $3 \\frac{1}{2}$ cups of orange slices is the same as the weight of $\\frac{3}{4}$ of a large pizza together with $\\frac{1}{2}$ cup of orange slices. A cup of orange slices weighs $\\frac{1}{4}$ of a pound. What is the weight, in pounds, of a large pizza? The answer can be written in the form $\\frac{m}{n}$, where $m$ and $n$ are relatively prime positive integers. What is $m-n$?",
+    "answer": 4.0
+  },
+  {
+    "question": "Rows 1, 2, 3, 4, and 5 of a triangular array of integers are shown below.\n1\n1 1\n1 3 1\n1 5 5 1\n1 7 11 7 1\nEach row after the first row is formed by placing a 1 at each end of the row, and each interior entry is 1 greater than the sum of the two numbers diagonally above it in the previous row. What is the units digits of the sum of the 2023 numbers in the 2023rd row?",
+    "answer": 5.0
+  },
+  {
+    "question": "If $A$ and $B$ are vertices of a polyhedron, define the distance $d(A,B)$ to be the minimum number of edges of the polyhedron one must traverse in order to connect $A$ and $B$. For example, if $\\overline{AB}$ is an edge of the polyhedron, then $d(A, B) = 1$, but if $\\overline{AC}$ and $\\overline{CB}$ are edges and $\\overline{AB}$ is not an edge, then $d(A, B) = 2$. Let $Q$, $R$, and $S$ be randomly chosen distinct vertices of a regular icosahedron (regular polyhedron made up of 20 equilateral triangles). Find the probability that $d(Q, R) > d(R, S)$. The final answer can be written in the form $\\frac{m}{n}$, where $m$ and $n$ are relatively prime positive integers. What is $m+n$?",
+    "answer": 29.0
+  },
+  {
+    "question": "Let $f$ be the unique function defined on the positive integers such that \\[\\sum_{d\\mid n}d\\cdot f\\left(\\frac{n}{d}\\right)=1\\] for all positive integers $n$. What is $f(2023)$?",
+    "answer": 96.0
+  },
+  {
+    "question": "How many ordered pairs of positive real numbers $(a,b)$ satisfy the equation\n\\[(1+2a)(2+2b)(2a+b) = 32ab?\\]",
+    "answer": 1.0
+  },
+  {
+    "question": "Let $K$ be the number of sequences $A_1$, $A_2$, $\\dots$, $A_n$ such that $n$ is a positive integer less than or equal to $10$, each $A_i$ is a subset of $\\{1, 2, 3, \\dots, 10\\}$, and $A_{i-1}$ is a subset of $A_i$ for each $i$ between $2$ and $n$, inclusive. For example, $\\{\\}$, $\\{5, 7\\}$, $\\{2, 5, 7\\}$, $\\{2, 5, 7\\}$, $\\{2, 5, 6, 7, 9\\}$ is one such sequence, with $n = 5$.What is the remainder when $K$ is divided by $10$?",
+    "answer": 5.0
+  },
+  {
+    "question": "There is a unique sequence of integers $a_1, a_2, \\cdots a_{2023}$ such that\n\\[\\tan2023x = \\frac{a_1 \\tan x + a_3 \\tan^3 x + a_5 \\tan^5 x + \\cdots + a_{2023} \\tan^{2023} x}{1 + a_2 \\tan^2 x + a_4 \\tan^4 x \\cdots + a_{2022} \\tan^{2022} x}\\]whenever $\\tan 2023x$ is defined. What is $a_{2023}?$",
+    "answer": -1.0
+  },
+  {
+    "question": "How many positive perfect squares less than $2023$ are divisible by $5$?",
+    "answer": 8.0
+  },
+  {
+    "question": "How many digits are in the base-ten representation of $8^5 \\cdot 5^{10} \\cdot 15^5$?",
+    "answer": 18.0
+  },
+  {
+    "question": "Janet rolls a standard $6$-sided die $4$ times and keeps a running total of the numbers she rolls. What is the probability that at some point, her running total will equal $3$? The final answer can be written in the form $\\frac{m}{n}$, where $m$ and $n$ are relatively prime positive integers. What is $m+n$?",
+    "answer": 265.0
+  },
+  {
+    "question": "Points $A$ and $B$ lie on the graph of $y=\\log_{2}x$. The midpoint of $\\overline{AB}$ is $(6, 2)$. What is the positive difference between the $x$-coordinates of $A$ and $B$? The final answer can be written in the form $m \\sqrt{n}$, where $m$ and $n$ are relatively prime positive integers. What is $m+n$?",
+    "answer": 9.0
+  }
+]
