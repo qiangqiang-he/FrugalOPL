@@ -21,9 +21,10 @@ run:
     # adapters there and Actor reads adapters from the same location.
     lora_adapter_root: null
 
-  # SwanLab credentials are deliberately never stored in configuration.
+  # Credentials remain outside the repository; managed runs report to SwanLab
+  # by default when their environment provides SWANLAB_API_KEY.
   swanlab:
-    enabled: false
+    enabled: true
     project: FrugalOPL-Official
     workspace: qhe
     mode: online
