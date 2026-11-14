@@ -1,2 +1,2 @@
 # Evaluation profile; inherits only common defaults.
-extends: ../common/eval_thinking_1GPU.yaml
+extends: eval_thinking_1GPU.yaml

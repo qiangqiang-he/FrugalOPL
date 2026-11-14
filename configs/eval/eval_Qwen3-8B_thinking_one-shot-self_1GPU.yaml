@@ -1,7 +1,7 @@
 # Evaluation profile; inherits only common defaults.
 extends:
-- ../common/eval_thinking_1GPU.yaml
-- ../common/eval_one-shot-self.yaml
+- eval_thinking_1GPU.yaml
+- eval_one-shot-self.yaml
 run:
   name: eval_qwen3_8b_aime_2024_thinking_one_shot_self
   policy:

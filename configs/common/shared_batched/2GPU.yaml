@@ -1,0 +1,104 @@
+# Two shared GPUs. Generate four global batches, consume each once; K=4.
+# Standalone common configuration; all runtime settings are defined in this file.
+eval_interval: 50
+save_ckpt_interval: 50
+save_question_accuracy: false
+
+run:
+  name: frugalopl_base
+  group: null
+  seed: 42
+  prompts:
+    train: MATH_PROMPT
+    evaluation: MATH_PROMPT
+  storage:
+    output_root: outputs
+    lora_adapter_root: null
+  swanlab:
+    enabled: true
+    project: FrugalOPL-Official
+    workspace: null
+    mode: online
+  redis:
+    url: redis://localhost:6379/0
+    key_prefix: frugalopl
+    clear_run_keys_on_start: true
+    serializer: pickle
+  runtime:
+    process_start_method: spawn
+    minimum_free_gpu_memory_gb: 0
+    pause_on_cuda_oom_only: true
+    restart:
+      enabled: true
+      worker_restart_delay_sec: 5
+      manager_poll_interval_sec: 2
+  policy:
+    dtype: bfloat16
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+      dropout: 0.0
+      target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+worker_defaults:
+  Teacher:
+    max_sequence_length: 10496
+    forward:
+      chunk_size: 512
+      max_batches_per_turn: 4
+    gpu_ids: [0, 1]
+
+controller:
+  queue_poll_timeout_sec: 1
+  data:
+    max_prompt_length: 2048
+    max_response_length: 8192
+  max_inflight_batches: 4
+
+actor:
+  engine:
+    max_model_len: 20480
+    gpu_memory_utilization: 0.5
+    tensor_parallel_size: 1
+    enforce_eager: false
+    collect_timeout_sec: 0.03
+    logprobs:
+      default: 0
+      max: 16
+    gpu_memory_budget_gb: 40.0
+  lora:
+    enabled: true
+    max_rank: 64
+  evaluation:
+    enabled: true
+    before_training: true
+    max_examples: null
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      max_response_length: 16384
+  gpu_ids: [0, 1]
+
+learner:
+  max_sequence_length: 10496
+  distributed:
+    backend: nccl
+    master_addr: 127.0.0.1
+    master_port: 29573
+    timeout_sec: 3600
+  execution:
+    forward_chunk_size: 512
+    gradient_checkpointing: true
+    clip_grad_norm: 0.0
+  optimizer:
+    type: adamw
+    lr: 1.0e-6
+    betas: [0.9, 0.999]
+    eps: 1.0e-08
+    weight_decay: 0.0
+  scheduler:
+    type: constant
+  checkpoint:
+    max_keep: 4
+  gpu_ids: [0, 1]

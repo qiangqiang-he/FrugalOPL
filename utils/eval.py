@@ -37,7 +37,10 @@ if str(_MODULE_PROJECT_ROOT) not in sys.path:
 from utils.answer_verifier import extract_final_answer, verify_response_answer
 
 
-MAX_EVALUATION_ROLLOUTS_PER_BATCH = 64
+# Local per-call evaluation rollout ceiling.  The original project rule was
+# 64; on 2026-10-14 the user explicitly authorized raising it to 128 for the
+# PG-OPD checkpoint evaluation campaign to cut wall-clock time.
+MAX_EVALUATION_ROLLOUTS_PER_BATCH = 128
 _WORKER_READY = "ready"
 _WORKER_RESULT = "result"
 _WORKER_ERROR = "error"
@@ -538,6 +541,15 @@ def _evaluation_worker(
                     [dict(record) for record in records],
                     prompt_alias,
                 )
+                # Explicit checkpoint evaluations must never silently turn
+                # into base-model evaluations if Actor quarantines an adapter.
+                requested_adapter = config.get("actor", {}).get("lora", {}).get("path")
+                if requested_adapter and (
+                    not actor.lora_enabled
+                    or not actor.current_lora_path
+                    or Path(actor.current_lora_path).resolve() != Path(str(requested_adapter)).expanduser().resolve()
+                ):
+                    raise RuntimeError(f"Requested evaluation LoRA is not active: {requested_adapter}")
                 result_queue.put(
                     {
                         "kind": _WORKER_RESULT,
@@ -671,6 +683,13 @@ def execute_actor_tasks(
         for task in tasks:
             task_queue.put(copy.deepcopy(dict(task)))
 
+        evaluation_cfg = _as_mapping(actor_cfg.get("evaluation", {}), "actor.evaluation")
+        rollouts_per_prompt = int(evaluation_cfg.get("rollouts_per_prompt", 8))
+        save_rollouts = bool(evaluation_cfg.get("save_rollouts", False))
+        output_dir = _output_directory(config, config_path=None)
+        generation_started = time.time()
+        completed_rollouts = 0
+        total_rollouts = sum(len(task["records"]) * rollouts_per_prompt for task in tasks)
         completed: dict[int, dict[str, object]] = {}
         while len(completed) < len(tasks):
             message = _worker_message_or_raise(result_queue, workers)
@@ -684,7 +703,31 @@ def execute_actor_tasks(
                 raise RuntimeError(f"Actor returned task {task_id} more than once.")
             if not isinstance(actor_result, Mapping):
                 raise RuntimeError(f"Actor result for task {task_id} is not a mapping.")
-            completed[task_id] = dict(actor_result)
+            task = tasks[task_id]
+            question_results = build_question_results(
+                task["records"], actor_result["traj"],
+                rollouts_per_prompt=rollouts_per_prompt,
+                save_rollouts=save_rollouts,
+                start_index=int(task["record_offset"]),
+            )
+            # Persist each completed batch before accepting more results. A
+            # disconnect or later failure cannot lose already generated text.
+            write_json(output_dir / "rollouts" / f"batch_{task_id:05d}.json", {
+                "task_id": task_id, "dataset": task["dataset_name"],
+                "gpu_id": message.get("gpu_id"), "questions": question_results,
+                "actor_metrics": actor_result.get("actor_metrics", {}),
+            })
+            completed[task_id] = {"question_results": question_results}
+            completed_rollouts += len(task["records"]) * rollouts_per_prompt
+            elapsed = time.time() - generation_started
+            remaining = elapsed / completed_rollouts * (total_rollouts - completed_rollouts)
+            print(f"Eval: {len(completed)}/{len(tasks)} batches | "
+                  f"{completed_rollouts}/{total_rollouts} rollouts | "
+                  f"elapsed={elapsed:.1f}s | remaining={remaining:.1f}s", flush=True)
+            print("GPU_PROGRESS " + json.dumps({
+                "phase": "eval", "step": completed_rollouts, "total": total_rollouts,
+                "remaining_seconds": round(remaining, 1), "updated_at": int(time.time()),
+            }), flush=True)
 
         forced_stop = False
         return completed
@@ -834,18 +877,19 @@ def run_evaluation(
     for task in tasks:
         identifier = int(task["task_id"])
         actor_result = actor_results[identifier]
-        trajectory = actor_result.get("traj")
-        if not isinstance(trajectory, Mapping):
-            raise TypeError(f"Actor result for task {identifier} needs a 'traj' mapping.")
         dataset_name = str(task["dataset_name"])
         details = prepared_datasets[dataset_name]
-        question_results = build_question_results(
-            task["records"],  # type: ignore[arg-type]
-            trajectory,
-            rollouts_per_prompt=rollouts_per_prompt,
-            save_rollouts=save_rollouts,
-            start_index=int(task["record_offset"]),
-        )
+        question_results = actor_result.get("question_results")
+        if question_results is None:
+            trajectory = actor_result.get("traj")
+            if not isinstance(trajectory, Mapping):
+                raise TypeError(f"Actor result for task {identifier} needs a 'traj' mapping.")
+            question_results = build_question_results(
+                task["records"], trajectory,
+                rollouts_per_prompt=rollouts_per_prompt,
+                save_rollouts=save_rollouts,
+                start_index=int(task["record_offset"]),
+            )
         stored_results = details["question_results"]
         assert isinstance(stored_results, list)
         stored_results.extend(question_results)

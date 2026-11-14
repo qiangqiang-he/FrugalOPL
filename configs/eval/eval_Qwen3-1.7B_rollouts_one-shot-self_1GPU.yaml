@@ -1,7 +1,7 @@
 # Evaluation profile; inherits only common defaults.
 extends:
-- ../common/eval_1GPU.yaml
-- ../common/eval_one-shot-self.yaml
+- eval_1GPU.yaml
+- eval_one-shot-self.yaml
 run:
   name: qwen3_1_7b_rollouts_one_shot_self
   output_dir: outputs/Qwen3-1.7B_rollouts/one-shot-self

@@ -602,11 +602,17 @@ class Teacher:
         if not callable(hook):
             raise RuntimeError(f"Teacher plugin hook is unavailable: {hook_name!r}.")
         with _teacher_plugin_scope(self):
-            additions = hook(copy.deepcopy(source))
+            hook_signals = copy.deepcopy(source)
+            # This Actor-owned diagnostic is transported unchanged, but is
+            # never an algorithm input at any Teacher stage.
+            hook_signals.pop("question_accuracies", None)
+            additions = hook(hook_signals)
         if not isinstance(additions, Mapping):
             raise TypeError(f"Teacher plugin hook {hook_name!r} must return a mapping of new signals.")
         if not all(isinstance(key, str) for key in additions):
             raise TypeError(f"Teacher plugin hook {hook_name!r} must return string signal names.")
+        if "question_accuracies" in additions:
+            raise ValueError("Teacher plugins may not produce reserved question_accuracies diagnostic metadata.")
         normalized_additions: Signals = dict(additions)
         if "teacher_metrics" in normalized_additions:
             metrics_key = f"{self.node_id}_metrics"

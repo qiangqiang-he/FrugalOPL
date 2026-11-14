@@ -43,6 +43,27 @@ The reference solution above is correct. Understand the reasoning behind it, but
 
 
 
+# Official OPSD reason_first=False prompts (siyan-zhao/OPSD, ae7d2519).
+# Keep separate from the existing PG-OPSD templates so that selecting the new
+# objective does not change prior experiment prompts.
+KL_OPSD_STUDENT_PROMPT = (
+    "Problem: {question}\n\n"
+    r"Please reason step by step, and put your final answer within \boxed{{}}."
+)
+
+KL_OPSD_TEACHER_PROMPT = (
+    "Problem: {question}\n\n"
+    "Here is a reference solution to this problem:\n"
+    "=== Reference Solution Begin ===\n{solution}\n=== Reference Solution End ===\n"
+    "\n\nAfter reading the reference solution above, make sure you truly understand "
+    "the reasoning behind each step — do not copy or paraphrase it. Now, using your "
+    "own words and independent reasoning, derive the same final answer to the problem above. "
+    "Think step by step, explore different approaches, and don't be afraid to backtrack "
+    "or reconsider if something doesn't work out:\n\n"
+    r"Please reason step by step, and put your final answer within \boxed{{}}."
+)
+
+
 # The previous question and solution are represented as actual conversation
 # history.  In particular, no model-visible text labels either turn as an
 # "example" or asks the model to refer to it.
@@ -98,6 +119,8 @@ def render_prompt(template: str, /, **variables: str) -> str:
 
 __all__ = [
     "EXPLICIT_STEP_PROMPT",
+    "KL_OPSD_STUDENT_PROMPT",
+    "KL_OPSD_TEACHER_PROMPT",
     "MATH_PROMPT",
     "MATH_ONESHOT_MESSAGES",
     "OPSD_TEACHER_PROMPT",

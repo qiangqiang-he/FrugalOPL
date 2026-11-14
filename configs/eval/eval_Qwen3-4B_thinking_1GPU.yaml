@@ -1,5 +1,5 @@
 # Evaluation profile; inherits only common defaults.
-extends: ../common/eval_thinking_1GPU.yaml
+extends: eval_thinking_1GPU.yaml
 run:
   policy:
     model_name_or_path: ~/projects/models/Qwen3-4B
