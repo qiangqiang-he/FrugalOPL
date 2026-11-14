@@ -1,0 +1,98 @@
+extends: ../../common/shared_batched/4GPU.yaml
+
+eval_interval: 20
+save_ckpt_interval: 25
+
+pipeline:
+  - id: controller
+    class: Controller
+  - id: actor
+    class: Actor
+    plugin_hook: collect_actor_signals
+    cpu_offload: false
+  - id: learner
+    class: Learner
+    plugin_hook: collect_learner_signals
+    objective_fn: compute_objective
+    cpu_offload: false
+
+run:
+  name: iso_gpso_qwen3_1p7b_dapo17k
+  group: iso-gpso
+  prompts:
+    train: KL_OPSD_STUDENT_PROMPT
+    evaluation: KL_OPSD_STUDENT_PROMPT
+  policy:
+    model_name_or_path: Qwen/Qwen3-1.7B
+  runtime:
+    minimum_free_gpu_memory_gb: 3
+  swanlab:
+    enabled: false
+    workspace: null
+  redis:
+    url: redis://127.0.0.1:6379/0
+    key_prefix: frugalopl_iso_gpso
+
+controller:
+  max_steps: 500
+  # The shared round hands four global batches from Actors to Learners.
+  max_inflight_batches: 4
+  train_prompt_batch_size: 32
+  data:
+    max_prompt_length: 4096
+    max_response_length: 1024
+    train:
+      name: dapo17k
+      path: data/DAPO-17k.json
+    eval:
+      - name: amc23
+        path: data/AMC-2023.json
+
+actor:
+  gpu_ids: [4, 5, 6, 7]
+  engine:
+    max_model_len: 32288
+    gpu_memory_utilization: 0.52
+    gpu_memory_budget_gb: 45.0
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    enable_chunked_prefill: true
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+    sleep_engine_after_turn: true
+  evaluation:
+    before_training: false
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    save_rollouts: false
+    generation:
+      max_response_length: 12288
+
+learner:
+  gpu_ids: [4, 5, 6, 7]
+  max_sequence_length: 5120
+  distributed:
+    master_port: 29753
+  execution:
+    forward_chunk_size: 128
+    clip_grad_norm: 0.1
+  optimizer:
+    lr: 5.0e-6
+
+algorithm:
+  plugin: IsoGPSOPlugin
+  algo_name: iso_gpso
+  loss_aggregation: token
+  enable_thinking: false
+  training_sampling:
+    n: 8
+    temperature: 1.1
+    top_p: 0.95
+    top_k: 20
+    max_tokens: 1024
+  teacher_sync_interval: -1
+  one_shot_format: prompt
+  oversampling_ratio: 1.25
+  kl_temperature: 1.1
+  kl_token_clip: 1.0e-7
+  kl_chunk_size: 128

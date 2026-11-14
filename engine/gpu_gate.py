@@ -16,6 +16,7 @@ incorrectly merge unrelated cards.
 from __future__ import annotations
 
 import multiprocessing as mp
+import json
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -28,6 +29,174 @@ class _StopEvent(Protocol):
     def is_set(self) -> bool: ...
 
     def wait(self, timeout: float | None = None) -> bool: ...
+
+
+@dataclass(frozen=True)
+class RoundManifest:
+    round_id: int
+    batch_ids: tuple[str, ...]
+    policy_version: int
+
+
+class SharedRoundGate:
+    """CPU-only phase handoff for a complete co-located Worker group.
+
+    This is not a binary execution lock: all Actors may run together during
+    ACTOR, and all Learner ranks may run together during LEARNER. Per-device
+    gates still protect physical execution against other Worker types.
+    """
+
+    _NAMES = {0: "idle", 1: "actor", 2: "learner", 3: "complete", -1: "aborted"}
+
+    def __init__(self, actor_gpu_ids: tuple[int, ...], learner_ranks: int, max_batches: int, *, ctx=None):
+        if not actor_gpu_ids or learner_ranks < 1 or max_batches < 1:
+            raise ValueError("A shared round requires Actors, Learner ranks and a positive batch limit.")
+        context = ctx if ctx is not None else mp.get_context()
+        self.actor_gpu_ids = tuple(actor_gpu_ids)
+        self.learner_ranks = learner_ranks
+        self.max_batches = max_batches
+        self._condition = context.Condition()
+        self._phase = context.Value("i", 0, lock=False)
+        self._round = context.Value("q", 0, lock=False)
+        self._manifest = context.Array("c", max(16384, max_batches * 256), lock=False)
+        self._error = context.Array("c", 4096, lock=False)
+        self._actor_done = context.Array("b", len(actor_gpu_ids), lock=False)
+        self._learner_ready = context.Array("b", learner_ranks, lock=False)
+        self._learner_done = context.Array("b", learner_ranks, lock=False)
+
+    @property
+    def phase(self) -> str:
+        with self._condition:
+            return self._NAMES[self._phase.value]
+
+    def _check(self) -> None:
+        if self._phase.value == -1:
+            raise RuntimeError("Shared GPU round aborted: " + self._error.value.decode("utf-8", errors="replace"))
+
+    @staticmethod
+    def _stopped(stop_event) -> bool:
+        check = getattr(stop_event, "is_set", None)
+        return bool(callable(check) and check())
+
+    def _read_manifest(self) -> RoundManifest:
+        value = json.loads(self._manifest.value.decode("utf-8"))
+        return RoundManifest(value["round_id"], tuple(value["batch_ids"]), value["policy_version"])
+
+    def begin_round(self, batch_ids, policy_version: int, actor_gpu_ids=None) -> RoundManifest:
+        ids = tuple(batch_ids)
+        if not ids or len(ids) > self.max_batches or len(set(ids)) != len(ids):
+            raise ValueError("Round batch IDs must be non-empty, unique and within the in-flight limit.")
+        if any(not isinstance(item, str) or not item for item in ids):
+            raise ValueError("Round batch IDs must be non-empty strings.")
+        if isinstance(policy_version, bool) or not isinstance(policy_version, int) or policy_version < 0:
+            raise ValueError("Round policy_version must be non-negative.")
+        active = set(self.actor_gpu_ids if actor_gpu_ids is None else actor_gpu_ids)
+        if not active or not active <= set(self.actor_gpu_ids):
+            raise ValueError("Round Actor IDs must belong to the configured Actor group.")
+        with self._condition:
+            self._check()
+            if self._phase.value not in (0, 3):
+                raise RuntimeError("Cannot open a round before the preceding round has fully released its GPUs.")
+            manifest = RoundManifest(self._round.value + 1, ids, policy_version)
+            data = json.dumps(manifest.__dict__).encode("utf-8")
+            if len(data) >= len(self._manifest):
+                raise ValueError("Round manifest exceeds the shared control buffer.")
+            self._manifest.value = data
+            self._round.value = manifest.round_id
+            for index, gpu_id in enumerate(self.actor_gpu_ids):
+                self._actor_done[index] = int(gpu_id not in active)
+            for index in range(self.learner_ranks):
+                self._learner_ready[index] = self._learner_done[index] = 0
+            self._phase.value = 1
+            self._condition.notify_all()
+            return manifest
+
+    def wait_actor(self, gpu_id: int, round_id: int, stop_event=None) -> bool:
+        if gpu_id not in self.actor_gpu_ids:
+            raise ValueError("Unknown Actor GPU.")
+        with self._condition:
+            while True:
+                self._check()
+                if self._stopped(stop_event):
+                    return False
+                if self._round.value == round_id and self._phase.value == 1:
+                    return True
+                if self._round.value >= round_id:
+                    raise RuntimeError("Actor requested an expired round grant.")
+                self._condition.wait(0.1)
+
+    def actor_done(self, gpu_id: int, round_id: int) -> None:
+        with self._condition:
+            self._check()
+            if self._round.value != round_id or self._phase.value != 1:
+                raise RuntimeError("Actor acknowledgement does not match the active generation round.")
+            index = self.actor_gpu_ids.index(gpu_id)
+            if self._actor_done[index]:
+                raise RuntimeError("Duplicate Actor round acknowledgement.")
+            self._actor_done[index] = 1
+            if all(self._actor_done):
+                self._phase.value = 2
+            self._condition.notify_all()
+
+    def wait_learner(self, after_round: int = 0, stop_event=None) -> RoundManifest | None:
+        with self._condition:
+            while True:
+                self._check()
+                if self._stopped(stop_event):
+                    return None
+                if self._phase.value == 2 and self._round.value > after_round:
+                    return self._read_manifest()
+                self._condition.wait(0.1)
+
+    def learner_ready(self, rank: int, round_id: int, stop_event=None) -> bool:
+        if rank not in range(self.learner_ranks):
+            raise ValueError("Unknown Learner rank.")
+        with self._condition:
+            self._check()
+            if self._round.value != round_id or self._phase.value != 2:
+                raise RuntimeError("Learner readiness does not match the active round.")
+            if self._learner_ready[rank]:
+                raise RuntimeError("Duplicate Learner readiness acknowledgement.")
+            self._learner_ready[rank] = 1
+            self._condition.notify_all()
+            while not all(self._learner_ready):
+                self._check()
+                if self._stopped(stop_event):
+                    return False
+                self._condition.wait(0.1)
+            self._check()
+            if self._stopped(stop_event):
+                return False
+            return True
+
+    def learner_done(self, rank: int, round_id: int) -> None:
+        if rank not in range(self.learner_ranks):
+            raise ValueError("Unknown Learner rank.")
+        with self._condition:
+            self._check()
+            if self._round.value != round_id or self._phase.value != 2 or not all(self._learner_ready):
+                raise RuntimeError("Learner completion does not match a fully admitted training round.")
+            if self._learner_done[rank]:
+                raise RuntimeError("Duplicate Learner completion acknowledgement.")
+            self._learner_done[rank] = 1
+            if all(self._learner_done):
+                self._phase.value = 3
+            self._condition.notify_all()
+
+    def wait_complete(self, round_id: int, *, timeout: float = 0.1) -> bool:
+        with self._condition:
+            self._check()
+            if self._round.value == round_id and self._phase.value == 3:
+                return True
+            self._condition.wait(timeout)
+            self._check()
+            return self._round.value == round_id and self._phase.value == 3
+
+    def abort(self, reason: str = "run stopped") -> None:
+        with self._condition:
+            self._error.value = str(reason).encode("utf-8")[:4000]
+            self._phase.value = -1
+            self._condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -139,8 +308,9 @@ class GpuGate:
 class GpuGateRegistry:
     """Map physical GPU IDs to shared or no-op :class:`GpuGate` objects."""
 
-    def __init__(self, gates: Mapping[int, GpuGate]) -> None:
+    def __init__(self, gates: Mapping[int, GpuGate], *, round_gate: SharedRoundGate | None = None) -> None:
         self._gates = dict(gates)
+        self.round_gate = round_gate
 
     @classmethod
     def from_worker_gpu_ids(
@@ -209,4 +379,4 @@ class GpuGateRegistry:
         return tuple(sorted(gpu_id for gpu_id, gate in self._gates.items() if gate.is_shared))
 
 
-__all__ = ["GpuGate", "GpuGateRegistry"]
+__all__ = ["GpuGate", "GpuGateRegistry", "RoundManifest", "SharedRoundGate"]

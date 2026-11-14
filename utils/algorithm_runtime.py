@@ -17,6 +17,7 @@ settings.
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, cast
@@ -61,6 +62,11 @@ class AlgorithmRuntimeConfig:
             Plugins read their scoped fields from here, for example
             ``runtime.algorithm[\"advantage_clip\"]``.  Common fields above are
             exposed separately so plugin code does not repeatedly parse them.
+        max_prompt_length: Optional token cap for one rendered training
+            prompt, resolved from ``controller.data.max_prompt_length``.  It
+            is ``None`` when the Controller does not set a cap.  Plugins that
+            construct privileged prompts can use it without depending on the
+            full Controller configuration.
 
     The snapshots are intentionally independent of the source merged config:
     later config mutation cannot silently change a Worker-local plugin.
@@ -70,6 +76,10 @@ class AlgorithmRuntimeConfig:
     training_sampling: Mapping[str, object] | None
     enable_thinking: bool
     algorithm: Mapping[str, object]
+    max_prompt_length: int | None
+    seed: int = 0
+    train_prompt_batch_size: int | None = None
+    save_question_accuracy: bool = False
 
 
 def resolve_algorithm_runtime_config(config: Mapping[str, object]) -> AlgorithmRuntimeConfig:
@@ -140,6 +150,27 @@ def resolve_algorithm_runtime_config(config: Mapping[str, object]) -> AlgorithmR
     if not isinstance(enable_thinking, bool):
         raise TypeError("algorithm.enable_thinking must be a boolean.")
 
+    controller = config.get("controller")
+    if controller is None:
+        max_prompt_length: int | None = None
+    elif not isinstance(controller, Mapping):
+        raise ValueError("config.controller must be a mapping when present.")
+    else:
+        controller_data = controller.get("data", {})
+        if not isinstance(controller_data, Mapping):
+            raise ValueError("controller.data must be a mapping when present.")
+        configured_max_prompt_length = controller_data.get("max_prompt_length")
+        if configured_max_prompt_length is None:
+            max_prompt_length = None
+        elif (
+            isinstance(configured_max_prompt_length, bool)
+            or not isinstance(configured_max_prompt_length, int)
+            or configured_max_prompt_length <= 0
+        ):
+            raise ValueError("controller.data.max_prompt_length must be a positive integer when present.")
+        else:
+            max_prompt_length = configured_max_prompt_length
+
     # The algorithm snapshot lets a plugin read its own fields without seeing
     # framework siblings such as ``run``.  Sampling receives its own copy so a
     # local Actor request can never mutate this scoped snapshot either.
@@ -148,7 +179,28 @@ def resolve_algorithm_runtime_config(config: Mapping[str, object]) -> AlgorithmR
         training_sampling=training_sampling,
         enable_thinking=enable_thinking,
         algorithm=copy.deepcopy(dict(algorithm)),
+        max_prompt_length=max_prompt_length,
+        seed=int(run.get("seed", 0)) if isinstance(run, Mapping) else 0,
+        train_prompt_batch_size=controller.get("train_prompt_batch_size") if controller is not None else None,
+        save_question_accuracy=config.get("save_question_accuracy", False),
     )
+
+
+def resolve_teacher_sync_interval(algorithm: Mapping[str, object]) -> int:
+    value = algorithm.get("teacher_sync_interval", -1)
+    if isinstance(value, bool) or not isinstance(value, int) or value < -1:
+        raise ValueError("algorithm.teacher_sync_interval must be an integer >= -1.")
+    return value
+
+
+def resolve_train_candidate_count(target: int, algorithm: Mapping[str, object]) -> int:
+    ratio = algorithm.get("oversampling_ratio", 1.0)
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or ratio < 1:
+        raise ValueError("algorithm.oversampling_ratio must be a finite number >= 1.")
+    try:
+        return math.ceil(target * ratio)
+    except (ValueError, OverflowError) as error:
+        raise ValueError("algorithm.oversampling_ratio must produce a finite candidate count.") from error
 
 
 def require_train_template(runtime: AlgorithmRuntimeConfig) -> str:

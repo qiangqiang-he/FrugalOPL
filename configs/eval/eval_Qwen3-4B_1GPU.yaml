@@ -3,7 +3,7 @@
 # allocation is a hard whole-device guardrail: with the current desktop
 # baseline it keeps observed usage below 35 GB.
 
-extends: ../common/eval_1GPU.yaml
+extends: eval_1GPU.yaml
 
 run:
   name: eval_qwen3_4b_aime_2024_zero_shot

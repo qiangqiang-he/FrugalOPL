@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -32,11 +31,8 @@ from utils.tensor_signals import (
     require_tensor_signal,
 )
 
-from .algorithm_base import AlgorithmPlugin, Metrics, Signals
+from .algorithm_base import AlgorithmPlugin, ObjectiveResult, Signals
 from .plugin_registry import register_plugin_class
-
-if TYPE_CHECKING:
-    from torch import Tensor
 
 
 _SMOKE_TRAJECTORY_SIGNALS: dict[str, object] = {
@@ -156,7 +152,7 @@ class ActorTestPlugin(AlgorithmPlugin):
             probability_difference_threshold=self._answer_probe_threshold,
         )
 
-    def compute_objective(self, batch: Signals) -> tuple[Tensor, Metrics]:
+    def compute_objective(self, batch: Signals) -> ObjectiveResult:
         """Exercise all Learner model-signal modes with a real objective.
 
         The objective is deliberately simple and not presented as a research
@@ -270,7 +266,7 @@ class ActorTestPlugin(AlgorithmPlugin):
         probe_probs = require_tensor_batch_field(batch, "answer_probe_probs", dtype=torch.float32)
         actor_lora_step = _actor_lora_step(batch)
 
-        return objective, {
+        return ObjectiveResult(objective=objective, metrics={
             "smoke_reward_mean": rewards.detach().float().mean(),
             "smoke_loss": -objective.detach(),
             "smoke_policy_no_grad_logprob": no_grad_mean.detach(),
@@ -296,7 +292,7 @@ class ActorTestPlugin(AlgorithmPlugin):
             "smoke_prompt_id_override_calls": 1.0,
             "smoke_policy_grad_has_graph": 1.0,
             "smoke_actor_lora_step": float(actor_lora_step),
-        }
+        }, valid_token_count=valid_mask.sum().detach())
 
     def _render_alternate_prompt(self) -> str:
         """Create one no-thinking prompt used solely to exercise overrides."""

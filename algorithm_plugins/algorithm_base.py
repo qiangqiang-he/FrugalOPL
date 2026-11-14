@@ -8,16 +8,82 @@ them.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+if TYPE_CHECKING:
+    import torch
 
 from utils.algorithm_runtime import AlgorithmRuntimeConfig
 
 Signals = dict[str, object]
 Metrics = dict[str, object]
+
+
+def _validate_forward_kl_request(
+    batch: Mapping[str, object],
+    teacher_prompts: Sequence[str],
+    temperature: float,
+    token_clip: float | None,
+    chunk_size: int | None,
+) -> tuple[list[str], float, float | None, int | None]:
+    """Validate the shared public/Worker boundary for one rollout's KL."""
+
+    if not isinstance(batch, Mapping):
+        raise TypeError("compute_forward_kl(batch, ...) requires a signal mapping.")
+    if isinstance(teacher_prompts, (str, bytes)) or not isinstance(teacher_prompts, Sequence):
+        raise TypeError("teacher_prompts must be a sequence containing one prompt string.")
+    if len(teacher_prompts) != 1 or not isinstance(teacher_prompts[0], str) or not teacher_prompts[0].strip():
+        raise ValueError("compute_forward_kl requires exactly one non-empty Teacher prompt.")
+    normalized = []
+    for value, name in ((temperature, "temperature"), (token_clip, "token_clip")):
+        if name == "token_clip" and value is None:
+            normalized.append(None)
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"compute_forward_kl {name} must be a positive finite number.")
+        try:
+            value = float(value)
+        except OverflowError as error:
+            raise ValueError(f"compute_forward_kl {name} must be a positive finite number.") from error
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"compute_forward_kl {name} must be a positive finite number.")
+        normalized.append(value)
+    if chunk_size is not None and (
+        isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0
+    ):
+        raise ValueError("compute_forward_kl chunk_size must be None or a positive integer.")
+    return list(teacher_prompts), normalized[0], normalized[1], chunk_size
+
+
+@dataclass(frozen=True)
+class ObjectiveResult:
+    """One micro-batch objective and its explicit token normalization weight.
+
+    ``objective`` is the maximized mean over the final valid token mask.
+    Multiplying it by ``valid_token_count`` must recover the sum of the same
+    token objective, including every regularization term.  The count must be
+    a detached scalar integer tensor or a Python integer, obtained from the
+    final mask used by the objective rather than the response's padded or
+    unfiltered length.  A zero count is permitted for an empty valid mask.
+
+    Learner uses this weight for ``algorithm.loss_aggregation: token``.
+    Sequence aggregation continues to average micro-batch objectives equally.
+    Two-value iteration preserves existing ``objective, metrics = result``
+    callers without exposing normalization as an experiment metric.
+    """
+
+    objective: torch.Tensor
+    metrics: Metrics
+    valid_token_count: torch.Tensor | int
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.objective
+        yield self.metrics
 
 
 class _PluginRuntime(Protocol):
@@ -54,6 +120,16 @@ class _PluginRuntime(Protocol):
         prompts: Sequence[str] | None,
         prompt_ids: object | None,
         return_signals: Mapping[str, object] | None,
+    ) -> Signals: ...
+
+    def _plugin_compute_forward_kl(
+        self,
+        batch: Signals,
+        *,
+        teacher_prompts: Sequence[str],
+        temperature: float = 1.0,
+        token_clip: float | None = None,
+        chunk_size: int | None = None,
     ) -> Signals: ...
 
 
@@ -106,11 +182,14 @@ class AlgorithmPlugin:
     only the fields newly produced at that Worker; the engine merges and
     forwards them.  The configured Learner objective runs on one rollout, so
     its physical batch dimension is fixed at one while Learner accumulates the
-    logical batch outside the plugin.  Plugins need implement only the methods
-    named by their own pipeline.
+    logical batch outside the plugin.  A legacy ``(objective, metrics)`` return
+    supports sequence aggregation; token aggregation requires ObjectiveResult
+    with the count from that objective's final valid mask.  Plugins need
+    implement only the methods named by their own pipeline.
     """
 
     requires_frozen_reference: bool = False
+    computes_actor_question_accuracy: bool = False
 
     @classmethod
     def from_runtime_config(
@@ -131,6 +210,39 @@ class AlgorithmPlugin:
             f"Registered algorithm plugin {cls.__name__} must implement "
             "from_runtime_config(tokenizer, runtime)."
         )
+
+    def on_training_step_completed(self, *, step: int, metrics: Mapping[str, object]) -> Metrics:
+        """Observe globally reduced metrics after one logical optimizer step.
+
+        All Learner ranks call this hook before publishing the matching
+        adapter/checkpoint. Returned scalar diagnostics join that step's
+        metrics, while any algorithm state change affects the next step.
+        """
+
+        del step, metrics
+        return {}
+
+    def prepare_learner_batch(self, signals: Signals) -> Signals:
+        """Select training rollouts from the complete logical Actor batch."""
+
+        return signals
+
+    def finalize_actor_batch(self, signals: Signals) -> Signals:
+        """Postprocess this Actor shard's generated trajectories."""
+
+        return signals
+
+    def training_state_dict(self) -> dict[str, object]:
+        """Return algorithm-owned state to save with the optimizer checkpoint."""
+
+        return {}
+
+    def load_training_state_dict(self, state: Mapping[str, object], *, step: int) -> None:
+        """Restore algorithm state after the checkpoint's optimizer is loaded."""
+
+        del step
+        if not isinstance(state, Mapping) or state:
+            raise ValueError(f"{type(self).__name__} does not support non-empty saved algorithm state.")
 
     def answer_probe(
         self,
@@ -248,5 +360,51 @@ class AlgorithmPlugin:
             return_signals=dict(return_signals) if return_signals is not None else None,
         )
 
+    def compute_forward_kl(
+        self,
+        batch: Signals,
+        *,
+        teacher_prompts: Sequence[str],
+        temperature: float = 1.0,
+        token_clip: float | None = None,
+        chunk_size: int | None = None,
+    ) -> Signals:
+        """Return exact full-vocabulary Teacher-to-Student KL at response positions.
 
-__all__ = ["AlgorithmPlugin", "Metrics", "Signals"]
+        This capability is available only during a Learner objective for one
+        unpadded rollout. Student inputs come from ``batch``; the sole Teacher
+        prompt replaces only its prompt, preserving identical response IDs.
+        Teacher scoring uses the configured LoRA version under no-grad and
+        eval mode. The default interval (-1) uses the frozen base; Student
+        scoring remains differentiable with its own LoRA active.
+
+        Both distributions use ``temperature`` and the complete vocabulary;
+        no sampled-token or top-k approximation and no T-squared multiplier is
+        applied. Optional ``token_clip`` caps each vocabulary contribution
+        ``q * (log(q) - log(p))`` from above before summing vocabulary entries.
+        Negative contributions are retained. ``chunk_size`` bounds the number
+        of response positions materialized at once and defaults to the Worker
+        forward chunk size. Full logits/hidden states never leave the Worker.
+
+        Results retain shape ``[1, response_length]``:
+        ``response_forward_kl`` is differentiable and includes the pointwise
+        cap; ``response_forward_kl_unclipped`` and
+        ``response_forward_kl_clipped_fraction`` are detached diagnostics. The
+        latter is the fraction of vocabulary contributions exceeding the cap,
+        or zero when the cap is disabled. The plugin owns masked reduction
+        into its maximized objective and corresponding valid-token count.
+        """
+
+        scope = _ACTIVE_PLUGIN_SCOPE.get()
+        if scope is None or scope.worker != "learner" or scope.phase != "objective":
+            raise RuntimeError("compute_forward_kl() is only available inside a Learner objective.")
+        prompts, temperature, token_clip, chunk_size = _validate_forward_kl_request(
+            batch, teacher_prompts, temperature, token_clip, chunk_size,
+        )
+        return scope.runtime._plugin_compute_forward_kl(
+            dict(batch), teacher_prompts=prompts, temperature=temperature,
+            token_clip=token_clip, chunk_size=chunk_size,
+        )
+
+
+__all__ = ["AlgorithmPlugin", "Metrics", "ObjectiveResult", "Signals"]
