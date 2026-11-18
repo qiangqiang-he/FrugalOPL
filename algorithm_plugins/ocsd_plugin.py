@@ -30,8 +30,8 @@ class OCSDPlugin(AlgorithmPlugin):
             raise ValueError("OCSD requires algorithm.loss_aggregation='token'.")
         if self._sampling.get("temperature", 1.0) != 1.0:
             raise ValueError("OCSD requires algorithm.training_sampling.temperature=1.0.")
-        self._gamma, self._tau = validate_ocsd_parameters(
-            runtime.algorithm.get("ocsd_gamma", 0.1), runtime.algorithm.get("ocsd_tau", 0.95),
+        self._gamma_pos, self._tau = validate_ocsd_parameters(
+            runtime.algorithm.get("ocsd_gamma", 0.25), runtime.algorithm.get("ocsd_tau", 0.95),
         )
 
     @classmethod
@@ -54,6 +54,7 @@ class OCSDPlugin(AlgorithmPlugin):
             "return_signals": {
                 "prompt_ids": True, "response_ids": True, "prompt_indices": True, "responses": True,
                 "response_logprobs": False, "response_truncated": False,
+                "generation_entropy": True,
             },
         }
 
@@ -64,23 +65,41 @@ class OCSDPlugin(AlgorithmPlugin):
         answers = signals["answers"]
         rollout_answers = [str(answers[index]) for index in signals["prompt_indices"].tolist()]
         scores = verify_response_answers(responses, rollout_answers)
-        return {"ocsd_correct": torch.tensor(scores, dtype=torch.bool)}
+        correct_count = sum(scores)
+        incorrect_count = len(scores) - correct_count
+        # This hook sees the complete logical batch before it is split across ranks.
+        negative_scale = min(0.75, max(0.25, correct_count / max(1, incorrect_count)))
+        return {
+            "ocsd_correct": torch.tensor(scores, dtype=torch.bool),
+            "ocsd_gamma_neg": self._gamma_pos * negative_scale,
+        }
 
     def compute_objective(self, batch: Signals) -> ObjectiveResult:
-        values = self.compute_ocsd(batch, gamma=self._gamma, tau=self._tau)
+        gamma_neg = float(batch["ocsd_gamma_neg"])
+        values = self.compute_ocsd(batch, gamma_pos=self._gamma_pos, gamma_neg=gamma_neg, tau=self._tau)
         mask = require_tensor_batch_field(batch, "response_mask", dtype=torch.bool)
         correct = require_tensor_batch_field(batch, "ocsd_correct")
         loss = masked_token_mean(values["response_ocsd_kl"], mask)
-        transfer = values["response_ocsd_transfer"]
+        reward = correct.float().mean()
+        outcome = "correct" if bool(correct.item()) else "incorrect"
+        metrics = {
+            "ocsd_loss": loss.detach(),
+            "ocsd_accuracy": reward,
+            "ocsd_reward_mean": reward,
+            "ocsd_response_length_mean": mask.sum(-1).float().mean(),
+            "ocsd_gamma_pos": self._gamma_pos,
+            "ocsd_gamma_neg": gamma_neg,
+            "ocsd_zero_transfer_fraction": masked_token_mean((values["response_ocsd_transfer"] == 0).float(), mask),
+        }
+        for name in ("head_mass", "tail_mass", "protected_mass", "transfer",
+                     "head_relative_transfer", "tail_relative_transfer"):
+            mean = masked_token_mean(values[f"response_ocsd_{name}"], mask)
+            metric_name = "transfer_mass" if name == "transfer" else name
+            metrics[f"ocsd_{metric_name}"] = mean
+            metrics[f"ocsd_{outcome}_{metric_name}"] = mean
         return ObjectiveResult(
             objective=-loss,
-            metrics={
-                "ocsd_loss": loss.detach(),
-                "ocsd_accuracy": correct.float().mean(),
-                "ocsd_head_mass": masked_token_mean(values["response_ocsd_head_mass"], mask),
-                "ocsd_transfer_mass": masked_token_mean(transfer, mask),
-                "ocsd_zero_transfer_fraction": masked_token_mean((transfer == 0).float(), mask),
-            },
+            metrics=metrics,
             valid_token_count=mask.sum().detach(),
         )
 

@@ -136,7 +136,9 @@ class _PluginRuntime(Protocol):
         self, batch: Signals, *, top_p: float, temperature: float, chunk_size: int | None,
     ) -> Signals: ...
 
-    def _plugin_compute_ocsd(self, batch: Signals, *, gamma: float, tau: float) -> Signals: ...
+    def _plugin_compute_ocsd(
+        self, batch: Signals, *, gamma_pos: float, gamma_neg: float, tau: float,
+    ) -> Signals: ...
 
 
 @dataclass(frozen=True)
@@ -434,14 +436,14 @@ class AlgorithmPlugin:
             dict(batch), top_p=top_p, temperature=temperature, chunk_size=chunk_size,
         )
 
-    def compute_ocsd(self, batch: Signals, *, gamma: float, tau: float) -> Signals:
+    def compute_ocsd(self, batch: Signals, *, gamma_pos: float, gamma_neg: float, tau: float) -> Signals:
         """Score full-vocabulary OCSD using the current student at temperature one."""
         scope = _ACTIVE_PLUGIN_SCOPE.get()
         if scope is None or scope.worker != "learner" or scope.phase != "objective":
             raise RuntimeError("compute_ocsd() is only available inside a Learner objective.")
         if not isinstance(batch, Mapping):
             raise TypeError("compute_ocsd requires a signal mapping.")
-        return scope.runtime._plugin_compute_ocsd(dict(batch), gamma=gamma, tau=tau)
+        return scope.runtime._plugin_compute_ocsd(dict(batch), gamma_pos=gamma_pos, gamma_neg=gamma_neg, tau=tau)
 
 
 __all__ = ["AlgorithmPlugin", "Metrics", "ObjectiveResult", "Signals"]

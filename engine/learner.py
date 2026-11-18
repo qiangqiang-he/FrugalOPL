@@ -1849,7 +1849,7 @@ class Learner:
         finally:
             module.train(prior_training)
 
-    def _plugin_compute_ocsd(self, batch: Signals, *, gamma: float, tau: float) -> Signals:
+    def _plugin_compute_ocsd(self, batch: Signals, *, gamma_pos: float, gamma_neg: float, tau: float) -> Signals:
         """Compute OCSD from one current-policy forward with bounded LM-head chunks."""
         from torch.utils.checkpoint import checkpoint
 
@@ -1873,7 +1873,9 @@ class Learner:
             if restore_eval:
                 head.train()
             try:
-                return ocsd_token_values(head(hidden), sampled_ids, correct, gamma=gamma, tau=tau)
+                return ocsd_token_values(
+                    head(hidden), sampled_ids, correct, gamma_pos=gamma_pos, gamma_neg=gamma_neg, tau=tau,
+                )
             finally:
                 if restore_eval:
                     head.eval()

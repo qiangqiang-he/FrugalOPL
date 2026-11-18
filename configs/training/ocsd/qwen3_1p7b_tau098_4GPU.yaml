@@ -1,0 +1,14 @@
+extends: qwen3_1p7b_shared_batched_4GPU.yaml
+
+run:
+  name: ocsd_qwen3_1p7b_dapo17k_tau098_shared_4gpu
+
+controller:
+  max_steps: 500
+
+actor:
+  engine:
+    enforce_eager: false
+
+algorithm:
+  ocsd_tau: 0.98

@@ -219,6 +219,11 @@ def _merge_actor_shards(shards: Sequence[Mapping[str, object]]) -> Signals:
         sum(float(metric.get("avg_response_tokens_per_response", 0.0)) * float(metric.get("cumulative_rollout_count", 0.0)) for metric in metrics)
         / cumulative_rollouts if cumulative_rollouts else 0.0
     )
+    if any("batch_generation_entropy_sum" in metric for metric in metrics):
+        entropy_tokens = sum(int(metric["batch_generation_entropy_tokens"]) for metric in metrics)
+        entropy_sum = sum(float(metric["batch_generation_entropy_sum"]) for metric in metrics)
+        combined_metrics["batch_generation_entropy_tokens"] = entropy_tokens
+        combined_metrics["batch_generation_entropy_nats"] = entropy_sum / entropy_tokens if entropy_tokens else 0.0
     result["actor_metrics"] = combined_metrics
     worker_timings = []
     for shard in ordered:
@@ -1073,6 +1078,12 @@ class Actor:
                 # Graph setting above: enforce_eager remains configuration
                 # owned and must stay false for the local sequential profile.
                 llm_kwargs["enable_sleep_mode"] = True
+            track_entropy = bool(self.engine_cfg.get("track_generation_entropy", False))
+            if track_entropy:
+                llm_kwargs.update(
+                    worker_extension_cls="engine.generation_entropy.GenerationEntropyWorker",
+                    async_scheduling=False,
+                )
             # Keep the generic Actor compatible with vLLM defaults unless a
             # profile explicitly opts into bounded scheduler/graph settings.
             # These controls limit only vLLM's internal concurrent requests;
@@ -1097,6 +1108,8 @@ class Actor:
                 self.lora_enabled = False
                 llm_kwargs["enable_lora"] = False
                 self.llm = LLM(**llm_kwargs)
+            if track_entropy:
+                self.llm.collective_rpc("install_generation_entropy")
             try:
                 self.tokenizer = self.llm.get_tokenizer()
             except Exception:
@@ -1980,10 +1993,24 @@ class Actor:
         merged_prompts: list[str] = []
         merged_params: list[object] = []
         prompt_counts: list[int] = []
-        for request in requests:
+        entropy_requested = False
+        for index, request in enumerate(requests):
             params = self._sampling_params_for_request(
                 request.sampling, request.require_return, len(request.prompts)
             )
+            if request.require_return.get("generation_entropy", False):
+                from engine.generation_entropy import ENTROPY_GROUP
+
+                entropy_requested = True
+                for param in params:
+                    if (
+                        param.temperature != 1.0 or param.top_p != 1.0 or param.top_k not in (-1, 0)
+                        or param.min_p or param.repetition_penalty != 1.0 or param.presence_penalty
+                        or param.frequency_penalty or param.min_tokens or param.bad_words
+                        or param.allowed_token_ids or param.logit_bias
+                    ):
+                        raise ValueError("Generation entropy requires unmodified T=1 full-vocabulary sampling.")
+                    param.extra_args = {**(param.extra_args or {}), ENTROPY_GROUP: index}
             request.sampling_params = params
             prompt_counts.append(len(request.prompts))
             merged_prompts.extend(request.prompts)
@@ -1994,16 +2021,25 @@ class Actor:
         generate = getattr(self.llm, "generate", None)
         if not callable(generate):
             raise TypeError("Actor vLLM engine must provide generate().")
+
+        def generate_with_entropy(lora_request: object):
+            entropy = None
+            if entropy_requested:
+                self.llm.collective_rpc("begin_generation_entropy", args=(len(requests),))
+            try:
+                outputs = generate(
+                    merged_prompts, merged_params, lora_request=lora_request, use_tqdm=False,
+                    tokenization_kwargs={"add_special_tokens": False},
+                )
+            finally:
+                if entropy_requested:
+                    entropy = self.llm.collective_rpc("finish_generation_entropy")[0]
+            return outputs, entropy
+
         active_lora_request = self.current_lora_request
         # Prompts already contain the chat template's control tokens, including BOS.
         try:
-            outputs = generate(
-                merged_prompts,
-                merged_params,
-                lora_request=active_lora_request,
-                use_tqdm=False,
-                tokenization_kwargs={"add_special_tokens": False},
-            )
+            outputs, entropy = generate_with_entropy(active_lora_request)
         except Exception as error:
             if active_lora_request is None or self._wave_policy_version is not None:
                 raise
@@ -2017,13 +2053,7 @@ class Actor:
             # A LoRA-enabled vLLM engine accepts a null request as the base
             # model.  Retry exactly once; a base-model failure must remain
             # visible to the caller instead of being silently swallowed.
-            outputs = generate(
-                merged_prompts,
-                merged_params,
-                lora_request=None,
-                use_tqdm=False,
-                tokenization_kwargs={"add_special_tokens": False},
-            )
+            outputs, entropy = generate_with_entropy(None)
         self._validate_actor_memory_budget("generation")
         elapsed = time.perf_counter() - started
         if not isinstance(outputs, list) or len(outputs) != len(merged_prompts):
@@ -2031,7 +2061,7 @@ class Actor:
 
         total_rollouts = sum(len(getattr(output, "outputs", [])) for output in outputs)
         offset = 0
-        for request, prompt_count in zip(requests, prompt_counts):
+        for index, (request, prompt_count) in enumerate(zip(requests, prompt_counts)):
             request_outputs = outputs[offset : offset + prompt_count]
             request_params = merged_params[offset : offset + prompt_count]
             trajectory, response_tokens, rollout_count, prompt_tokens = self._parse_outputs(
@@ -2041,6 +2071,17 @@ class Actor:
             metadata = self._rollout_metadata(
                 proportional_duration, response_tokens, rollout_count, prompt_tokens, len(request_outputs)
             )
+            if request.require_return.get("generation_entropy", False):
+                entropy_sum, entropy_tokens = entropy[index]
+                if entropy_tokens != response_tokens or not math.isfinite(entropy_sum):
+                    raise RuntimeError(
+                        f"Generation entropy has {entropy_tokens} observations for {response_tokens} response tokens."
+                    )
+                metadata.update(
+                    batch_generation_entropy_sum=entropy_sum,
+                    batch_generation_entropy_tokens=entropy_tokens,
+                    batch_generation_entropy_nats=entropy_sum / entropy_tokens if entropy_tokens else 0.0,
+                )
             if not request.future.done():
                 request.future.set_result((trajectory, metadata))
             offset += prompt_count

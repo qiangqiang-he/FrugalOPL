@@ -36,6 +36,7 @@ controller:
 
 actor:
   engine:
+    track_generation_entropy: true
     max_num_seqs: 32
     max_num_batched_tokens: 4096
     enable_chunked_prefill: true
@@ -61,7 +62,7 @@ algorithm:
   algo_name: ocsd
   loss_aggregation: token
   enable_thinking: false
-  ocsd_gamma: 0.1
+  ocsd_gamma: 0.25  # Positive coefficient. The batch sets the negative coefficient.
   ocsd_tau: 0.95
   training_sampling:
     temperature: 1.0
