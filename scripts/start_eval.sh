@@ -89,12 +89,39 @@ case "${config_path}" in
         ;;
 esac
 mkdir -p -- "${log_dir}"
-log_path="${log_dir}/${session_name}.log"
+log_path="${GPU_LOG:-${log_dir}/${session_name}.log}"
+if [[ "${log_path}" != /* ]]; then
+    echo "Error: GPU_LOG must be an absolute path: ${log_path}" >&2
+    exit 1
+fi
+mkdir -p -- "$(dirname -- "${log_path}")"
+export GPU_LOG="${log_path}"
 status_path="${log_dir}/${session_name}.status"
 rm -f -- "${status_path}"
 
 # Quote all paths before passing them through tmux's shell-command interface.
-printf -v python_command '%q ' "${python_bin}" "${project_root}/utils/eval.py" --config "${config_path}"
+# An existing tmux server may retain another task's environment. Put the GPU
+# registration and selected runtime directly on the eventual Python command.
+python_dir="$(dirname -- "${python_bin}")"
+runtime_variables=(CONDA_PREFIX CUDA_HOME CUDA_PATH LD_LIBRARY_PATH
+    TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TORCH_EXTENSIONS_DIR
+    VLLM_CACHE_ROOT HF_HOME CUDA_CACHE_PATH TORCH_HOME CUDA_VISIBLE_DEVICES)
+evaluation_environment=(env)
+for runtime_variable in "${runtime_variables[@]}"; do
+    if [[ ! -v "${runtime_variable}" ]]; then
+        evaluation_environment+=(-u "${runtime_variable}")
+    fi
+done
+evaluation_environment+=(PYTHONUNBUFFERED=1 SPT_NOENV=1 "PATH=${python_dir}:${PATH}"
+    "OMP_NUM_THREADS=${OMP_NUM_THREADS-4}" "MKL_NUM_THREADS=${MKL_NUM_THREADS-4}"
+    "OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS-4}"
+    "MAX_JOBS=${MAX_JOBS-4}" "TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS-2}")
+for environment_variable in GPU_OWNER GPU_TASK GPU_HOURS GPU_KIND GPU_LOG GPU_RUN "${runtime_variables[@]}"; do
+    if [[ -v "${environment_variable}" ]]; then
+        evaluation_environment+=("${environment_variable}=${!environment_variable}")
+    fi
+done
+printf -v python_command '%q ' "${evaluation_environment[@]}" "${python_bin}" "${project_root}/utils/eval.py" --config "${config_path}"
 python_command="${python_command% }"
 printf -v quoted_log '%q' "${log_path}"
 printf -v quoted_status '%q' "${status_path}"

@@ -1,0 +1,10 @@
+extends: qwen3_1p7b_rtx5000_2_shared_batched_4GPU.yaml
+
+run:
+  name: iso_gpso_qwen3_1p7b_dapo17k_8gpu
+
+actor:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+
+learner:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]

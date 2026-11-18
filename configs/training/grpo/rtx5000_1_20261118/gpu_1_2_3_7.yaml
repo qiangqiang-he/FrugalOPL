@@ -1,0 +1,8 @@
+extends: base.yaml
+actor:
+  gpu_ids: [1, 2, 3, 7]
+learner:
+  gpu_ids: [1, 2, 3, 7]
+worker_defaults:
+  Teacher:
+    gpu_ids: [1, 2, 3, 7]

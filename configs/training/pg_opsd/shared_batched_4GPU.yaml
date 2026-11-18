@@ -1,0 +1,89 @@
+# Four co-located Actor/Learner pairs, K=4. Each global batch is consumed once.
+# Retain the original Qwen3-1.7B PG-OPSD workload and optimizer settings.
+extends: ../../common/shared_batched/4GPU.yaml
+
+eval_interval: 20
+save_ckpt_interval: 20
+save_question_accuracy: false
+
+pipeline:
+  - id: controller
+    class: Controller
+  - id: actor
+    class: Actor
+    plugin_hook: collect_actor_signals
+    cpu_offload: false
+  - id: learner
+    class: Learner
+    plugin_hook: collect_learner_signals
+    objective_fn: compute_objective
+    cpu_offload: false
+
+run:
+  name: pg_opsd_qwen3_1p7b_openthoughts_math30k_shared_batched_4gpu
+  group: pg-opsd
+  seed: 42
+  redis:
+    url: redis://localhost:6379/0
+    key_prefix: frugalopl_pg_opsd_shared_batched_4gpu
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-1.7B
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+
+controller:
+  max_steps: 100
+  train_prompt_batch_size: 32
+  data:
+    max_prompt_length: 2048
+    max_response_length: 4096
+    train:
+      name: openthoughts_math30k
+      path: data/openthoughts_math30k.json
+    eval:
+      - name: aime24
+        path: data/AIME-2024.json
+      - name: amc23
+        path: data/AMC-2023.json
+
+actor:
+  engine:
+    max_model_len: 18432
+  evaluation:
+    enabled: true
+    before_training: true
+    max_examples: null
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    save_rollouts: false
+    generation:
+      temperature: 0.7
+      top_p: 0.95
+      max_response_length: 16384
+
+learner:
+  max_sequence_length: 8192
+  distributed:
+    master_port: 29704
+  execution:
+    forward_chunk_size: 512
+    gradient_checkpointing: true
+    clip_grad_norm: 1.0
+  optimizer:
+    lr: 1.0e-5
+  scheduler:
+    type: constant
+
+algorithm:
+  plugin: PGOPSDPlugin
+  algo_name: pg_opsd
+  loss_aggregation: sequence
+  enable_thinking: false
+  training_sampling:
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 4096
+    n: 4
+  advantage_clip: 10.0

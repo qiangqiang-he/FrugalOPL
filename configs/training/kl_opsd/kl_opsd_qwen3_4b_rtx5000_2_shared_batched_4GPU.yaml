@@ -1,0 +1,29 @@
+# RTX5000-2 GPUs 4-7. Same KL-OPSD recipe as the completed Qwen3-8B run.
+extends: shared_batched_4GPU.yaml
+
+run:
+  name: kl_opsd_qwen3_4b_math30k_b64n1_aime24_12288_nothinking_rtx5000_2_20261106
+  storage:
+    output_root: /data/heqiangqiang/outputs/FrugalOPL
+  redis:
+    url: redis://127.0.0.1:16379/0
+    key_prefix: frugalopl_kl_opsd_qwen3_4b_rtx5000_2_b64n1_aime24_12288_20261106
+  runtime:
+    minimum_free_gpu_memory_gb: 3
+  policy:
+    model_name_or_path: /data/heqiangqiang/models/Qwen3-4B-nvme-20261106
+
+worker_defaults:
+  Teacher:
+    gpu_ids: [4, 5, 6, 7]
+
+actor:
+  gpu_ids: [4, 5, 6, 7]
+  engine:
+    gpu_memory_utilization: 0.52
+    gpu_memory_budget_gb: 45.0
+
+learner:
+  gpu_ids: [4, 5, 6, 7]
+  distributed:
+    master_port: 29750

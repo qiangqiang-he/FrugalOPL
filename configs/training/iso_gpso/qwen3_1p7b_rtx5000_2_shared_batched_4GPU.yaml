@@ -1,0 +1,45 @@
+extends: ../kl_opsd/kl_opsd_qwen3_1p7b_rtx5000_2_shared_batched_4GPU.yaml
+
+eval_interval: 20
+
+run:
+  name: iso_gpso_qwen3_1p7b_dapo17k
+  group: iso-gpso
+  swanlab:
+    enabled: false
+  redis:
+    key_prefix: frugalopl_iso_gpso_qwen3_1p7b_rtx5000_2
+
+controller:
+  max_steps: 500
+  # The shared round hands four global batches from Actors to Learners.
+  max_inflight_batches: 4
+  train_prompt_batch_size: 32
+  data:
+    max_prompt_length: 4096
+    train:
+      name: dapo17k
+      path: data/DAPO-17k.json
+    eval:
+      - name: amc23
+        path: data/AMC-2023.json
+
+actor:
+  engine:
+    sleep_engine_after_turn: true
+  evaluation:
+    before_training: false
+
+learner:
+  max_sequence_length: 5120
+  distributed:
+    master_port: 29753
+
+algorithm:
+  plugin: IsoGPSOPlugin
+  algo_name: iso_gpso
+  training_sampling:
+    n: 8
+  teacher_sync_interval: -1
+  one_shot_format: prompt
+  oversampling_ratio: 1.25

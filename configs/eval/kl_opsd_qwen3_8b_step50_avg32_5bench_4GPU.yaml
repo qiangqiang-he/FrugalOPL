@@ -1,0 +1,54 @@
+# RTX5000-3: four independent vLLM replicas, using the trained step-50 LoRA.
+extends: ../common/shared_batched/4GPU.yaml
+
+run:
+  name: Logic_RL
+  seed: 42
+  prompts:
+    evaluation: KL_OPSD_STUDENT_PROMPT
+  policy:
+    model_name_or_path: /data/heqiangqiang/models/Qwen3-8B-nvme-20261106
+  output_dir: /data/heqiangqiang/outputs/FrugalOPL/kl_opsd_qwen3_8b_step50_avg32_5bench_20261107
+
+actor:
+  gpu_ids: [0, 1, 2, 3]
+  engine:
+    max_model_len: 20480
+    gpu_memory_utilization: 0.52
+    gpu_memory_budget_gb: 45.0
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    enable_chunked_prefill: true
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+  lora:
+    enabled: true
+    max_rank: 64
+    path: /data/heqiangqiang/outputs/FrugalOPL/kl_opsd_qwen3_8b_math30k_b64n1_aime24_12288_nothinking_20261106/checkpoints/step_50/adapter_lora
+  evaluation:
+    enabled: true
+    enable_thinking: false
+    max_examples: null
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 32
+    save_rollouts: true
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      max_response_length: 12288
+    datasets:
+      aime_2024:
+        path: data/AIME-2024.json
+        prompt: evaluation
+      aime_2025:
+        path: data/AIME-2025.json
+        prompt: evaluation
+      aime_2026:
+        path: data/AIME-2026.json
+        prompt: evaluation
+      amc_2023:
+        path: data/AMC-2023.json
+        prompt: evaluation
+      math500:
+        path: data/MATH500.json
+        prompt: evaluation

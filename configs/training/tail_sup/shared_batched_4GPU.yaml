@@ -1,0 +1,98 @@
+# Exact on-policy self-distillation: one fresh batch and one optimizer update.
+extends: ../../common/shared_batched/4GPU.yaml
+eval_interval: 10
+save_ckpt_interval: 10
+save_question_accuracy: false
+
+pipeline:
+  - id: controller
+    class: Controller
+  - id: actor
+    class: Actor
+    plugin_hook: collect_actor_signals
+    cpu_offload: false
+  - id: learner
+    class: Learner
+    plugin_hook: collect_learner_signals
+    objective_fn: compute_objective
+    cpu_offload: false
+
+run:
+  name: tail_sup_qwen3_1p7b_dapo17k_p090_b64n4_r4096_100steps
+  group: tail-sup
+  seed: 42
+  prompts:
+    train: MATH_PROMPT
+    evaluation: MATH_PROMPT
+  policy:
+    model_name_or_path: /data/heqiangqiang/cache/models/Qwen3-1.7B
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+
+controller:
+  max_steps: 100
+  max_inflight_batches: 1
+  train_prompt_batch_size: 64
+  data:
+    max_prompt_length: 2048
+    max_response_length: 4096
+    train:
+      name: dapo17k
+      path: data/DAPO-17k.json
+    eval:
+      - name: amc23
+        path: data/AMC-2023.json
+
+actor:
+  engine:
+    max_model_len: 20480
+    gpu_memory_utilization: 0.5
+    gpu_memory_budget_gb: 40.0
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    enable_chunked_prefill: true
+    enforce_eager: false
+    sleep_engine_after_turn: true
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+  evaluation:
+    enabled: true
+    before_training: true
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    save_rollouts: false
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      max_response_length: 16384
+
+learner:
+  max_sequence_length: 6144
+  execution:
+    forward_chunk_size: 32
+    gradient_checkpointing: true
+    clip_grad_norm: 0.1
+  optimizer:
+    lr: 5.0e-6
+  scheduler:
+    type: constant
+
+algorithm:
+  plugin: TailSupPlugin
+  algo_name: tail_sup
+  loss_aggregation: token
+  enable_thinking: false
+  # This provisions a frozen versioned old-student adapter, not an external teacher.
+  teacher_sync_interval: 1
+  training_sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 4096
+    n: 4
+  # Head selection is independent of rollout sampling settings above.
+  tail_sup_top_p: 0.9
+  tail_sup_temperature: 1.0
+  tail_sup_chunk_size: 32

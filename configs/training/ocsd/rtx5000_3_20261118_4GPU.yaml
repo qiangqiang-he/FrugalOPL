@@ -1,0 +1,23 @@
+extends: qwen3_1p7b_shared_batched_4GPU.yaml
+
+run:
+  name: ocsd_qwen3_1p7b_dapo17k_b32n8_gamma025_rtx5000_3_20261118
+  redis:
+    url: redis://127.0.0.1:16379/0
+    key_prefix: frugalopl_ocsd_gamma025_rtx5000_3_20261118
+  policy:
+    model_name_or_path: /data/heqiangqiang/models/Qwen3-1.7B
+  runtime:
+    minimum_free_gpu_memory_gb: 3
+
+actor:
+  gpu_ids: [0, 1, 2, 3]
+
+learner:
+  gpu_ids: [0, 1, 2, 3]
+  distributed:
+    master_port: 29897
+
+algorithm:
+  ocsd_gamma: 0.25
+  ocsd_tau: 0.95

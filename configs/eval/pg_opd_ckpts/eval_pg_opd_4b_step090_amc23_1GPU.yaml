@@ -1,0 +1,22 @@
+# AMC-2023 (40 questions) Avg@8 sweep entry: PG-OPD Qwen3-4B student,
+# checkpoint exported at training step 90.
+extends: common_pg_opd_ckpts_1GPU.yaml
+
+run:
+  name: eval_pg_opd_4b_step090_amc23
+  output_dir: outputs/pg_opd_ckpt_eval/qwen3_4b/amc23_step090
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-4B
+
+actor:
+  engine:
+    # Matches the established Qwen3-4B offline preset on this card.
+    gpu_memory_utilization: 0.58
+  lora:
+    path: outputs/pg_opd_qwen3_4b_instruct_2507_to_4b_dapo17k_r64_100steps_2GPU_amc23_20/eval_adapters/step_90
+  evaluation:
+    datasets:
+      amc23:
+        path: data/AMC-2023.json
+        prompt: evaluation
+        max_examples: null

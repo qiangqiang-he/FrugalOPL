@@ -1,0 +1,14 @@
+extends: shared_batched_4GPU.yaml
+run:
+  name: grpo_qwen3_1p7b_rtx5000_3_urgent_20261118
+  redis:
+    url: redis://127.0.0.1:16379/0
+    key_prefix: frugalopl_grpo_rtx5000_3_urgent_20261118
+  policy:
+    model_name_or_path: /data/heqiangqiang/models/Qwen3-1.7B
+actor:
+  gpu_ids: [0, 1, 2, 3]
+learner:
+  gpu_ids: [0, 1, 2, 3]
+  distributed:
+    master_port: 29896

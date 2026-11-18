@@ -3,7 +3,7 @@
 The Learner owns model residency, LoRA switching, model forwards, answer
 probes, micro-batching, distributed placement, backward passes, optimizer
 steps, and adapter publication.  Algorithm plugins only see ordinary signal
-dictionaries and call two worker-local helpers inherited from
+dictionaries and call worker-local helpers inherited from
 ``AlgorithmPlugin``:
 
 ``self.answer_probe(batch, probability_difference_threshold=...)``
@@ -15,6 +15,11 @@ dictionaries and call two worker-local helpers inherited from
     or the current single-rollout micro-batch inside ``compute_objective``.
     It returns token-aligned signals, never full-vocabulary logits.
 
+``self.compute_forward_kl(batch, teacher_prompts=...)``
+    Computes full-vocabulary frozen-Teacher-to-Student KL inside the objective.
+    Token chunks are recomputed during backward; only tokenwise KL leaves the
+    Worker, and Teacher logits are never cached across the logical batch.
+
 No algorithm code receives a Learner, Redis client, rank, CUDA device, or
 DeepSpeed engine.
 """
@@ -25,10 +30,13 @@ import argparse
 import copy
 import datetime
 import gc
+import inspect
+import json
 import math
 import multiprocessing as mp
 import os
 import pickle
+import random
 import re
 import shutil
 import signal
@@ -36,8 +44,9 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -49,11 +58,15 @@ from algorithm_plugins import plugin_factory_from_config
 from algorithm_plugins.algorithm_base import (
     AlgorithmPlugin,
     Metrics,
+    ObjectiveResult,
     Signals,
     _learner_plugin_scope,
+    _validate_forward_kl_request,
 )
-from engine.gpu_gate import GpuGate, GpuGateRegistry
+from engine.gpu_gate import GpuGate, GpuGateRegistry, RoundManifest, SharedRoundGate
 from engine.pipeline import resolve_training_pipeline
+from engine.scheduling import resolve_scheduling
+from utils.algorithm_runtime import resolve_teacher_sync_interval
 from utils.answer_verifier import verify_response_answer
 
 
@@ -81,6 +94,7 @@ _ROLLOUT_CORE_FIELDS = frozenset(
 
 _LOGIT_SIGNAL_KEYS = frozenset(DEFAULT_LOGIT_SIGNALS)
 _TOPK_SIGNAL_KEYS = frozenset({"enabled", "top_k", "k"})
+_TEACHER_ADAPTER = "forward_kl_teacher"
 
 # On a shared physical GPU, a normal Learner shutdown may be waiting for
 # Actor's vLLM or Teacher's model teardown to release the execution gate
@@ -449,6 +463,8 @@ class Learner:
     make CPU-only contract tests possible without loading a real model.
     """
 
+    teacher_sync_interval = -1
+
     def __init__(
         self,
         config: Mapping[str, object],
@@ -459,6 +475,7 @@ class Learner:
         device: torch.device | str | None = None,
         gpu_id: int | None = None,
         gpu_gate: GpuGate | None = None,
+        round_gate: SharedRoundGate | None = None,
         node_id: str = "learner",
     ) -> None:
         if not isinstance(config, Mapping):
@@ -466,9 +483,18 @@ class Learner:
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size).")
         self.config: dict[str, object] = copy.deepcopy(dict(config))
+        self.save_question_accuracy = self.config.get("save_question_accuracy", False)
+        if not isinstance(self.save_question_accuracy, bool):
+            raise ValueError("save_question_accuracy must be a boolean.")
         self.run_cfg = _mapping(self.config.get("run"), "run")
         self.policy_cfg = _mapping(self.run_cfg.get("policy"), "run.policy")
         self.learner_cfg = _mapping(self.config.get("learner"), "learner")
+        algorithm_cfg = _mapping(self.config.get("algorithm", {}), "algorithm")
+        self.teacher_sync_interval = resolve_teacher_sync_interval(algorithm_cfg)
+        self._teacher_adapter_step = 0
+        self.loss_aggregation = algorithm_cfg.get("loss_aggregation", "sequence")
+        if not isinstance(self.loss_aggregation, str) or self.loss_aggregation not in ("sequence", "token"):
+            raise ValueError("algorithm.loss_aggregation must be 'sequence' or 'token'.")
         self.pipeline = resolve_training_pipeline(self.config)
         self.pipeline_node = self.pipeline.node(node_id)
         self.node_id = self.pipeline_node.node_id
@@ -477,9 +503,21 @@ class Learner:
         self.objective_fn = self.pipeline_node.objective_fn
         self.cpu_offload = self.pipeline_node.cpu_offload
         self.execution_cfg = _mapping(self.learner_cfg.get("execution", {}), "learner.execution")
+        if "loss_aggregation" in self.execution_cfg:
+            raise ValueError("learner.execution.loss_aggregation is unsupported; use algorithm.loss_aggregation.")
         self.distributed_cfg = _mapping(self.learner_cfg.get("distributed", {}), "learner.distributed")
         self.checkpoint_cfg = _mapping(self.learner_cfg.get("checkpoint", {}), "learner.checkpoint")
+        if "interval_steps" in self.checkpoint_cfg:
+            raise ValueError("learner.checkpoint.interval_steps is unsupported; use top-level save_ckpt_interval.")
+        self.save_ckpt_interval = self.config.get("save_ckpt_interval", 0)
+        if (
+            isinstance(self.save_ckpt_interval, bool)
+            or not isinstance(self.save_ckpt_interval, int)
+            or self.save_ckpt_interval < 0
+        ):
+            raise ValueError("save_ckpt_interval must be a non-negative integer.")
         self.runtime_cfg = _mapping(self.run_cfg.get("runtime", {}), "run.runtime")
+        self.pause_on_cuda_oom_only = bool(self.runtime_cfg.get("pause_on_cuda_oom_only", True))
         if "micro_batch_size" in self.execution_cfg:
             raise ValueError(
                 "learner.execution.micro_batch_size has been removed; "
@@ -501,6 +539,9 @@ class Learner:
             raise ValueError("Learner GPU gate must match the Learner physical gpu_id.")
         self.gpu_id = gpu_id
         self.gpu_gate = gpu_gate if gpu_gate is not None else GpuGate(physical_gpu_id=gpu_id)
+        self.round_gate = round_gate
+        self._control_group: object | None = None
+        self.scheduling_plan = resolve_scheduling(self.config)
         self.device = torch.device(device) if device is not None else self._default_device()
         self.plugin: AlgorithmPlugin | None = None
         self.tokenizer: object | None = None
@@ -509,20 +550,41 @@ class Learner:
         self.optimizer: object | None = None
         self.lr_scheduler: object | None = None
         self.lora_enabled = bool(_mapping(self.policy_cfg.get("lora", {}), "run.policy.lora").get("enabled", False))
+        if self.teacher_sync_interval >= 0 and not self.lora_enabled:
+            raise ValueError("Teacher synchronization requires run.policy.lora.enabled=true.")
+        if self.save_ckpt_interval and not self.lora_enabled:
+            raise ValueError("save_ckpt_interval requires run.policy.lora.enabled=true.")
+        self.global_step = 0
+        # Model/optimizer restoration normally precedes plugin construction.
+        # Keep the checkpoint payload until set_plugin can restore its exact
+        # logical-step state; None inside the tuple denotes a legacy checkpoint.
+        self._pending_algorithm_state: tuple[int, Mapping[str, object] | None] | None = None
         if plugin is not None:
             self.set_plugin(plugin)
-        self.global_step = 0
+        self._restored_state_path: Path | None = None
         self._initialized = False
         self._model_on_gpu = False
+        # A stage-zero DeepSpeed low-precision optimizer owns FP32 LoRA
+        # masters plus Adam moments independently of ``model.parameters()``.
+        # Keeping only the module on CPU would therefore leave several GiB
+        # allocated while the Actor needs the card.  Track that second
+        # residency domain explicitly rather than assuming ``module.to``
+        # covers it.
+        self._optimizer_on_gpu = False
         self._model_load_count = 0
         self._model_offload_count = 0
+        self._optimizer_load_count = 0
+        self._optimizer_offload_count = 0
+        # Some PyTorch optimizers deliberately keep scalar bookkeeping (for
+        # example Adam's ``step`` counter) on CPU even while their moments are
+        # on CUDA.  Remember exactly which persistent tensors originated on
+        # CUDA so reactivation does not migrate that valid CPU metadata.
+        self._optimizer_cuda_tensor_ids: set[int] = set()
 
         self.forward_chunk_size = int(self.execution_cfg.get("forward_chunk_size", 512))
         if self.forward_chunk_size <= 0:
             raise ValueError("learner.execution.forward_chunk_size must be positive.")
-        self.max_batches_per_turn = int(self.execution_cfg.get("max_batches_per_turn", 1))
-        if self.max_batches_per_turn < 1:
-            raise ValueError("learner.execution.max_batches_per_turn must be positive.")
+        self.max_batches_per_turn = self.scheduling_plan.learner_batches_per_turn
         self.clip_grad_norm = float(self.execution_cfg.get("clip_grad_norm", 0.0) or 0.0)
         if not math.isfinite(self.clip_grad_norm) or self.clip_grad_norm < 0:
             raise ValueError("learner.execution.clip_grad_norm must be a finite non-negative number.")
@@ -547,6 +609,62 @@ class Learner:
         if plugin.requires_frozen_reference and not self.lora_enabled:
             raise ValueError(f"{type(plugin).__name__} requires LoRA to keep its reference Teacher fixed.")
         self.plugin = plugin
+        self._restore_plugin_training_state()
+
+    def _restore_plugin_training_state(self) -> None:
+        """Apply a queued checkpoint once, after both model and plugin exist."""
+
+        pending = getattr(self, "_pending_algorithm_state", None)
+        plugin = getattr(self, "plugin", None)
+        if pending is None or plugin is None:
+            return
+        step, envelope = pending
+        if step != self.global_step:
+            raise RuntimeError("Pending algorithm checkpoint does not match the current Learner step.")
+        state: Mapping[str, object] = {}
+        if envelope is not None:
+            if envelope.get("plugin_class") != type(plugin).__name__:
+                raise RuntimeError("Checkpoint algorithm plugin does not match the configured plugin.")
+            state = _mapping(envelope.get("state"), "checkpoint algorithm_state.state")
+        # Stateful plugins reject legacy/empty state when resuming a positive
+        # step. Stateless plugins retain compatibility with older checkpoints.
+        plugin.load_training_state_dict(copy.deepcopy(dict(state)), step=step)
+        self._pending_algorithm_state = None
+
+    def _algorithm_checkpoint_state(self) -> dict[str, object] | None:
+        plugin = getattr(self, "plugin", None)
+        if plugin is None:
+            return None
+        state = plugin.training_state_dict()
+        if not isinstance(state, Mapping):
+            raise TypeError("Algorithm training_state_dict() must return a mapping.")
+        return {"plugin_class": type(plugin).__name__, "state": copy.deepcopy(dict(state))}
+
+    def _complete_algorithm_training_step(self, metrics: Metrics) -> None:
+        """Advance algorithm state from globally aggregated metrics on every rank.
+
+        This runs once per optimizer update, before publishing its checkpoint.
+        In particular a K=4 round can cross a 50-step algorithm window without
+        waiting for Controller acknowledgement or the next Actor turn.
+        """
+
+        plugin = getattr(self, "plugin", None)
+        if plugin is None:
+            return
+        additions = plugin.on_training_step_completed(
+            step=self.global_step, metrics=copy.deepcopy(metrics),
+        )
+        if not isinstance(additions, Mapping):
+            raise TypeError("Algorithm on_training_step_completed() must return a metric mapping.")
+        for key, value in additions.items():
+            if not isinstance(key, str) or not key:
+                raise TypeError("Algorithm step diagnostics must use non-empty string names.")
+            if key in metrics:
+                raise ValueError(f"Algorithm step diagnostics cannot replace an existing metric: {key}.")
+            numeric = _metric_number(value)
+            if numeric is None:
+                raise ValueError(f"Algorithm step diagnostic {key!r} must be a finite scalar.")
+            metrics[key] = numeric
 
     def queue_keys(self) -> dict[str, str]:
         name, prefix = _run_name_and_redis(self.config)
@@ -589,6 +707,7 @@ class Learner:
                 enable()
 
         self.model = self._attach_or_restore_lora(self.model)
+        self._initialize_forward_kl_teacher_adapter()
         self._validate_model_load_headroom()
         self.model.to(self.device)
         self._model_on_gpu = self.device.type == "cuda"
@@ -600,7 +719,12 @@ class Learner:
             lr_scheduler=configured_scheduler,
         )
         self.lr_scheduler = engine_scheduler if engine_scheduler is not None else configured_scheduler
-        self._validate_runtime_memory_after_load()
+        self._optimizer_on_gpu = self.device.type == "cuda"
+        if self.cpu_offload:
+            self._validate_cpu_offload_optimizer_layout()
+        self._restore_training_state()
+        if not self.pause_on_cuda_oom_only:
+            self._validate_runtime_memory_after_load()
         if self.cpu_offload:
             self._offload_model()
         self._initialized = True
@@ -624,21 +748,20 @@ class Learner:
             raise RuntimeError("peft is required when run.policy.lora.enabled=true.") from error
         lora_cfg = _mapping(self.policy_cfg.get("lora", {}), "run.policy.lora")
         step, adapter = _latest_lora_adapter(self.config)
+        resume_step = int(self.runtime_cfg.get("resume_step", 0))
+        if resume_step > 0 and (adapter is None or step < resume_step):
+            raise RuntimeError(f"Learner cannot find a published checkpoint at or after resume step {resume_step}.")
         if adapter is not None:
+            state_path = adapter.parent / "state" / "trainer_state.pt"
+            if not state_path.is_file():
+                raise RuntimeError(f"Published checkpoint has no optimizer state: {state_path}")
             try:
                 restored = PeftModel.from_pretrained(model, str(adapter), is_trainable=True)
             except Exception as error:
-                # A partially copied or incompatible adapter must not prevent
-                # a fresh run.  The actor only observes atomically published
-                # directories, but an old manual checkpoint can still fail to
-                # load after a model or PEFT-version change.
-                print(
-                    f"[Learner] Could not restore LoRA adapter {adapter}: {error}. "
-                    "Starting from a fresh adapter.",
-                    flush=True,
-                )
+                raise RuntimeError(f"Cannot restore published LoRA checkpoint {adapter}; refusing a fresh adapter.") from error
             else:
                 self.global_step = max(self.global_step, step)
+                self._restored_state_path = state_path
                 return restored
         targets = lora_cfg.get("target_modules", [])
         if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
@@ -847,33 +970,235 @@ class Learner:
         module = self._module()
         return sum(item.numel() * item.element_size() for item in (*module.parameters(), *module.buffers()))
 
-    def _activate_model(self) -> float:
-        if not self.cpu_offload or self.device.type != "cuda" or not torch.cuda.is_available() or self._model_on_gpu:
-            return 0.0
-        self._validate_model_load_headroom()
-        started = time.perf_counter()
-        self._module().to(self.device)
+    def _optimizer_for_residency(self) -> object | None:
+        """Return the concrete optimizer that owns persistent CUDA tensors.
+
+        DeepSpeed exposes its optimizer through the engine, and that wrapper
+        owns the FP32 master weights even when ``self.optimizer`` happens to
+        be a separate reference to the same object.  Looking through the
+        engine first avoids accidentally inspecting only a user-supplied
+        pre-wrap optimizer.
+        """
+
+        engine_optimizer = getattr(self.model_engine, "optimizer", None)
+        return engine_optimizer if engine_optimizer is not None else self.optimizer
+
+    @staticmethod
+    def _optimizer_master_tensors(optimizer: object) -> tuple[torch.Tensor, ...]:
+        """Return DeepSpeed's unflattened FP32 master tensors, when present."""
+
+        groups = getattr(optimizer, "fp32_groups", None)
+        if groups is None:
+            return ()
+        if isinstance(groups, (str, bytes)) or not isinstance(groups, Sequence):
+            raise TypeError("DeepSpeed optimizer fp32_groups must be a sequence.")
+        masters: list[torch.Tensor] = []
+        for group in groups:
+            if isinstance(group, (str, bytes)) or not isinstance(group, Sequence):
+                raise TypeError("DeepSpeed optimizer fp32_groups entries must be sequences.")
+            for parameter in group:
+                if not isinstance(parameter, torch.Tensor):
+                    raise TypeError("DeepSpeed optimizer fp32_groups entries must be tensors.")
+                masters.append(parameter)
+        return tuple(masters)
+
+    def _validate_cpu_offload_optimizer_layout(self) -> None:
+        """Reject a DeepSpeed layout whose aliases cannot be safely migrated.
+
+        The local FP16 stage-zero configuration resolves to DeepSpeed's
+        ``FP16_UnfusedOptimizer`` (whose ``fp32_groups`` are independent
+        master parameters).  Its model and optimizer tensors can safely move
+        between turns while retaining object identities and Adam state.
+
+        DeepSpeed's flattened BF16 optimizer keeps model parameter
+        storage as views into CUDA-flat buffers.  Calling ``module.to('cpu')``
+        first would break those aliases, so silently attempting a generic
+        tensor walk would risk a numerically invalid next update.  Fail before
+        a run instead; the user can keep optimizer residency or add a
+        dedicated flattened-buffer transfer implementation for that version.
+        """
+
+        optimizer = self._optimizer_for_residency()
+        if optimizer is None:
+            return
+        flattened_markers = ("bf16_groups_flat", "bf16_partitioned_groups", "fp32_groups_flat_partition")
+        if any(hasattr(optimizer, marker) for marker in flattened_markers):
+            raise RuntimeError(
+                "Learner cpu_offload requires an unflattened DeepSpeed optimizer layout; "
+                "the installed optimizer exposes flattened BF16 parameter buffers."
+            )
+        # Force structural validation now, before the initial offload rather
+        # than after an Actor has already started reserving its own memory.
+        self._optimizer_master_tensors(optimizer)
+
+    @staticmethod
+    def _move_tensor_storage(tensor: torch.Tensor, device: torch.device) -> None:
+        """Move one persistent optimizer tensor without replacing its object.
+
+        Optimizer state is keyed by ``Parameter`` identity.  Mutating ``.data``
+        preserves that identity (and DeepSpeed's master-parameter references)
+        while releasing the old CUDA allocation after the copy completes.
+        """
+
+        if tensor.device == device:
+            return
+        with torch.no_grad():
+            tensor.data = tensor.data.to(device=device, non_blocking=False)
+            gradient = tensor.grad
+            if gradient is not None:
+                gradient.data = gradient.data.to(device=device, non_blocking=False)
+
+    @staticmethod
+    def _optimizer_state_tensors(value: object, seen_containers: set[int] | None = None) -> tuple[torch.Tensor, ...]:
+        """Flatten state values without traversing parameter dictionary keys."""
+
+        seen = seen_containers if seen_containers is not None else set()
+        if isinstance(value, torch.Tensor):
+            return (value,)
+        if isinstance(value, Mapping):
+            identity = id(value)
+            if identity in seen:
+                return ()
+            seen.add(identity)
+            tensors: list[torch.Tensor] = []
+            # State-map keys are Parameters; they are identities, not state
+            # payloads, and must never be copied or replaced here.
+            for item in value.values():
+                tensors.extend(Learner._optimizer_state_tensors(item, seen))
+            return tuple(tensors)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            identity = id(value)
+            if identity in seen:
+                return ()
+            seen.add(identity)
+            tensors: list[torch.Tensor] = []
+            for item in value:
+                tensors.extend(Learner._optimizer_state_tensors(item, seen))
+            return tuple(tensors)
+        return ()
+
+    def _optimizer_residency_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return each independently allocated master/state tensor once."""
+
+        optimizer = self._optimizer_for_residency()
+        if optimizer is None:
+            return ()
+        if self.cpu_offload:
+            self._validate_cpu_offload_optimizer_layout()
+        tensors = list(self._optimizer_master_tensors(optimizer))
+        state = getattr(optimizer, "state", None)
+        tensors.extend(self._optimizer_state_tensors(state))
+        unique: list[torch.Tensor] = []
+        seen_tensors: set[int] = set()
+        for tensor in tensors:
+            identity = id(tensor)
+            if identity not in seen_tensors:
+                seen_tensors.add(identity)
+                unique.append(tensor)
+        return tuple(unique)
+
+    def _optimizer_transfer_tensors(self, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """Return only state tensors that belong on ``device`` for a turn.
+
+        On offload, discover all CUDA-resident master/state tensors and leave
+        CPU bookkeeping scalars untouched.  On activation, replay that exact
+        selection.  This matters for stock AdamW, whose non-capturable
+        ``step`` tensor is intentionally CPU-resident.
+        """
+
+        tensors = self._optimizer_residency_tensors()
+        if device.type == "cpu":
+            selected = tuple(tensor for tensor in tensors if tensor.device.type == "cuda")
+            self._optimizer_cuda_tensor_ids = {id(tensor) for tensor in selected}
+            return selected
+        if device.type == "cuda":
+            return tuple(tensor for tensor in tensors if id(tensor) in self._optimizer_cuda_tensor_ids)
+        raise ValueError(f"Unsupported optimizer residency device: {device}.")
+
+    def _optimizer_residency_bytes(self) -> int:
+        """Return the extra allocation needed to reactivate an offloaded optimizer."""
+
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self._optimizer_transfer_tensors(self.device)
+        )
+
+    def _move_optimizer_residency(self, device: torch.device) -> None:
+        """Move DeepSpeed masters and optimizer state as one residency unit."""
+
+        for tensor in self._optimizer_transfer_tensors(device):
+            self._move_tensor_storage(tensor, device)
+
+    def _activate_optimizer(self) -> None:
+        if not self.cpu_offload or self.device.type != "cuda" or not torch.cuda.is_available() or self._optimizer_on_gpu:
+            return
+        # Mark first so an exception midway through copies is recoverable by
+        # the turn's ``finally: _offload_model()`` cleanup path.
+        self._optimizer_on_gpu = True
+        self._move_optimizer_residency(self.device)
         self._synchronize_cuda()
-        self._model_on_gpu = True
-        self._validate_runtime_memory_after_load()
+        self._optimizer_load_count += 1
+
+    def _offload_optimizer(self) -> None:
+        if not self.cpu_offload or self.device.type != "cuda" or not torch.cuda.is_available() or not self._optimizer_on_gpu:
+            return
+        self._move_optimizer_residency(torch.device("cpu"))
+        self._optimizer_on_gpu = False
+        self._optimizer_offload_count += 1
+
+    def _activate_model(self) -> float:
+        if not self.cpu_offload or self.device.type != "cuda" or not torch.cuda.is_available():
+            return 0.0
+        if self._model_on_gpu and self._optimizer_on_gpu:
+            return 0.0
+        # Initialization already checked the configured model budget.  During
+        # training, the OOM-only policy must not abort an offload round trip
+        # based on a free-memory estimate; real CUDA allocation errors still
+        # propagate to the worker's logged exception handler.
+        if not self.pause_on_cuda_oom_only:
+            self._validate_model_load_headroom()
+        started = time.perf_counter()
+        if not self._model_on_gpu:
+            # Set this before the transfer so an exception during an
+            # asynchronous CUDA allocation is still cleaned up by the
+            # caller's offload-finally path.
+            self._model_on_gpu = True
+            self._module().to(self.device)
+            self._synchronize_cuda()
+        self._activate_optimizer()
+        if not self.pause_on_cuda_oom_only:
+            self._validate_runtime_memory_after_load()
         self._model_load_count += 1
         return time.perf_counter() - started
 
     def _offload_model(self) -> float:
-        if not self.cpu_offload or self.device.type != "cuda" or not torch.cuda.is_available() or not self._model_on_gpu:
+        if not self.cpu_offload or self.device.type != "cuda" or not torch.cuda.is_available():
+            return 0.0
+        if not self._model_on_gpu and not self._optimizer_on_gpu:
             return 0.0
         self._synchronize_cuda()
         started = time.perf_counter()
-        self._zero_grad()
-        self._module().to("cpu")
-        self._synchronize_cuda()
-        torch.cuda.empty_cache()
-        self._model_on_gpu = False
+        try:
+            self._zero_grad()
+        finally:
+            # The optimizer owns independent FP32 masters and Adam moments;
+            # always transfer those even if model gradient clearing or the
+            # module transfer reported an error.  The shared GPU gate must
+            # never be released with a mostly-offloaded Learner still holding
+            # several GiB that the Actor cannot account for.
+            try:
+                if self._model_on_gpu:
+                    self._module().to("cpu")
+                    self._model_on_gpu = False
+            finally:
+                self._offload_optimizer()
+                self._synchronize_cuda()
+                torch.cuda.empty_cache()
         self._model_offload_count += 1
         return time.perf_counter() - started
 
     def _validate_model_load_headroom(self) -> None:
-        """Keep the device-wide floor intact before any CPU-resident model moves in."""
+        """Honor the configured free-memory target before a model moves in."""
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
             return
@@ -881,7 +1206,12 @@ class Learner:
         if minimum_gb < 0:
             raise ValueError("run.runtime.minimum_free_gpu_memory_gb must be non-negative.")
         free, _total = self._gpu_memory_info()
-        required = int(minimum_gb * 1024**3) + self._model_size_bytes()
+        # With sequential CPU offload, model parameters alone are not the
+        # whole next-turn allocation: DeepSpeed's FP32 masters and Adam state
+        # must return alongside the model.  Count them before any GPU copy so
+        # the configured device-wide free-memory target remains intact.
+        optimizer_bytes = self._optimizer_residency_bytes() if self.cpu_offload and not self._optimizer_on_gpu else 0
+        required = int(minimum_gb * 1024**3) + self._model_size_bytes() + optimizer_bytes
         if free < required:
             raise MemoryError(
                 f"Learner model load needs {required / 1024**3:.2f} GB free, "
@@ -1339,6 +1669,271 @@ class Learner:
             disable_lora=disable_lora,
         )
 
+    def _plugin_compute_forward_kl(
+        self,
+        batch: Signals,
+        *,
+        teacher_prompts: Sequence[str],
+        temperature: float = 1.0,
+        token_clip: float | None = None,
+        chunk_size: int | None = None,
+    ) -> Signals:
+        """Score one rollout's exact full-vocabulary forward KL on this rank.
+
+        Unlike collection signals, neither hidden states nor vocabulary
+        tensors cross the Worker boundary or enter all_gather_object. The
+        Teacher can be recomputed with the same adapter until this logical
+        optimizer step finishes. Each head/KL token chunk is
+        checkpointed as a unit so backward retains O(L * hidden_size), rather
+        than retaining all vocabulary tensors from the complete response.
+        """
+
+        from torch.utils.checkpoint import checkpoint
+        from utils.forward_kl import forward_kl_token_values
+
+        prompts, temperature, token_clip, chunk_size = _validate_forward_kl_request(
+            batch, teacher_prompts, temperature, token_clip, chunk_size,
+        )
+        if not self.lora_enabled:
+            raise ValueError("Forward KL requires LoRA to keep its reference Teacher frozen.")
+        if not torch.is_grad_enabled():
+            raise RuntimeError("Forward KL must run with gradients enabled for the Student objective.")
+        module = self._module()
+        if not any(callable(getattr(candidate, "disable_adapter", None)) for candidate in (
+            module, getattr(module, "base_model", None),
+        )):
+            raise RuntimeError("Forward KL reference requires an adapter-disable capability.")
+        student_batch = self._prepare_forward_batch(batch, prompts=None, prompt_ids=None)
+        teacher_batch = self._prepare_forward_batch(batch, prompts=prompts, prompt_ids=None)
+        response_length = int(student_batch["response_ids"].size(1))
+        student_prompt_length = int(student_batch["prompt_ids"].size(1))
+        teacher_prompt_length = int(teacher_batch["prompt_ids"].size(1))
+        width = self.forward_chunk_size if chunk_size is None else chunk_size
+        if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+            raise ValueError("Forward KL requires a positive forward chunk size.")
+        head = self._lm_head(module)
+        teacher_step = self._forward_kl_teacher_step()
+        prior_training = bool(module.training)
+        keys = (
+            "response_forward_kl", "response_forward_kl_unclipped",
+            "response_forward_kl_clipped_fraction",
+        )
+
+        def score_chunk(student_chunk: torch.Tensor, teacher_chunk: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            # This closure is executed both now and during checkpoint backward.
+            # Reapply Teacher context to the head as well: LoRA may target the
+            # output head, so reference hidden states alone are insufficient.
+            chunk_prior_training = bool(module.training)
+            try:
+                module.eval()
+                with self._forward_kl_teacher_adapter(module, teacher_step), torch.no_grad():
+                    teacher_logits = head(teacher_chunk)
+                module.train()
+                student_logits = head(student_chunk)
+                values = forward_kl_token_values(
+                    student_logits, teacher_logits, temperature=temperature, token_clip=token_clip,
+                )
+                return tuple(values[key] for key in keys)
+            finally:
+                module.train(chunk_prior_training)
+
+        try:
+            self._load_forward_kl_teacher_adapter(module, teacher_step)
+            module.eval()
+            with self._forward_kl_teacher_adapter(module, teacher_step), torch.no_grad():
+                teacher_all_hidden = self._forward_hidden(
+                    module, input_ids=teacher_batch["input_ids"],
+                    attention_mask=teacher_batch["attention_mask"], position_ids=teacher_batch["position_ids"],
+                )
+                teacher_hidden = teacher_all_hidden[
+                    :, teacher_prompt_length - 1:teacher_prompt_length - 1 + response_length, :
+                ].detach()
+            module.train()
+            student_all_hidden = self._forward_hidden(
+                module, input_ids=student_batch["input_ids"],
+                attention_mask=student_batch["attention_mask"], position_ids=student_batch["position_ids"],
+            )
+            student_hidden = student_all_hidden[
+                :, student_prompt_length - 1:student_prompt_length - 1 + response_length, :
+            ]
+            chunks: dict[str, list[torch.Tensor]] = {key: [] for key in keys}
+            for start in range(0, response_length, width):
+                end = min(start + width, response_length)
+                # Slice tensors are explicit arguments, not late-bound loop
+                # variables captured by checkpoint's recomputation closure.
+                values = checkpoint(
+                    score_chunk, student_hidden[:, start:end, :], teacher_hidden[:, start:end, :],
+                    use_reentrant=False,
+                )
+                for key, value in zip(keys, values, strict=True):
+                    chunks[key].append(value if key == "response_forward_kl" else value.detach())
+            return {key: torch.cat(values, dim=1) for key, values in chunks.items()}
+        finally:
+            module.train(prior_training)
+
+    def _plugin_compute_tail_suppression(
+        self, batch: Signals, *, top_p: float = 0.99, temperature: float = 1.0,
+        chunk_size: int | None = None,
+    ) -> Signals:
+        """Score the exact rollout policy, including a lagged shared-round policy.
+
+        An immutable LoRA snapshot supplies the old student's backbone AND
+        output head. Recompute bounded vocabulary chunks during backward;
+        never transport/cache full distributions or recompute targets from
+        the student's changing parameters.
+        """
+
+        from torch.utils.checkpoint import checkpoint
+        from utils.tail_suppression import tail_suppression_token_values, validate_tail_sup_parameters
+
+        top_p, temperature = validate_tail_sup_parameters(top_p, temperature)
+        old_step = batch.get("policy_version")
+        if type(old_step) is not int or old_step < 0 or old_step > self.global_step:
+            raise ValueError("Tail suppression requires an existing rollout policy_version <= global_step.")
+        if batch.get("behavior_version", old_step) != old_step:
+            raise ValueError("Tail suppression rollout policy and behavior versions disagree.")
+        if not self.lora_enabled or self.teacher_sync_interval != 1:
+            raise ValueError("Tail suppression requires LoRA and teacher_sync_interval=1.")
+        if not torch.is_grad_enabled():
+            raise RuntimeError("Tail suppression requires a differentiable Student objective.")
+        width = self.forward_chunk_size if chunk_size is None else chunk_size
+        if type(width) is not int or width < 1:
+            raise ValueError("Tail suppression chunk_size must be a positive integer.")
+        module = self._module()
+        prepared = self._prepare_forward_batch(batch, prompts=None, prompt_ids=None)
+        length = int(prepared["response_ids"].size(1))
+        first = int(prepared["prompt_ids"].size(1)) - 1
+        head = self._lm_head(module)
+        prior_training = bool(module.training)
+        keys = ("response_tail_sup_kl", "response_tail_sup_active", "response_tail_sup_head_mass",
+                "response_tail_sup_head_size", "response_tail_sup_old_tail_mass", "response_tail_sup_tail_mass",
+                "response_tail_sup_entropy", "response_tail_sup_max_probability")
+
+        def score_chunk(student_chunk: torch.Tensor, old_chunk: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            chunk_prior_training = bool(module.training)
+            try:
+                module.eval()
+                with self._forward_kl_teacher_adapter(module, old_step), torch.no_grad():
+                    old_logits = head(old_chunk)
+                module.train()
+                values = tail_suppression_token_values(
+                    head(student_chunk), old_logits, top_p=top_p, temperature=temperature,
+                )
+                return tuple(values[key] for key in keys)
+            finally:
+                module.train(chunk_prior_training)
+
+        try:
+            if old_step > 0:
+                self._load_forward_kl_teacher_adapter(module, old_step)
+            module.eval()
+            with self._forward_kl_teacher_adapter(module, old_step), torch.no_grad():
+                old_hidden = self._forward_hidden(
+                    module, input_ids=prepared["input_ids"], attention_mask=prepared["attention_mask"],
+                    position_ids=prepared["position_ids"],
+                )[:, first:first + length, :].detach()
+            module.train()
+            student_hidden = self._forward_hidden(
+                module, input_ids=prepared["input_ids"], attention_mask=prepared["attention_mask"],
+                position_ids=prepared["position_ids"],
+            )[:, first:first + length, :]
+            chunks: dict[str, list[torch.Tensor]] = {key: [] for key in keys}
+            for start in range(0, length, width):
+                values = checkpoint(
+                    score_chunk, student_hidden[:, start:start + width, :], old_hidden[:, start:start + width, :],
+                    use_reentrant=False,
+                )
+                for key, value in zip(keys, values, strict=True):
+                    chunks[key].append(value if key == "response_tail_sup_kl" else value.detach())
+            return {key: torch.cat(values, dim=1) for key, values in chunks.items()}
+        finally:
+            module.train(prior_training)
+
+    def _plugin_compute_ocsd(self, batch: Signals, *, gamma: float, tau: float) -> Signals:
+        """Compute OCSD from one current-policy forward with bounded LM-head chunks."""
+        from torch.utils.checkpoint import checkpoint
+
+        from utils.ocsd import ocsd_token_values
+        from utils.tensor_signals import require_tensor_batch_field
+
+        correct = require_tensor_batch_field(batch, "ocsd_correct", dtype=torch.bool)
+        if correct.shape != (1,):
+            raise ValueError("OCSD requires one correctness label per rollout.")
+        prepared = self._prepare_forward_batch(batch, prompts=None, prompt_ids=None)
+        response_ids = prepared["response_ids"]
+        length = response_ids.size(1)
+        first = prepared["prompt_ids"].size(1) - 1
+        module = self._module()
+        head = self._lm_head(module)
+
+        def score_chunk(hidden: torch.Tensor, sampled_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+            # Backward can replay this chunk after the surrounding model
+            # mode was restored. Match the forward mode of an adapted head.
+            restore_eval = isinstance(head, torch.nn.Module) and not head.training
+            if restore_eval:
+                head.train()
+            try:
+                return ocsd_token_values(head(hidden), sampled_ids, correct, gamma=gamma, tau=tau)
+            finally:
+                if restore_eval:
+                    head.eval()
+
+        was_training = module.training
+        try:
+            module.train()
+            hidden = self._forward_hidden(
+                module, input_ids=prepared["input_ids"], attention_mask=prepared["attention_mask"],
+                position_ids=prepared["position_ids"],
+            )[:, first:first + length, :]
+            width = self.forward_chunk_size
+            chunks = [
+                checkpoint(
+                    score_chunk, hidden[:, start:start + width, :], response_ids[:, start:start + width],
+                    use_reentrant=False,
+                )
+                for start in range(0, length, width)
+            ]
+            return {key: torch.cat([chunk[key] for chunk in chunks], dim=1) for key in chunks[0]}
+        finally:
+            module.train(was_training)
+
+    def _initialize_forward_kl_teacher_adapter(self) -> None:
+        if self.teacher_sync_interval > 0:
+            teacher_config = copy.deepcopy(self.model.peft_config["default"])
+            teacher_config.inference_mode = True
+            self.model.add_adapter(_TEACHER_ADAPTER, teacher_config)
+
+    def _forward_kl_teacher_step(self, step: int | None = None) -> int:
+        interval = self.teacher_sync_interval
+        if interval < 0:
+            return 0
+        step = self.global_step if step is None else step
+        return step if interval == 0 else step - step % interval
+
+    def _load_forward_kl_teacher_adapter(self, module: torch.nn.Module, step: int) -> None:
+        if self.teacher_sync_interval <= 0 or step == self._teacher_adapter_step:
+            return
+        path = _lora_adapter_root(self.config) / f"step_{step}" / "adapter_lora"
+        result = module.load_adapter(str(path), _TEACHER_ADAPTER, is_trainable=False, torch_device="cpu")
+        if result.missing_keys or result.unexpected_keys:
+            raise RuntimeError(f"Could not load a complete Teacher LoRA adapter from {path}: {result}.")
+        self._teacher_adapter_step = step
+
+    @contextmanager
+    def _forward_kl_teacher_adapter(self, module: torch.nn.Module, step: int):
+        if self.teacher_sync_interval == 0:
+            yield
+        elif step == 0:
+            with self._disable_lora(module):
+                yield
+        else:
+            student_adapter = module.active_adapter
+            module.set_adapter(_TEACHER_ADAPTER, inference_mode=True)
+            try:
+                yield
+            finally:
+                module.set_adapter(student_adapter)
+
     def _prepare_forward_batch(
         self,
         batch: Mapping[str, object],
@@ -1598,6 +2193,7 @@ class Learner:
                 "attention_mask",
                 "rollout_indices",
                 "rollout_count",
+                "question_accuracies",
             }:
                 continue
             result[key] = self._select_rollout_signal_value(
@@ -1700,18 +2296,55 @@ class Learner:
             learner["clip_gradient"] = clip_gradient
         return algorithm, learner
 
+    @staticmethod
+    def _validate_question_accuracies(value: object, *, prompt_count: int) -> list[float]:
+        """Validate CPU diagnostic metadata without creating model signals."""
+
+        if not isinstance(value, list) or len(value) != prompt_count:
+            raise ValueError("question_accuracies must be a list aligned with the batch questions.")
+        result: list[float] = []
+        for accuracy in value:
+            if (
+                isinstance(accuracy, bool)
+                or not isinstance(accuracy, (int, float))
+                or not 0.0 <= accuracy <= 1.0
+                or not math.isfinite(accuracy)
+            ):
+                raise ValueError("question_accuracies must contain finite non-boolean numbers in [0, 1].")
+            result.append(float(accuracy))
+        return result
+
     def process_training_batch(self, signals: Mapping[str, object]) -> Signals:
         """Run full-batch signal collection followed by one logical optimizer update."""
 
         if self.plugin is None:
             raise RuntimeError("Learner training requires an AlgorithmPlugin.")
-        logical = self._normalize_logical_signals(signals)
+        prepared = self.plugin.prepare_learner_batch(dict(signals))
+        question_accuracies: list[float] | None = None
+        if self.save_question_accuracy:
+            if "question_accuracies" not in prepared:
+                raise ValueError("save_question_accuracy=true requires Actor question_accuracies metadata.")
+            question_accuracies = self._validate_question_accuracies(
+                prepared.pop("question_accuracies"), prompt_count=len(prepared["questions"])
+            )
+        elif "question_accuracies" in prepared:
+            raise ValueError("question_accuracies metadata is unsupported when save_question_accuracy=false.")
+        trajectory = prepared.get("traj")
+        response_ids = trajectory.get("response_ids") if isinstance(trajectory, Mapping) else None
+        if isinstance(response_ids, list) and not response_ids:
+            return self._training_result(
+                prepared, {}, {"train_rollouts": 0, "optimizer_steps": 0},
+                rollout_count=0, question_accuracies=question_accuracies,
+            )
+        logical = self._normalize_logical_signals(prepared)
         with _learner_plugin_scope(self, phase="collect"):
             additions = getattr(self.plugin, self.plugin_hook)(copy.deepcopy(logical))
         if not isinstance(additions, Mapping):
             raise TypeError(f"Learner plugin_hook {self.plugin_hook!r} must return a mapping of new signals.")
         if not all(isinstance(key, str) for key in additions):
             raise TypeError(f"Learner plugin_hook {self.plugin_hook!r} must return string signal names.")
+        if "question_accuracies" in additions:
+            raise ValueError("Learner plugins may not produce reserved question_accuracies diagnostic metadata.")
         collisions = sorted(key for key in additions if key in logical)
         if collisions:
             raise ValueError(
@@ -1722,12 +2355,28 @@ class Learner:
         enriched.update(dict(additions))
         micro_batches = self.build_micro_batches(enriched)
         metrics, raw_learner_metrics = self._train_micro_batches(micro_batches)
+        return self._training_result(
+            logical, metrics, raw_learner_metrics,
+            rollout_count=int(logical["rollout_count"]), question_accuracies=question_accuracies,
+        )
+
+    def _training_result(
+        self,
+        logical: Mapping[str, object],
+        metrics: Metrics,
+        raw_learner_metrics: Metrics,
+        *,
+        rollout_count: int,
+        question_accuracies: list[float] | None,
+    ) -> Signals:
         algorithm_metrics, learner_metrics = self._centralized_training_metrics(
             metrics,
             raw_learner_metrics,
         )
         result: Signals = {
             "global_step": self.global_step,
+            "rollout_count": rollout_count,
+            "optimizer_steps": int(raw_learner_metrics["optimizer_steps"]),
             # ``metrics`` remains the legacy algorithm-metric name for
             # existing result consumers.  New Controller code should prefer
             # the explicit centralized ``algorithm_metrics`` envelope.
@@ -1735,6 +2384,8 @@ class Learner:
             "algorithm_metrics": algorithm_metrics,
             "learner_metrics": learner_metrics,
         }
+        if question_accuracies is not None:
+            result["question_accuracies"] = list(question_accuracies)
         # Preserve upstream Worker telemetry for the Controller's single
         # experiment run and for local JSON history.  All values are detached
         # below before the result crosses Redis.
@@ -1765,11 +2416,26 @@ class Learner:
                     "Learner invariant violated: each physical training batch must contain exactly one rollout."
                 )
         total_rollouts = len(micro_batches)
+        token_aggregation = self.loss_aggregation == "token"
+        response_token_total = sum(int(batch["response_ids"].numel()) for batch in micro_batches)
+        if token_aggregation:
+            if response_token_total == 0:
+                raise ValueError("Token loss aggregation requires at least one response token.")
+            if self.world_size > 1 and (
+                not _distributed_active() or dist.get_world_size() != self.world_size
+            ):
+                raise RuntimeError("Token loss aggregation requires the complete Learner process group.")
+            # Validate the real optimizer gradient layout before any backward.
+            # Unsupported wrappers must not silently normalize model.grad when
+            # the optimizer actually consumes a separate accumulation buffer.
+            self._optimizer_gradient_state(strict=True)
         slots = math.ceil(len(micro_batches) / self.world_size)
         metric_sums: dict[str, float] = {}
         metric_weights: dict[str, float] = {}
         objective_sum = 0.0
         objective_weight = 0.0
+        local_valid_tokens = 0
+        counted_rollouts = 0
         self._zero_grad()
 
         for slot in range(slots):
@@ -1779,20 +2445,38 @@ class Learner:
                 if not isinstance(batch, dict):  # pragma: no cover - recursive helper invariant.
                     raise RuntimeError("Learner failed to materialize a micro-batch mapping.")
                 with _learner_plugin_scope(self, phase="objective"):
-                    objective, raw_metrics = getattr(self.plugin, self.objective_fn)(batch)  # type: ignore[union-attr]
+                    computed = getattr(self.plugin, self.objective_fn)(batch)  # type: ignore[union-attr]
+                if isinstance(computed, ObjectiveResult):
+                    objective, raw_metrics = computed
+                    valid_token_count = self._objective_valid_token_count(computed, batch)
+                    local_valid_tokens += valid_token_count
+                    counted_rollouts += 1
+                elif isinstance(computed, tuple) and len(computed) == 2:
+                    if token_aggregation:
+                        raise TypeError(
+                            "Token loss aggregation requires ObjectiveResult with valid_token_count; "
+                            "legacy (objective, metrics) results support sequence aggregation only."
+                        )
+                    objective, raw_metrics = computed
+                    valid_token_count = None
+                else:
+                    raise TypeError("Learner objectives must return ObjectiveResult or (objective, metrics).")
                 if not isinstance(objective, torch.Tensor) or objective.numel() != 1:
                     raise TypeError(f"Learner objective_fn {self.objective_fn!r} must return one scalar torch.Tensor objective.")
                 if not objective.requires_grad:
                     raise ValueError(f"Learner objective_fn {self.objective_fn!r} must return a differentiable objective tensor.")
                 if not isinstance(raw_metrics, Mapping):
                     raise TypeError(f"Learner objective_fn {self.objective_fn!r} metrics must be a mapping.")
-                # Objectives have maximization semantics.  DDP/DeepSpeed
-                # averages rank gradients, hence the world_size factor makes
-                # one logical update equal to the mean across all rollouts.
-                scale = self.world_size / float(total_rollouts)
+                # DDP/DeepSpeed averages rank gradients.  Token mode first
+                # scales by the known response length upper bound, then fixes
+                # the denominator after the actual finite masks are known.
+                # This avoids backpropagating an unnormalized token sum.
+                weight = float(valid_token_count) if token_aggregation else 1.0
+                denominator = response_token_total if token_aggregation else total_rollouts
+                scale = self.world_size * weight / float(denominator)
                 self._backward(-objective * scale)
-                objective_sum += float(objective.detach().float().cpu().item())
-                objective_weight += 1.0
+                objective_sum += float(objective.detach().float().cpu().item()) * weight
+                objective_weight += weight
                 for key, value in raw_metrics.items():
                     name = str(key)
                     if name == "objective":
@@ -1800,23 +2484,42 @@ class Learner:
                     numeric = _metric_number(value)
                     if numeric is None:
                         continue
-                    metric_sums[name] = metric_sums.get(name, 0.0) + numeric
-                    metric_weights[name] = metric_weights.get(name, 0.0) + 1.0
+                    metric_weight = weight if token_aggregation and (name == "loss" or name.endswith("_loss")) else 1.0
+                    metric_sums[name] = metric_sums.get(name, 0.0) + numeric * metric_weight
+                    metric_weights[name] = metric_weights.get(name, 0.0) + metric_weight
             else:
                 # Every rank must participate in the same number of DDP
                 # backwards.  A zero graph over trainable params provides the
                 # required collective without affecting the logical gradient.
                 self._backward(self._dummy_loss())
 
+        global_valid_tokens: int | None = None
+        if token_aggregation:
+            token_count = torch.tensor(local_valid_tokens, dtype=torch.int64, device=self.device)
+            if _distributed_active():
+                dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+            global_valid_tokens = int(token_count.item())
+            if global_valid_tokens == 0:
+                self._zero_grad()
+            else:
+                gradients, _loss_scale = self._optimizer_gradient_state(strict=True)
+                correction = response_token_total / float(global_valid_tokens)
+                with torch.no_grad():
+                    for gradient in gradients:
+                        gradient.mul_(correction)
+
         # Capture the norm after every micro-batch contribution has been
         # accumulated and before optional clipping.  This is the only point
         # where a meaningful logical-batch raw gradient exists.  Keep the
         # ordering explicit: raw -> clip -> clipped -> optimizer step.
-        raw_gradient = self._gradient_norm()
-        self._clip_gradients()
-        clip_gradient = self._gradient_norm()
-        self._step()
-        self.global_step += 1
+        did_update = global_valid_tokens != 0
+        raw_gradient = self._gradient_norm() if did_update else 0.0
+        if did_update:
+            self._clip_gradients()
+        clip_gradient = self._gradient_norm() if did_update else 0.0
+        if did_update:
+            self._step()
+            self.global_step += 1
         if _distributed_active():
             gathered: list[object | None] = [None for _ in range(self.world_size)]
             dist.all_gather_object(
@@ -1826,17 +2529,23 @@ class Learner:
                     "objective_weight": objective_weight,
                     "metric_sums": metric_sums,
                     "metric_weights": metric_weights,
+                    "valid_tokens": local_valid_tokens,
+                    "counted_rollouts": counted_rollouts,
                 },
             )
             objective_sum = 0.0
             objective_weight = 0.0
             metric_sums = {}
             metric_weights = {}
+            local_valid_tokens = 0
+            counted_rollouts = 0
             for item in gathered:
                 if not isinstance(item, Mapping):
                     raise RuntimeError("Learner metric gather returned an invalid payload.")
                 objective_sum += float(item.get("objective_sum", 0.0))
                 objective_weight += float(item.get("objective_weight", 0.0))
+                local_valid_tokens += int(item.get("valid_tokens", 0))
+                counted_rollouts += int(item.get("counted_rollouts", 0))
                 remote_sums = item.get("metric_sums", {})
                 remote_weights = item.get("metric_weights", {})
                 if not isinstance(remote_sums, Mapping) or not isinstance(remote_weights, Mapping):
@@ -1853,10 +2562,20 @@ class Learner:
             if metric_weights[key] > 0
         }
         metrics["loss"] = -(objective_sum / objective_weight) if objective_weight > 0 else 0.0
-        adapter_path = self._maybe_publish_adapter()
+        if did_update:
+            self._complete_algorithm_training_step(metrics)
+        adapter_path = self._maybe_publish_adapter() if did_update else None
+        if (
+            did_update and self.teacher_sync_interval > 0
+            and self.global_step % self.teacher_sync_interval == 0
+            and _distributed_active()
+        ):
+            # All ranks must see the published snapshot before the next step.
+            dist.barrier()
         learner_metrics: Metrics = {
             "train_rollouts": float(total_rollouts),
             "micro_batches": float(len(micro_batches)),
+            "optimizer_steps": float(did_update),
             "lr": self._current_lr(),
             # ``grad_norm`` remains the public compatibility spelling for
             # the pre-clip global L2 norm.  New consumers should use the
@@ -1864,7 +2583,12 @@ class Learner:
             "raw_gradient": raw_gradient,
             "clip_gradient": clip_gradient,
             "grad_norm": raw_gradient,
+            "loss_aggregation": self.loss_aggregation,
         }
+        if global_valid_tokens is not None:
+            learner_metrics["objective_valid_tokens"] = float(global_valid_tokens)
+        elif counted_rollouts == total_rollouts:
+            learner_metrics["objective_valid_tokens"] = float(local_valid_tokens)
         if adapter_path:
             learner_metrics["lora_path"] = adapter_path
         return metrics, learner_metrics
@@ -1885,9 +2609,42 @@ class Learner:
         if self.model_engine is not None:
             backward = getattr(self.model_engine, "backward", None)
             if callable(backward):
+                loss = self._engine_backward_loss(loss)
                 backward(loss)
                 return
         loss.backward()
+
+    def _engine_backward_loss(self, loss: torch.Tensor) -> torch.Tensor:
+        """Apply the unfused loss scale exactly once across DeepSpeed APIs.
+
+        Legacy engines delegate to optimizer.backward, which scales the loss.
+        DeepSpeed 0.19.7 instead uses Tensor.backward for stage zero, but the
+        unfused optimizer still unscales at step. Keep the engine's reduction
+        hooks while supplying the missing scale for this verified API.
+        """
+
+        optimizer = self._optimizer_for_residency()
+        backend_types = {(cls.__module__, cls.__name__) for cls in type(optimizer).__mro__}
+        if ("deepspeed.runtime.fp16.unfused_optimizer", "FP16_UnfusedOptimizer") not in backend_types:
+            return loss
+        loss_scale = float(getattr(optimizer, "loss_scale", 1.0))
+        if not math.isfinite(loss_scale) or loss_scale <= 0:
+            raise ValueError("DeepSpeed FP16 loss_scale must be finite and positive.")
+        if loss_scale == 1.0:
+            return loss
+        if callable(getattr(self.model_engine, "_do_optimizer_backward", None)):
+            # The older engine explicitly invokes the optimizer's scaler.
+            return loss
+        import deepspeed
+
+        if deepspeed.__version__ != "0.19.7":
+            raise RuntimeError(
+                f"Unverified DeepSpeed {deepspeed.__version__} unfused loss-scaling API; "
+                "refusing an update that could apply loss_scale twice or omit it."
+            )
+        if getattr(self.model_engine, "torch_autocast_z0_gradscaler", None) is not None:
+            raise RuntimeError("Unfused loss scaling cannot be combined with a Torch autocast scaler.")
+        return loss.float() * loss_scale
 
     def _step(self) -> None:
         if self.model_engine is not None:
@@ -1912,24 +2669,159 @@ class Learner:
             raise RuntimeError("Learner has no trainable parameters.")
         return parameters
 
-    def _gradient_norm(self) -> float:
-        """Return the pre-clip global L2 norm of trainable parameter gradients."""
+    @staticmethod
+    def _objective_valid_token_count(result: ObjectiveResult, batch: Mapping[str, object]) -> int:
+        """Validate a plugin's exact final-mask count without inferring a weight."""
 
-        squared_norm = torch.zeros((), dtype=torch.float64, device=self.device)
-        for parameter in self._trainable_parameters():
-            gradient = parameter.grad
-            if gradient is None:
+        value = result.valid_token_count
+        if isinstance(value, torch.Tensor):
+            integer_dtypes = {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
+            if value.ndim != 0 or value.requires_grad or value.dtype not in integer_dtypes:
+                raise TypeError("ObjectiveResult.valid_token_count must be a detached scalar integer tensor or int.")
+            count = int(value.item())
+        elif isinstance(value, int) and not isinstance(value, bool):
+            count = value
+        else:
+            raise TypeError("ObjectiveResult.valid_token_count must be a detached scalar integer tensor or int.")
+        mask = batch.get("response_mask")
+        response_ids = batch.get("response_ids")
+        if (
+            not isinstance(mask, torch.Tensor)
+            or not isinstance(response_ids, torch.Tensor)
+            or tuple(mask.shape) != tuple(response_ids.shape)
+        ):
+            raise TypeError("ObjectiveResult requires a response_mask aligned with response_ids.")
+        available = int(mask.to(dtype=torch.bool).sum().item())
+        if not 0 <= count <= available:
+            raise ValueError("ObjectiveResult.valid_token_count must be between zero and response_mask.sum().")
+        return count
+
+    @staticmethod
+    def _unique_gradient_tensors(gradients: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        """Keep each dense buffer view once and reject overlapping aliases."""
+
+        unique: list[torch.Tensor] = []
+        spans: dict[tuple[str, int | None], list[tuple[int, int, tuple[object, ...]]]] = {}
+        for gradient in gradients:
+            if not isinstance(gradient, torch.Tensor) or not gradient.is_floating_point():
+                raise TypeError("Optimizer gradient buffers must be floating-point tensors.")
+            if gradient.layout != torch.strided:
+                raise RuntimeError("Logical-batch gradient normalization requires dense gradient buffers.")
+            if gradient.numel() == 0:
                 continue
+            start = gradient.data_ptr()
+            span_elements = 1 + sum((size - 1) * stride for size, stride in zip(gradient.shape, gradient.stride()))
+            end = start + span_elements * gradient.element_size()
+            view = (start, tuple(gradient.shape), gradient.stride(), gradient.dtype)
+            device = (gradient.device.type, gradient.device.index)
+            previous = spans.setdefault(device, [])
+            if any(view == prior_view for _prior_start, _prior_end, prior_view in previous):
+                continue
+            if any(start < prior_end and prior_start < end for prior_start, prior_end, _prior_view in previous):
+                raise RuntimeError("Optimizer gradient buffers contain overlapping aliases; refusing repeated normalization.")
+            previous.append((start, end, view))
+            unique.append(gradient)
+        return tuple(unique)
+
+    def _optimizer_gradient_state(self, *, strict: bool) -> tuple[tuple[torch.Tensor, ...], float]:
+        """Return the buffers consumed by supported stage-zero optimizers.
+
+        BF16 stores cumulative gradients in separate high-precision buffers;
+        its model.grad contains only the latest backward.  FP16 unfused reads
+        model.grad at step and unscales there.  The returned scale is used only
+        for norm/clip calculations: never unscale these buffers a second time.
+        Unknown wrappers retain the legacy sequence path, but token mode must
+        fail rather than normalize buffers that its optimizer never consumes.
+        """
+
+        optimizer = self._optimizer_for_residency()
+        parameters = self._trainable_parameters()
+        parameter_ids = {id(parameter) for parameter in parameters}
+        backend_types = {(cls.__module__, cls.__name__) for cls in type(optimizer).__mro__}
+        bf16_backend = ("deepspeed.runtime.bf16_optimizer", "BF16_Optimizer") in backend_types
+        fp16_backend = ("deepspeed.runtime.fp16.unfused_optimizer", "FP16_UnfusedOptimizer") in backend_types
+        torch_backend = isinstance(optimizer, torch.optim.Optimizer)
+        if strict:
+            ds_cfg = self.deepspeed_config()
+            zero = ds_cfg.get("zero_optimization", {})
+            if not isinstance(zero, Mapping) or int(zero.get("stage", 0)) != 0:
+                raise ValueError("Token loss aggregation currently supports DeepSpeed ZeRO stage 0 only.")
+            if int(ds_cfg.get("gradient_accumulation_steps", 1)) != 1:
+                raise ValueError("Token loss aggregation requires Learner-owned accumulation with DeepSpeed GAS=1.")
+            if not (bf16_backend or fp16_backend or torch_backend):
+                raise RuntimeError(
+                    f"Token loss aggregation does not support optimizer {type(optimizer).__name__}; "
+                    "supported layouts are Torch, DeepSpeed stage-zero BF16 and FP16 unfused."
+                )
+
+        if bf16_backend or fp16_backend:
+            group_name = "bf16_groups" if bf16_backend else "fp16_groups"
+            groups = getattr(optimizer, group_name, None)
+            if not isinstance(groups, Sequence) or isinstance(groups, (str, bytes)):
+                raise RuntimeError(f"Supported DeepSpeed optimizer has no valid {group_name} parameter layout.")
+            low_precision_parameters: list[torch.Tensor] = []
+            for group in groups:
+                if not isinstance(group, Sequence) or isinstance(group, (str, bytes)):
+                    raise RuntimeError(f"DeepSpeed {group_name} entries must be parameter sequences.")
+                low_precision_parameters.extend(group)
+            if (
+                not all(isinstance(parameter, torch.Tensor) for parameter in low_precision_parameters)
+                or len(low_precision_parameters) != len(parameter_ids)
+                or {id(parameter) for parameter in low_precision_parameters} != parameter_ids
+            ):
+                raise RuntimeError("DeepSpeed gradient parameters do not match the Learner's trainable model parameters.")
+            if bf16_backend:
+                getter = getattr(optimizer, "get_grads_for_norm", None)
+                if not callable(getter):
+                    raise RuntimeError("DeepSpeed BF16 optimizer cannot expose its cumulative gradient buffers.")
+                gradients = getter(for_clipping=True)
+                if not isinstance(gradients, Sequence) or isinstance(gradients, (str, bytes)):
+                    raise TypeError("DeepSpeed BF16 gradient getter must return a tensor sequence.")
+                return self._unique_gradient_tensors(gradients), 1.0
+            masters = self._optimizer_master_tensors(optimizer)
+            if len(masters) != len(low_precision_parameters) or any(
+                tuple(master.shape) != tuple(parameter.shape)
+                for master, parameter in zip(masters, low_precision_parameters)
+            ):
+                raise RuntimeError("DeepSpeed FP16 unfused master parameters do not match its model gradient layout.")
+            loss_scale = float(getattr(optimizer, "loss_scale", 1.0))
+            if not math.isfinite(loss_scale) or loss_scale <= 0:
+                raise ValueError("DeepSpeed FP16 loss_scale must be finite and positive.")
+        else:
+            if strict and torch_backend:
+                optimizer_parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+                if len(optimizer_parameters) != len(parameter_ids) or {id(parameter) for parameter in optimizer_parameters} != parameter_ids:
+                    raise RuntimeError("Torch optimizer parameters do not match the Learner's trainable model parameters.")
+                if getattr(self.model_engine, "torch_autocast_z0_gradscaler", None) is not None:
+                    raise RuntimeError("Token loss aggregation does not support a Torch autocast gradient scaler.")
+            loss_scale = 1.0
+        gradients = [parameter.grad for parameter in parameters if parameter.grad is not None]
+        if not strict and not (bf16_backend or fp16_backend or torch_backend):
+            return tuple(gradients), loss_scale
+        return self._unique_gradient_tensors(gradients), loss_scale
+
+    def _gradient_norm(self) -> float:
+        """Return the global L2 norm of the optimizer's actual accumulated gradients."""
+
+        gradients, loss_scale = self._optimizer_gradient_state(strict=self.loss_aggregation == "token")
+        squared_norm = torch.zeros((), dtype=torch.float64, device=self.device)
+        for gradient in gradients:
             value = torch.linalg.vector_norm(gradient.detach().float(), ord=2)
             squared_norm.add_(value.to(dtype=torch.float64).square())
-        return float(torch.sqrt(squared_norm).detach().cpu().item())
+        return float(torch.sqrt(squared_norm).detach().cpu().item()) / loss_scale
 
     def _clip_gradients(self) -> None:
         """Clip once after the full logical-batch accumulation, when requested."""
 
         if self.clip_grad_norm <= 0:
             return
-        torch.nn.utils.clip_grad_norm_(self._trainable_parameters(), max_norm=self.clip_grad_norm)
+        gradients, _loss_scale = self._optimizer_gradient_state(strict=self.loss_aggregation == "token")
+        coefficient = self.clip_grad_norm / (self._gradient_norm() + 1e-6)
+        if coefficient > 1.0:
+            coefficient = 1.0
+        with torch.no_grad():
+            for gradient in gradients:
+                gradient.mul_(coefficient)
 
     def _dummy_loss(self) -> torch.Tensor:
         trainable = [parameter for parameter in self._module().parameters() if parameter.requires_grad]
@@ -1947,27 +2839,81 @@ class Learner:
                 return float(value)
         return 0.0
 
+    def _restore_training_state(self) -> None:
+        """Restore Adam/master parameters and scheduler after DeepSpeed wraps them."""
+        path = self._restored_state_path
+        if path is None:
+            return
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(state, Mapping) or int(state.get("global_step", -1)) != self.global_step:
+            raise RuntimeError(f"Checkpoint trainer step does not match the restored adapter: {path}")
+        algorithm_state = state.get("algorithm_state")
+        if algorithm_state is not None:
+            algorithm_state = _mapping(algorithm_state, "checkpoint algorithm_state")
+            if not isinstance(algorithm_state.get("plugin_class"), str):
+                raise RuntimeError("Checkpoint algorithm_state requires a plugin class name.")
+            _mapping(algorithm_state.get("state"), "checkpoint algorithm_state.state")
+        optimizer = getattr(self.model_engine, "optimizer", None) if self.model_engine is not None else None
+        optimizer = optimizer if optimizer is not None else self.optimizer
+        load = getattr(optimizer, "load_state_dict", None)
+        if not callable(load) or "optimizer" not in state:
+            raise RuntimeError(f"Cannot resume without the saved optimizer state: {path}")
+        if "state_dict_list" in inspect.signature(load).parameters:
+            # DeepSpeed BF16 takes one saved state per data-parallel rank;
+            # its default rebuilds FP32 masters from rounded BF16 weights.
+            # This checkpoint format currently saves the rank-zero state.
+            if self.world_size != 1:
+                raise RuntimeError("This optimizer checkpoint requires one Learner rank for BF16 resume.")
+            load([state["optimizer"]], load_from_fp32_weights=True)
+        else:
+            load(state["optimizer"])
+        if self.lr_scheduler is not None:
+            scheduler_load = getattr(self.lr_scheduler, "load_state_dict", None)
+            if not callable(scheduler_load) or "scheduler" not in state:
+                raise RuntimeError(f"Cannot resume without the saved scheduler state: {path}")
+            scheduler_load(state["scheduler"])
+        if self.model_engine is not None:
+            self.model_engine.global_steps = self.global_step
+        rng = state.get("rng")
+        if isinstance(rng, Mapping):
+            random.setstate(rng["python"])
+            torch.set_rng_state(rng["torch"].cpu())
+            if self.device.type == "cuda" and "cuda" in rng:
+                torch.cuda.set_rng_state(rng["cuda"].cpu(), device=self.device)
+        self._pending_algorithm_state = (self.global_step, copy.deepcopy(algorithm_state))
+        self._restore_plugin_training_state()
+        print(f"[Learner] Restored adapter and optimizer at global_step={self.global_step}.", flush=True)
+
     def _maybe_publish_adapter(self) -> str:
         if not self.lora_enabled or self.rank != 0:
             return ""
         save = getattr(self._module(), "save_pretrained", None)
         if not callable(save):
+            if self.save_ckpt_interval:
+                raise RuntimeError("Scheduled training checkpoint requires a model exposing save_pretrained().")
             return ""
         root = _lora_adapter_root(self.config)
         root.mkdir(parents=True, exist_ok=True)
         final_dir = root / f"step_{self.global_step}"
         adapter_dir = final_dir / "adapter_lora"
         if adapter_dir.is_dir():
+            self._snapshot_periodic_checkpoint(final_dir)
             return str(adapter_dir)
         temporary_dir = root / f"step_{self.global_step}_tmp"
         if temporary_dir.exists():
             shutil.rmtree(temporary_dir)
         temporary_adapter = temporary_dir / "adapter_lora"
         temporary_adapter.parent.mkdir(parents=True, exist_ok=False)
-        save(str(temporary_adapter))
+        if self.teacher_sync_interval > 0:
+            save(str(temporary_adapter), selected_adapters=["default"])
+        else:
+            save(str(temporary_adapter))
         state_dir = temporary_dir / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
         state: dict[str, object] = {"global_step": self.global_step}
+        state["rng"] = {"python": random.getstate(), "torch": torch.get_rng_state()}
+        if self.device.type == "cuda":
+            state["rng"]["cuda"] = torch.cuda.get_rng_state(self.device)
         optimizer = getattr(self.model_engine, "optimizer", None) if self.model_engine is not None else None
         optimizer = optimizer or self.optimizer
         state_dict = getattr(optimizer, "state_dict", None)
@@ -1976,53 +2922,132 @@ class Learner:
         scheduler_state = getattr(self.lr_scheduler, "state_dict", None)
         if callable(scheduler_state):
             state["scheduler"] = scheduler_state()
+        algorithm_state = self._algorithm_checkpoint_state()
+        if algorithm_state is not None:
+            state["algorithm_state"] = algorithm_state
         torch.save(state, state_dir / "trainer_state.pt")
         os.replace(temporary_dir, final_dir)
+        # Preserve scheduled training state before temporary publications can
+        # be pruned. This schedule is independent of Actor evaluation.
+        self._snapshot_periodic_checkpoint(final_dir)
         self._prune_old_adapters(root)
         return str(adapter_dir)
+
+    @staticmethod
+    def _validate_complete_checkpoint(path: Path) -> None:
+        required = (
+            path / "adapter_lora" / "adapter_config.json",
+            path / "adapter_lora" / "adapter_model.safetensors",
+            path / "state" / "trainer_state.pt",
+        )
+        missing = [str(item.relative_to(path)) for item in required if not item.is_file() or item.stat().st_size == 0]
+        if missing:
+            raise RuntimeError(f"Training checkpoint is incomplete at {path}; missing or empty: {', '.join(missing)}.")
+
+    def _snapshot_periodic_checkpoint(self, source: Path) -> None:
+        """Keep an immutable full training checkpoint at the configured interval.
+
+        ``max_keep`` controls only the rolling Actor publication directory.
+        Scheduled checkpoints retain adapter, optimizer, scheduler and RNG
+        state together under the run's ``checkpoints`` directory.
+        """
+
+        interval = self.save_ckpt_interval
+        if interval == 0 or self.global_step <= 0 or self.global_step % interval:
+            return
+        storage = _mapping(self.run_cfg.get("storage", {}), "run.storage")
+        output_root = Path(str(storage.get("output_root", "outputs"))).expanduser()
+        run_name, _prefix = _run_name_and_redis(self.config)
+        destination = output_root / run_name / "checkpoints" / f"step_{self.global_step}"
+        if destination.exists():
+            self._validate_complete_checkpoint(destination)
+            return
+        self._validate_complete_checkpoint(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = destination.parent / f".step_{self.global_step}.copy-{uuid.uuid4().hex}"
+        try:
+            shutil.copytree(source, staging)
+            self._validate_complete_checkpoint(staging)
+            os.replace(staging, destination)
+        except Exception as error:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            raise RuntimeError(
+                f"Could not save training checkpoint at step {self.global_step} to {destination}: {error}"
+            ) from error
 
     def _prune_old_adapters(self, root: Path) -> None:
         max_keep = int(self.checkpoint_cfg.get("max_keep", 4))
         if max_keep < 1:
             raise ValueError("learner.checkpoint.max_keep must be positive.")
+        # Dispatch pins an Actor wave to one exact policy version. A queued
+        # wave may not have loaded its adapter while the Learner advances and
+        # its earlier results await Controller acknowledgement. Cover both
+        # bounded windows rather than deleting a still-needed sampling policy.
+        max_keep = max(max_keep, 2 * self.scheduling_plan.max_inflight_batches + 2)
         candidates: list[tuple[int, Path]] = []
         for child in root.iterdir():
             match = re.fullmatch(r"step_(\d+)", child.name)
             if child.is_dir() and match and (child / "adapter_lora").is_dir():
                 candidates.append((int(match.group(1)), child))
         candidates.sort()
-        for _step, stale in candidates[:-max_keep]:
-            shutil.rmtree(stale)
+        # The asynchronous Learner can run ahead of the last result durably
+        # acknowledged by Controller. Keep that recovery anchor even when
+        # newer in-flight updates would otherwise age it out of max_keep.
+        storage = _mapping(self.run_cfg.get("storage", {}), "run.storage")
+        summary_path = Path(str(storage.get("output_root", "outputs"))).expanduser() / str(self.run_cfg["name"]) / "training_summary.json"
+        confirmed_step: int | None = None
+        if summary_path.is_file():
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                confirmed_step = int(summary["completed_steps"])
+            except (OSError, ValueError, KeyError, TypeError):
+                # A concurrent legacy, non-atomic summary write is not a
+                # reason to delete recovery anchors. Try pruning next update.
+                return
+        teacher_floor = self._forward_kl_teacher_step(confirmed_step)
+        for step, stale in candidates[:-max_keep]:
+            teacher_checkpoint = (
+                self.teacher_sync_interval > 0
+                and step >= teacher_floor
+                and step % self.teacher_sync_interval == 0
+            )
+            if step != confirmed_step and not teacher_checkpoint:
+                shutil.rmtree(stale)
 
     def initialize_distributed(self) -> None:
         """Initialize this Learner's explicit process group, including rank zero alone."""
 
-        if dist.is_initialized():
-            return
         backend = str(self.distributed_cfg.get("backend", "nccl"))
         address = str(self.distributed_cfg.get("master_addr", "127.0.0.1"))
         port = int(self.distributed_cfg.get("master_port", 29573))
         timeout_seconds = int(self.distributed_cfg.get("timeout_sec", 7200))
-        if self.device.type != "cuda" and backend.lower() == "nccl":
-            raise ValueError("learner.distributed.backend='nccl' requires a CUDA Learner device.")
-        # ``LearnerManager`` sets these before spawning a rank, but direct
-        # single-rank use (including the real local smoke test) intentionally
-        # bypasses that manager.  DeepSpeed still requires LOCAL_RANK even
-        # when the framework supplies an explicit ``init_method``.  Do not
-        # overwrite launcher-provided values for a managed multi-rank run.
-        os.environ.setdefault("RANK", str(self.rank))
-        os.environ.setdefault("WORLD_SIZE", str(self.world_size))
-        local_rank = self.device.index if self.device.type == "cuda" and self.device.index is not None else 0
-        os.environ.setdefault("LOCAL_RANK", str(local_rank))
-        if self.device.type == "cuda":
-            torch.cuda.set_device(self.device)
-        dist.init_process_group(
-            backend=backend,
-            init_method=f"tcp://{address}:{port}",
-            rank=self.rank,
-            world_size=self.world_size,
-            timeout=datetime.timedelta(seconds=timeout_seconds),
-        )
+        if not dist.is_initialized():
+            if self.device.type != "cuda" and backend.lower() == "nccl":
+                raise ValueError("learner.distributed.backend='nccl' requires a CUDA Learner device.")
+            # Children isolate one physical GPU, hence LOCAL_RANK is zero.
+            os.environ.setdefault("RANK", str(self.rank))
+            os.environ.setdefault("WORLD_SIZE", str(self.world_size))
+            local_rank = self.device.index if self.device.type == "cuda" and self.device.index is not None else 0
+            os.environ.setdefault("LOCAL_RANK", str(local_rank))
+            if self.device.type == "cuda":
+                torch.cuda.set_device(self.device)
+            dist.init_process_group(
+                backend=backend,
+                init_method=f"tcp://{address}:{port}",
+                rank=self.rank,
+                world_size=self.world_size,
+                timeout=datetime.timedelta(seconds=timeout_seconds),
+            )
+        if self.round_gate is not None and self.world_size > 1 and self._control_group is None:
+            # All ranks create this group during startup, while Actor workers
+            # have not started. Commands must remain CPU-only later, when an
+            # Actor may own the shared GPUs and NCCL is not permitted yet.
+            self._control_group = dist.new_group(
+                ranks=list(range(self.world_size)),
+                backend="gloo",
+                timeout=datetime.timedelta(seconds=timeout_seconds),
+            )
 
     def _redis_client(self) -> object:
         try:
@@ -2039,21 +3064,102 @@ class Learner:
         if not _distributed_active():
             return command
         objects = [command if self.rank == 0 else None]
-        dist.broadcast_object_list(objects, src=0, device=self.device)
+        if self.round_gate is not None:
+            if self._control_group is None:
+                raise RuntimeError("Shared-GPU Learner commands require the startup Gloo control group.")
+            dist.broadcast_object_list(objects, src=0, group=self._control_group, device=torch.device("cpu"))
+        else:
+            dist.broadcast_object_list(objects, src=0, device=self.device)
         return objects[0]
 
+    def _collect_round_batches(
+        self,
+        client: object,
+        manifest: RoundManifest,
+        stop_event: object,
+    ) -> list[Signals] | None:
+        """Wait for this round's complete batch set and restore manifest order."""
+
+        expected = tuple(manifest.batch_ids)
+        if not expected or len(set(expected)) != len(expected):
+            raise RuntimeError("A shared Learner round requires distinct batch IDs.")
+        received: dict[str, Signals] = {}
+        while len(received) < len(expected):
+            if stop_event.is_set():  # type: ignore[union-attr]
+                return None
+            payload = client.brpop(self.queue_keys()["learner_train"], timeout=1.0)  # type: ignore[union-attr]
+            if not payload:
+                continue
+            _key, raw = payload
+            decoded = pickle.loads(raw)
+            if not isinstance(decoded, Mapping):
+                raise TypeError("Shared Learner payload did not contain a signal mapping.")
+            batch_id = decoded.get("batch_id")
+            if not isinstance(batch_id, str) or batch_id not in expected:
+                raise RuntimeError(f"Learner received batch {batch_id!r} outside round {manifest.round_id}.")
+            if batch_id in received:
+                raise RuntimeError(f"Learner received duplicate batch {batch_id!r} in round {manifest.round_id}.")
+            policy_version = decoded.get("policy_version")
+            if isinstance(policy_version, bool) or not isinstance(policy_version, int) or policy_version != manifest.policy_version:
+                raise RuntimeError(f"Learner batch {batch_id!r} does not match its round's sampling policy.")
+            received[batch_id] = dict(decoded)
+        return [received[batch_id] for batch_id in expected]
+
+    def _receive_training_command(self, client: object, stop_event: object, last_round: int) -> dict[str, object]:
+        """Receive one exact shared round or a bounded asynchronous queue turn."""
+
+        if stop_event.is_set():  # type: ignore[union-attr]
+            return {"kind": "stop"}
+        if self.round_gate is not None:
+            manifest = self.round_gate.wait_learner(last_round, stop_event)
+            if manifest is None:
+                return {"kind": "stop"}
+            batches = self._collect_round_batches(client, manifest, stop_event)
+            if batches is None:
+                self.round_gate.abort("Learner stopped while collecting a shared round.")
+                return {"kind": "stop"}
+            return {
+                "kind": "batches",
+                "round_id": manifest.round_id,
+                "batch_ids": tuple(manifest.batch_ids),
+                "signals": batches,
+            }
+
+        payload = client.brpop(self.queue_keys()["learner_train"], timeout=1.0)  # type: ignore[union-attr]
+        if not payload:
+            return {"kind": "idle"}
+        _key, raw = payload
+        decoded = pickle.loads(raw)
+        if not isinstance(decoded, Mapping):
+            raise TypeError("Redis payload did not contain a signal mapping.")
+        batches = [dict(decoded)]
+        for _ in range(self.max_batches_per_turn - 1):
+            try:
+                extra = client.rpop(self.queue_keys()["learner_train"])  # type: ignore[union-attr]
+            except Exception:
+                break
+            if extra is None:
+                break
+            try:
+                extra_decoded = pickle.loads(extra)
+                if not isinstance(extra_decoded, Mapping):
+                    raise TypeError("Redis payload did not contain a signal mapping.")
+                batches.append(dict(extra_decoded))
+            except Exception as error:
+                self._publish_event(client, f"Could not decode Learner input: {error}")
+        return {"kind": "batches", "signals": batches}
+
     def run_forever(self, stop_event: object) -> None:
-        """Consume bounded Learner turns on rank zero and coordinate all ranks."""
+        """Consume exact shared rounds or bounded asynchronous Learner turns."""
 
         if not callable(getattr(stop_event, "is_set", None)):
             raise TypeError("stop_event must provide is_set().")
         if not self._initialized:
             self.initialize_engine()
+        if self.scheduling_plan.shared and self.round_gate is None:
+            raise RuntimeError("Shared-GPU Learner execution requires the Controller's round gate.")
         client = self._redis_client() if self.rank == 0 else None
-        # This is intentionally fixed.  It bounds shutdown responsiveness
-        # without making the framework's asynchronous queue mechanics part of
-        # each run configuration.
-        timeout = 1.0
+        last_round = 0
         if self.rank == 0:
             print(
                 f"[Learner GPU {self.gpu_id}] Listening on {self.queue_keys()['learner_train']}; "
@@ -2064,44 +3170,21 @@ class Learner:
         while True:
             command: object = {"kind": "idle"}
             if self.rank == 0:
-                if stop_event.is_set():
-                    command = {"kind": "stop"}
-                else:
-                    try:
-                        payload = client.brpop(self.queue_keys()["learner_train"], timeout=timeout)  # type: ignore[union-attr]
-                    except Exception as error:
-                        self._publish_event(client, f"Redis receive failed: {error}")
-                        payload = None
-                    if payload:
-                        _key, raw = payload
-                        try:
-                            decoded = pickle.loads(raw)
-                            if not isinstance(decoded, Mapping):
-                                raise TypeError("Redis payload did not contain a signal mapping.")
-                            batches: list[Signals] = [dict(decoded)]
-                            for _ in range(self.max_batches_per_turn - 1):
-                                try:
-                                    extra = client.rpop(self.queue_keys()["learner_train"])  # type: ignore[union-attr]
-                                except Exception:
-                                    break
-                                if extra is None:
-                                    break
-                                try:
-                                    extra_decoded = pickle.loads(extra)
-                                    if not isinstance(extra_decoded, Mapping):
-                                        raise TypeError("Redis payload did not contain a signal mapping.")
-                                    batches.append(dict(extra_decoded))
-                                except Exception as error:
-                                    self._publish_event(client, f"Could not decode Learner input: {error}")
-                            command = {"kind": "batches", "signals": batches}
-                        except Exception as error:
-                            self._publish_event(client, f"Could not decode Learner input: {error}")
+                try:
+                    command = self._receive_training_command(client, stop_event, last_round)
+                except Exception as error:
+                    self._publish_event(client, f"Could not receive Learner input: {error}")
+                    if self.round_gate is not None:
+                        self.round_gate.abort(str(error))
+                        command = {"kind": "error", "message": str(error)}
             command = self._broadcast_command(command)
             if not isinstance(command, Mapping):
                 raise RuntimeError("Learner distributed command must be a mapping.")
             kind = command.get("kind")
             if kind == "stop":
                 return
+            if kind == "error":
+                raise RuntimeError(str(command.get("message", "Learner round failed.")))
             if kind != "batches":
                 continue
             raw_batches = command.get("signals")
@@ -2109,10 +3192,18 @@ class Learner:
                 raise RuntimeError("Learner batches command lacks signal mappings.")
             if not all(isinstance(batch, Mapping) for batch in raw_batches):
                 raise RuntimeError("Learner batches command contains a non-mapping payload.")
+            round_id = command.get("round_id")
+            if self.round_gate is not None:
+                if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id <= last_round:
+                    raise RuntimeError("Shared Learner command must identify a new round.")
+                if tuple(batch.get("batch_id") for batch in raw_batches) != tuple(command.get("batch_ids", ())):
+                    raise RuntimeError("Shared Learner command must contain the exact ordered round batches.")
 
             waiting_started = time.perf_counter()
             if not self.gpu_gate.acquire(stop_event):
-                continue
+                if self.round_gate is not None:
+                    self.round_gate.abort("Learner stopped before acquiring its physical GPU.")
+                return
             gate_wait_seconds = time.perf_counter() - waiting_started
             turn_started = time.perf_counter()
             completed_count = 0
@@ -2120,7 +3211,11 @@ class Learner:
             model_offload_seconds = 0.0
             handoff_memory: tuple[dict[str, float] | None, dict[str, float] | None] | None = None
             completed: list[tuple[Signals, float]] = []
+            turn_succeeded = False
             try:
+                if self.round_gate is not None and not self.round_gate.learner_ready(self.rank, round_id, stop_event):
+                    self.round_gate.abort("Learner stopped before all ranks acquired their GPUs.")
+                    return
                 model_load_seconds = self._activate_model()
                 for batch in raw_batches:
                     batch_started = time.perf_counter()
@@ -2146,6 +3241,11 @@ class Learner:
                         )
                     pipeline.execute()
                 completed_count = len(completed)
+                turn_succeeded = True
+            except BaseException as error:
+                if self.round_gate is not None:
+                    self.round_gate.abort(str(error))
+                raise
             finally:
                 try:
                     if self.cpu_offload:
@@ -2160,10 +3260,23 @@ class Learner:
                         handoff_memory = self._release_shared_gpu_turn_memory(
                             suppress_errors=sys.exc_info()[0] is not None,
                         )
+                    self._synchronize_cuda()
+                except BaseException as error:
+                    turn_succeeded = False
+                    if self.round_gate is not None:
+                        self.round_gate.abort(str(error))
+                    raise
                 finally:
                     # Offload can fail; do not strand a shared-GPU peer.
                     gate_hold_seconds = time.perf_counter() - turn_started
                     self.gpu_gate.release()
+                if self.round_gate is not None and turn_succeeded:
+                    try:
+                        self.round_gate.learner_done(self.rank, round_id)
+                    except BaseException as error:
+                        self.round_gate.abort(str(error))
+                        raise
+                    last_round = round_id
                 handoff_suffix = ""
                 if handoff_memory is not None:
                     before, after = handoff_memory
@@ -2181,7 +3294,8 @@ class Learner:
                     f"model_offload={model_offload_seconds:.3f}s{handoff_suffix}.",
                     flush=True,
                 )
-                self.gpu_gate.yield_after_release(stop_event, delay_sec=2.0)
+                if self.round_gate is None:
+                    self.gpu_gate.yield_after_release(stop_event, delay_sec=2.0)
 
     def _synchronize_cuda(self) -> None:
         """Finish this Learner's queued CUDA work before releasing its Gate."""
@@ -2275,6 +3389,8 @@ class Learner:
             "model_offload_seconds": max(0.0, float(model_offload_seconds)),
             "model_load_count": self._model_load_count,
             "model_offload_count": self._model_offload_count,
+            "optimizer_load_count": self._optimizer_load_count,
+            "optimizer_offload_count": self._optimizer_offload_count,
         }
         timing["workers"] = workers
         result["timing"] = timing
@@ -2315,6 +3431,8 @@ class Learner:
         self.tokenizer = None
         self._initialized = False
         self._model_on_gpu = False
+        self._optimizer_on_gpu = False
+        self._optimizer_cuda_tensor_ids.clear()
         gc.collect()
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -2418,6 +3536,7 @@ class LearnerManager:
                     self.stop_event,
                     ready_event,
                     self.gpu_gates.for_gpu(gpu_id) if self.gpu_gates is not None else None,
+                    self.gpu_gates.round_gate if self.gpu_gates is not None else None,
                 ),
                 name=f"FrugalOPL-Learner-rank{rank}-GPU{gpu_id}",
             )
@@ -2622,6 +3741,7 @@ def _learner_worker_main(
     stop_event: object,
     ready_event: object,
     gpu_gate: GpuGate | None,
+    round_gate: SharedRoundGate | None = None,
 ) -> None:
     # GPU isolation must occur before any CUDA operation in this child.  Torch
     # import itself is harmless; no CUDA context is created until Learner
@@ -2710,6 +3830,7 @@ def _learner_worker_main(
                     world_size=world_size,
                     gpu_id=gpu_id,
                     gpu_gate=initialization_gate,
+                    round_gate=round_gate,
                 )
                 learner.initialize_distributed()
                 learner.initialize_engine()
@@ -2735,12 +3856,13 @@ def _learner_worker_main(
                 f"[Learner rank {rank} FATAL] {error}\n{traceback.format_exc()}",
                 flush=True,
             )
+            if round_gate is not None:
+                round_gate.abort(f"Learner rank {rank} failed: {error}")
             cleanup_resources(gate_is_held=False)
-            if world_size > 1:
-                # The Manager restarts the whole group.  Avoid attempting an
-                # in-place single-rank recovery against a stale collective.
-                # A lone-rank retry cannot repair a collective group.  Exit
-                # so LearnerManager can stop and restart every rank together.
+            if world_size > 1 or round_gate is not None:
+                # A lone-rank retry cannot repair distributed collectives or
+                # an aborted shared round. Let the Manager stop the group;
+                # shared-card failures remain terminal for this run.
                 raise
             waiter = getattr(stop_event, "wait", None)
             if callable(waiter):

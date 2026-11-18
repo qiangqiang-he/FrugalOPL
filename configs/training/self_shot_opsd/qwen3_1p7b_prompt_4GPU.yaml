@@ -1,0 +1,12 @@
+extends: shared_batched_4GPU.yaml
+run:
+  name: self_shot_opsd_qwen3_1p7b_prompt_math30k_b64n1_aime24_20261107
+  policy:
+    model_name_or_path: /data/heqiangqiang/models/Qwen3-1.7B-nvme-20261105
+  redis:
+    key_prefix: frugalopl_self_shot_opsd_qwen3_1p7b_prompt_20261107
+learner:
+  distributed:
+    master_port: 29865
+algorithm:
+  self_shot_format: prompt

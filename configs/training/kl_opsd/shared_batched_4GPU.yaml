@@ -1,0 +1,101 @@
+# Full-vocabulary Forward-KL OPSD, following the official 8B non-thinking recipe.
+# One fresh global batch at a time; all four Actor/Learner GPUs are shared.
+extends: ../../common/shared_batched/4GPU.yaml
+
+eval_interval: 10
+save_ckpt_interval: 25
+save_question_accuracy: false
+
+pipeline:
+  - id: controller
+    class: Controller
+  - id: actor
+    class: Actor
+    plugin_hook: collect_actor_signals
+    cpu_offload: false
+  - id: learner
+    class: Learner
+    plugin_hook: collect_learner_signals
+    objective_fn: compute_objective
+    cpu_offload: false
+
+run:
+  name: kl_opsd_qwen3_8b_openthoughts_math30k_nonthink_shared4_k1_b64n1_aime24
+  group: kl-opsd
+  seed: 42
+  prompts:
+    train: KL_OPSD_STUDENT_PROMPT
+    evaluation: KL_OPSD_STUDENT_PROMPT
+  redis:
+    key_prefix: frugalopl_kl_opsd_qwen8b_nonthink_shared4_k1_b64n1_aime24
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-8B
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+
+controller:
+  max_steps: 100
+  max_inflight_batches: 1
+  train_prompt_batch_size: 64
+  data:
+    max_prompt_length: 20000
+    max_response_length: 1024
+    train:
+      name: openthoughts_math30k
+      path: data/openthoughts_math30k.json
+    eval:
+      - name: aime24
+        path: data/AIME-2024.json
+
+actor:
+  engine:
+    max_model_len: 32288
+    gpu_memory_utilization: 0.6
+    gpu_memory_budget_gb: 40.0
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    enable_chunked_prefill: true
+    enforce_eager: false
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+  evaluation:
+    enabled: true
+    before_training: true
+    max_examples: null
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    save_rollouts: false
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      max_response_length: 12288
+
+learner:
+  max_sequence_length: 21024
+  distributed:
+    master_port: 29749
+  execution:
+    forward_chunk_size: 128
+    gradient_checkpointing: true
+    clip_grad_norm: 0.1
+  optimizer:
+    lr: 5.0e-6
+  scheduler:
+    type: constant
+
+algorithm:
+  plugin: KLOPSDPlugin
+  algo_name: kl_opsd
+  loss_aggregation: token
+  enable_thinking: false
+  training_sampling:
+    temperature: 1.1
+    top_p: 0.95
+    top_k: 20
+    max_tokens: 1024
+    n: 1
+  kl_temperature: 1.1
+  kl_token_clip: 1.0e-7
+  kl_chunk_size: 128

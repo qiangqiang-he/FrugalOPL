@@ -26,15 +26,20 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import json
 import math
 import multiprocessing as mp
+import os
 import pickle
 import random
+import re
 import shutil
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -42,10 +47,12 @@ from typing import Any
 from algorithm_plugins import plugin_factory_from_config
 from algorithm_plugins.algorithm_base import AlgorithmPlugin
 from engine.actor import ActorManager, load_merged_config
-from engine.gpu_gate import GpuGateRegistry
+from engine.gpu_gate import GpuGateRegistry, SharedRoundGate
+from engine.scheduling import question_shards, resolve_scheduling
 from engine.learner import LearnerManager
 from engine.pipeline import TrainingPipeline, resolve_training_pipeline, resolve_worker_config
 from engine.teacher import TeacherManager
+from utils.algorithm_runtime import resolve_train_candidate_count
 from utils.eval import (
     build_question_results,
     compute_metrics,
@@ -153,6 +160,9 @@ class Controller:
             raise TypeError("plugin_factory must be callable.")
 
         self.config: dict[str, object] = copy.deepcopy(dict(config))
+        self.save_question_accuracy = self.config.get("save_question_accuracy", False)
+        if not isinstance(self.save_question_accuracy, bool):
+            raise ValueError("save_question_accuracy must be a boolean.")
         self.pipeline: TrainingPipeline = resolve_training_pipeline(self.config)
         self.controller_node = self.pipeline.node_for_class("Controller")
         self.actor_node = self.pipeline.node_for_class("Actor")
@@ -170,23 +180,30 @@ class Controller:
             self.controller_cfg.get("train_prompt_batch_size"),
             "controller.train_prompt_batch_size",
         )
+        self.train_candidate_count = resolve_train_candidate_count(
+            self.train_prompt_batch_size, _mapping(self.config.get("algorithm", {}), "algorithm"),
+        )
         self.max_inflight_batches = _positive_int(
             self.controller_cfg.get("max_inflight_batches", 1),
             "controller.max_inflight_batches",
         )
 
-        engine_cfg = _mapping(self.actor_cfg.get("engine"), "actor.engine")
-        self.actor_max_batches_per_turn = _positive_int(
-            engine_cfg.get("max_batches_per_turn", 1),
-            "actor.engine.max_batches_per_turn",
-        )
+        self.scheduling = resolve_scheduling(self.config)
+        self.actor_max_batches_per_turn = self.scheduling.actor_batches_per_wave
+        self._active_round_id = 0
         evaluation_cfg = _mapping(self.actor_cfg.get("evaluation", {}), "actor.evaluation")
+        if "interval_steps" in evaluation_cfg:
+            raise ValueError("actor.evaluation.interval_steps is unsupported; use top-level eval_interval.")
         self.evaluation_enabled = bool(evaluation_cfg.get("enabled", True))
         self.evaluation_before_training = bool(evaluation_cfg.get("before_training", False))
-        self.evaluation_interval_steps = int(evaluation_cfg.get("interval_steps", 0) or 0)
-        if self.evaluation_interval_steps < 0:
-            raise ValueError("actor.evaluation.interval_steps must be non-negative.")
-        if self.evaluation_enabled and self.evaluation_interval_steps == 0 and not self.evaluation_before_training:
+        self.eval_interval = self.config.get("eval_interval", 0)
+        if (
+            isinstance(self.eval_interval, bool)
+            or not isinstance(self.eval_interval, int)
+            or self.eval_interval < 0
+        ):
+            raise ValueError("eval_interval must be a non-negative integer.")
+        if self.evaluation_enabled and self.eval_interval == 0 and not self.evaluation_before_training:
             # Evaluation is deliberately opt-in when no interval is supplied.
             self.evaluation_enabled = False
         self.eval_rollouts_per_batch, self.eval_rollouts_per_prompt, self.eval_prompts_per_batch = (
@@ -216,25 +233,26 @@ class Controller:
         seed = int(self.run_cfg.get("seed", 0))
         random.Random(seed).shuffle(self._train_order)
         self._next_train_offset = 0
+        self._confirmed_batch_sequence = 0
 
         self.output_dir = self._resolve_output_dir()
         self.train_history: list[dict[str, object]] = []
         self.evaluation_history: list[dict[str, object]] = []
         self._last_policy_version = 0
+        self._restored_elapsed_seconds = 0.0
+        self._training_elapsed_seconds = 0.0
+        self._restored_from_storage = False
+        self._run_started_at: float | None = None
+        self._train_dataset_digest = hashlib.sha256(
+            json.dumps(self.train_records, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
         # One Controller-owned SwanLab experiment receives detached Worker
         # telemetry through the normal Redis result path.  Workers never
         # initialize their own telemetry experiment.
-        self._swanlab = SwanLabLogger(self.config, pipeline=self.pipeline)
+        self._swanlab = SwanLabLogger(self.config, pipeline=self.pipeline, output_dir=self.output_dir)
 
     def _build_gpu_gates(self) -> GpuGateRegistry:
-        """Create the run-local physical-GPU gate registry before spawning.
-
-        Actor and Teacher entries each represent independent per-GPU Workers.
-        Learner is the only collective Worker type; a multi-rank Learner that
-        overlaps another Worker on just some of its GPUs is intentionally not
-        supported by this lightweight per-GPU design, because it could let
-        one rank enter a collective while another waits for a shared GPU.
-        """
+        """Create physical permits and an optional collective round handoff."""
 
         def configured_gpu_ids(worker_name: str, cfg: Mapping[str, object]) -> list[object]:
             raw_gpu_ids = cfg.get("gpu_ids", [])
@@ -249,25 +267,21 @@ class Controller:
         for node in self.teacher_nodes:
             teacher_cfg = resolve_worker_config(self.config, node.node_id)
             worker_gpu_ids[node.node_id] = configured_gpu_ids(node.node_id, teacher_cfg)
-        learner_ids = set(worker_gpu_ids[self.learner_node.node_id])
-        if len(learner_ids) > 1:
-            non_learner_ids = set().union(
-                *(
-                    set(gpu_ids)
-                    for worker_name, gpu_ids in worker_gpu_ids.items()
-                    if worker_name != self.learner_node.node_id
-                )
-            )
-            conflicting = learner_ids & non_learner_ids
-            if conflicting:
-                formatted = ", ".join(str(gpu_id) for gpu_id in sorted(conflicting))
+        if len(self.scheduling.learner_gpu_ids) > 1 and not self.scheduling.shared:
+            learner_ids = set(self.scheduling.learner_gpu_ids)
+            if any(learner_ids & set(worker_gpu_ids[node.node_id]) for node in self.teacher_nodes):
                 raise ValueError(
-                    "A multi-GPU Learner may not share only part of its collective GPU set with another "
-                    f"Worker (overlap: {formatted}). Use dedicated Learner GPUs for this configuration."
+                    "An asynchronous multi-GPU Learner requires GPUs separate from Teacher workers as well."
                 )
         runtime_cfg = _mapping(self.run_cfg.get("runtime", {}), "run.runtime")
         context = mp.get_context(str(runtime_cfg.get("process_start_method", "spawn")))
-        return GpuGateRegistry.from_worker_gpu_ids(worker_gpu_ids, ctx=context)
+        registry = GpuGateRegistry.from_worker_gpu_ids(worker_gpu_ids, ctx=context)
+        if self.scheduling.shared:
+            registry.round_gate = SharedRoundGate(
+                self.scheduling.actor_gpu_ids, len(self.scheduling.learner_gpu_ids),
+                self.max_inflight_batches, ctx=context,
+            )
+        return registry
 
     def _run_name_and_redis(self) -> tuple[str, str]:
         name = self.run_cfg.get("name")
@@ -324,6 +338,205 @@ class Controller:
         if not root.is_absolute():
             root = _project_root() / root
         return root.resolve()
+
+    def _restore_run_progress(self) -> int:
+        """Restore one Controller-confirmed update before any model is loaded.
+
+        A Learner may publish checkpoints ahead of the Controller's last
+        durable result. Preserve unconfirmed live and periodic checkpoints
+        under recovery so both Workers resume the same confirmed policy and
+        replayed steps cannot reuse a periodic snapshot from a discarded
+        branch. Never roll back already recorded history to an older available
+        checkpoint.
+        """
+
+        summary_path = self.output_dir / "training_summary.json"
+        summary: dict[str, object] = {}
+        if summary_path.is_file():
+            summary = _mapping(json.loads(summary_path.read_text(encoding="utf-8")), str(summary_path))
+            if summary.get("run_name") != self.run_name:
+                raise RuntimeError("Saved training summary belongs to a different run.")
+        completed = _positive_int(summary.get("completed_steps", 0), "saved completed_steps", minimum=0)
+        if completed > self.max_steps:
+            raise RuntimeError("controller.max_steps is below the saved completed step.")
+        history = summary.get("train", [])
+        if not isinstance(history, list) or len(history) != completed:
+            raise RuntimeError("Saved training history does not match completed_steps.")
+        sequences: list[int] = []
+        for index, raw_item in enumerate(history, start=1):
+            item = _mapping(raw_item, f"saved train[{index - 1}]")
+            if item.get("completed_step") != index or item.get("policy_version") != index:
+                raise RuntimeError("Saved history lacks consecutive Controller/policy steps.")
+            dispatch = _mapping(item.get("dispatch"), "saved dispatch")
+            if dispatch.get("record_count") != self.train_candidate_count:
+                raise RuntimeError("Training candidate batch size changed since the saved run.")
+            sequences.append(_positive_int(dispatch.get("sequence"), "saved dispatch.sequence"))
+
+        saved_state = summary.get("resume_state")
+        confirmed_sequence = completed
+        if saved_state is not None:
+            state = _mapping(saved_state, "saved resume_state")
+            confirmed_sequence = _positive_int(
+                state.get("confirmed_batch_sequence", completed), "saved confirmed_batch_sequence", minimum=completed,
+            )
+            if (
+                state.get("train_dataset_sha256") != self._train_dataset_digest
+                or state.get("seed") != int(self.run_cfg.get("seed", 0))
+                or state.get("train_prompt_batch_size") != self.train_prompt_batch_size
+                or state.get("train_candidate_count", self.train_prompt_batch_size) != self.train_candidate_count
+                or state.get("completed_train_offset") != confirmed_sequence * self.train_candidate_count
+            ):
+                raise RuntimeError("Saved data cursor or training data, seed or prompt batch size does not match this run.")
+        elif completed:
+            # Existing runs predate resume_state; their merged configuration
+            # still records the deterministic data traversal inputs.
+            saved_config_path = self.output_dir / "merged_config.json"
+            if not saved_config_path.is_file():
+                raise RuntimeError("Legacy training history requires its saved merged_config.json to resume.")
+            saved_config = _mapping(json.loads(saved_config_path.read_text(encoding="utf-8")), "saved config")
+            saved_run = _mapping(saved_config.get("run"), "saved run")
+            saved_controller = _mapping(saved_config.get(self.controller_node.node_id), "saved controller")
+            saved_data = _mapping(saved_controller.get("data"), "saved controller.data")
+            current_data = _mapping(self.controller_cfg.get("data"), "controller.data")
+            if (
+                int(saved_run.get("seed", 0)) != int(self.run_cfg.get("seed", 0))
+                or saved_data.get("train") != current_data.get("train")
+                or saved_controller.get("train_prompt_batch_size") != self.train_prompt_batch_size
+                or self.train_candidate_count != self.train_prompt_batch_size
+            ):
+                raise RuntimeError("Legacy training data configuration changed; cannot reconstruct its cursor safely.")
+        if len(set(sequences)) != len(sequences) or any(sequence > confirmed_sequence for sequence in sequences):
+            raise RuntimeError("Saved training requests do not match the confirmed dataset prefix.")
+
+        adapter_root = self._lora_adapter_root()
+        checkpoints: list[tuple[int, Path]] = []
+        if adapter_root.is_dir():
+            for path in adapter_root.iterdir():
+                match = re.fullmatch(r"step_([0-9]+)", path.name)
+                if path.is_dir() and match:
+                    checkpoints.append((int(match.group(1)), path))
+        periodic_checkpoints: list[tuple[int, Path]] = []
+        periodic_root = self.output_dir / "checkpoints"
+        if periodic_root.is_dir():
+            for path in periodic_root.iterdir():
+                match = re.fullmatch(r"step_([0-9]+)", path.name)
+                if path.is_dir() and match:
+                    periodic_checkpoints.append((int(match.group(1)), path))
+        if (checkpoints or periodic_checkpoints) and not summary:
+            raise RuntimeError("Existing checkpoints have no durable Controller summary; refusing a fresh run over them.")
+        if completed:
+            checkpoint = adapter_root / f"step_{completed}"
+            required = (
+                checkpoint / "adapter_lora" / "adapter_config.json",
+                checkpoint / "adapter_lora" / "adapter_model.safetensors",
+                checkpoint / "state" / "trainer_state.pt",
+            )
+            if not all(path.is_file() for path in required):
+                raise RuntimeError(f"Confirmed step {completed} has no complete adapter/optimizer checkpoint; history was preserved.")
+
+        evaluations: dict[int, dict[str, object]] = {}
+        saved_evaluations = summary.get("evaluations", [])
+        if not isinstance(saved_evaluations, list):
+            raise RuntimeError("Saved evaluation history must be a list.")
+        candidates = list(saved_evaluations)
+        for path in sorted((self.output_dir / "evaluations").glob("step_*_summary.json")):
+            candidates.append(json.loads(path.read_text(encoding="utf-8")))
+        for raw_result in candidates:
+            result = _mapping(raw_result, "saved evaluation")
+            step = _positive_int(result.get("step"), "saved evaluation.step", minimum=0)
+            if step > completed:
+                continue
+            datasets = result.get("datasets")
+            if not isinstance(datasets, Mapping) or not datasets:
+                raise RuntimeError("Saved evaluation has no completed dataset results.")
+            if self.evaluation_enabled and set(datasets) != set(self.eval_datasets):
+                raise RuntimeError("Evaluation datasets changed since the saved run.")
+            evaluations[step] = result
+        elapsed = float(summary.get("elapsed_seconds", 0.0))
+        if not math.isfinite(elapsed) or elapsed < 0:
+            raise RuntimeError("Saved elapsed_seconds must be finite and non-negative.")
+        saved_evaluation_steps = {int(item["step"]) for item in saved_evaluations}
+        for step, result in evaluations.items():
+            cumulative = result.get("run_elapsed_seconds")
+            if cumulative is not None:
+                cumulative = float(cumulative)
+                if not math.isfinite(cumulative) or cumulative < 0:
+                    raise RuntimeError("Saved evaluation run_elapsed_seconds must be finite and non-negative.")
+                elapsed = max(elapsed, cumulative)
+            elif step == completed and step not in saved_evaluation_steps:
+                # Legacy markers lack the cumulative clock. At least retain
+                # their evaluation duration when the global summary lagged.
+                duration = float(result.get("elapsed_seconds", 0.0))
+                if not math.isfinite(duration) or duration < 0:
+                    raise RuntimeError("Saved evaluation elapsed_seconds must be finite and non-negative.")
+                elapsed += duration
+
+        training_elapsed = summary.get("training_elapsed_seconds")
+        if training_elapsed is None and history:
+            training_elapsed = history[-1].get("training_elapsed_seconds")
+        if training_elapsed is None:
+            # Legacy runs only recorded the whole-run clock. Their completed
+            # evaluation durations are the best available correction; new
+            # runs persist a separate, exact training clock below.
+            evaluation_elapsed = 0.0
+            for result in evaluations.values():
+                duration = float(result.get("elapsed_seconds", 0.0))
+                if not math.isfinite(duration) or duration < 0:
+                    raise RuntimeError("Saved evaluation elapsed_seconds must be finite and non-negative.")
+                evaluation_elapsed += duration
+            training_elapsed = max(0.0, elapsed - evaluation_elapsed) if completed else 0.0
+        training_elapsed = float(training_elapsed)
+        if not math.isfinite(training_elapsed) or training_elapsed < 0:
+            raise RuntimeError("Saved training_elapsed_seconds must be finite and non-negative.")
+
+        ahead = [(step, path) for step, path in checkpoints if step > completed]
+        periodic_ahead = [(step, path) for step, path in periodic_checkpoints if step > completed]
+        accuracy_root = self.output_dir / "question_accuracy"
+        accuracy_orphans = [
+            path for path in accuracy_root.iterdir()
+            if path.is_file() and re.fullmatch(r"train-[0-9]+\.json", path.name)
+            and int(path.stem.removeprefix("train-")) > confirmed_sequence
+        ] if accuracy_root.is_dir() else []
+        if ahead or periodic_ahead or accuracy_orphans:
+            archive = self.output_dir / "recovery" / f"unconfirmed-{uuid.uuid4().hex}"
+            archive.mkdir(parents=True, exist_ok=False)
+            for _step, path in ahead:
+                path.rename(archive / path.name)
+            if periodic_ahead:
+                periodic_archive = archive / "checkpoints"
+                periodic_archive.mkdir()
+                for _step, path in periodic_ahead:
+                    path.rename(periodic_archive / path.name)
+            if accuracy_orphans:
+                accuracy_archive = archive / "question_accuracy"
+                accuracy_archive.mkdir()
+                for path in accuracy_orphans:
+                    path.rename(accuracy_archive / path.name)
+            print(
+                f"[Controller] Preserved {len(ahead)} live and {len(periodic_ahead)} periodic "
+                f"unconfirmed checkpoint(s), and {len(accuracy_orphans)} unconfirmed question-accuracy file(s) under {archive}.",
+                flush=True,
+            )
+        self.train_history = copy.deepcopy(history)
+        self.evaluation_history = [evaluations[step] for step in sorted(evaluations)]
+        self._last_policy_version = completed
+        # Dispatched but unconfirmed requests are discarded and regenerated.
+        self._confirmed_batch_sequence = confirmed_sequence
+        self._next_train_offset = confirmed_sequence * self.train_candidate_count
+        self._restored_elapsed_seconds = elapsed
+        self._training_elapsed_seconds = training_elapsed
+        self._restored_from_storage = bool(summary or evaluations)
+        runtime = _mapping(self.run_cfg.get("runtime", {}), "run.runtime")
+        runtime["resume_step"] = completed
+        self.run_cfg["runtime"] = runtime
+        self.config["run"] = copy.deepcopy(self.run_cfg)
+        os.environ["FRUGALOPL_RESUME_STEP"] = str(completed)
+        if summary or evaluations:
+            print(f"[Controller] Restored step={completed}, data_offset={self._next_train_offset}, elapsed={elapsed:.2f}s.", flush=True)
+        return completed
+
+    def _has_completed_evaluation(self, step: int) -> bool:
+        return any(result.get("step") == step for result in self.evaluation_history)
 
     @staticmethod
     def _validate_complete_peft_adapter(path: Path, *, label: str) -> None:
@@ -431,7 +644,7 @@ class Controller:
 
     def _clear_run_keys(self, client: object) -> None:
         redis_cfg = _mapping(self.run_cfg.get("redis"), "run.redis")
-        if not bool(redis_cfg.get("clear_run_keys_on_start", False)):
+        if not bool(redis_cfg.get("clear_run_keys_on_start", False)) and not self._restored_from_storage:
             return
         scan_iter = getattr(client, "scan_iter", None)
         delete = getattr(client, "delete", None)
@@ -451,7 +664,7 @@ class Controller:
         """Take a deterministic prompt batch, cycling only after dataset exhaustion."""
 
         selected: list[dict[str, object]] = []
-        for _ in range(self.train_prompt_batch_size):
+        for _ in range(self.train_candidate_count):
             record_index = self._train_order[self._next_train_offset % len(self._train_order)]
             selected.append(copy.deepcopy(self.train_records[record_index]))
             self._next_train_offset += 1
@@ -479,13 +692,15 @@ class Controller:
         count: int,
         issued: int,
     ) -> int:
-        """Atomically queue one bounded Actor execution turn."""
+        """Dispatch one global-batch wave, sharded evenly across all Actors."""
 
         if count < 1:
             return issued
-        serialized: list[bytes] = []
+        global_batches: list[dict[str, object]] = []
         new_entries: list[tuple[str, dict[str, object]]] = []
+        wave_id = f"wave-{issued + 1:06d}-{issued + count:06d}"
         for _ in range(count):
+            train_offset = self._next_train_offset
             records = self._next_train_records()
             questions, answers = self._records_to_signals(records)
             sequence = issued + 1
@@ -499,26 +714,82 @@ class Controller:
                 # solutions) without teaching the framework algorithm fields.
                 "records": copy.deepcopy(records),
             }
-            serialized.append(pickle.dumps(signals, protocol=pickle.HIGHEST_PROTOCOL))
-            new_entries.append((batch_id, {"sequence": sequence, "record_count": len(records)}))
+            global_batches.append(signals)
+            entry: dict[str, object] = {"sequence": sequence, "record_count": len(records)}
+            entry["wave_id"] = wave_id
+            if self.save_question_accuracy:
+                entry["question_indices"] = [
+                    self._train_order[(train_offset + index) % len(self._train_order)]
+                    for index in range(len(records))
+                ]
+            new_entries.append((batch_id, entry))
             issued += 1
-        lpush = getattr(client, "lpush", None)
-        if not callable(lpush):
-            raise TypeError("Controller Redis client must provide lpush().")
-        # A variadic LPUSH is atomic.  BRPOP retrieves the first payload and
-        # Actor's immediate RPOP retrieves the next one, preserving the
-        # logical order while allowing one bounded execution turn to coalesce.
-        # Record immediately before the actual Redis send so the end-to-end
-        # number includes queueing, every Worker stage, and the result route.
+        batch_ids = [str(batch["batch_id"]) for batch in global_batches]
+        slices = question_shards(self.train_candidate_count, self.scheduling.actor_gpu_ids)
+        round_id = None
+        if self.gpu_gates.round_gate is not None:
+            manifest = self.gpu_gates.round_gate.begin_round(
+                batch_ids, self._last_policy_version, actor_gpu_ids=[gpu for gpu, _, _ in slices],
+            )
+            round_id = self._active_round_id = manifest.round_id
+        queue = client.pipeline()
+        for shard_index, (gpu_id, start, stop) in enumerate(slices):
+            shards = []
+            for batch_index, batch in enumerate(global_batches):
+                shard = copy.deepcopy(batch)
+                for field in ("questions", "answers", "records"):
+                    shard[field] = shard[field][start:stop]
+                shard["actor_shard"] = {
+                    "index": shard_index, "count": len(slices), "prompt_offset": start,
+                    "global_prompt_count": self.train_candidate_count,
+                }
+                shard["wave_batch_index"] = batch_index
+                shards.append(shard)
+            envelope = {
+                "kind": "actor_wave", "wave_id": wave_id, "round_id": round_id,
+                "policy_version": self._last_policy_version, "batch_ids": batch_ids,
+                "batches": shards,
+            }
+            queue.lpush(
+                f"{self.queue_keys()['actor_train']}:gpu:{gpu_id}",
+                pickle.dumps(envelope, protocol=pickle.HIGHEST_PROTOCOL),
+            )
         dispatched_at = time.monotonic()
-        lpush(self.queue_keys()["actor_train"], *serialized)
+        queue.execute()
         for _batch_id, entry in new_entries:
             entry["dispatch_monotonic"] = dispatched_at
+            entry["round_id"] = round_id
         pending.update(dict(new_entries))
         first = new_entries[0][0]
         last = new_entries[-1][0]
         print(f"[Controller] Dispatched {first}..{last} ({len(pending)} training batch(es) in flight).", flush=True)
         return issued
+
+    def _wait_for_round_release(self, actor_manager, learner_manager, teacher_manager) -> None:
+        gate = self.gpu_gates.round_gate
+        if gate is None or not self._active_round_id:
+            return
+        while not gate.wait_complete(self._active_round_id, timeout=0.1):
+            self._assert_workers_alive(actor_manager, learner_manager, teacher_manager)
+
+    def _question_accuracy_rows(self, question_indices: object, accuracies: object) -> list[dict[str, object]]:
+        """Validate batch-local means and attach the original dataset positions."""
+
+        if not isinstance(question_indices, list) or len(question_indices) != self.train_candidate_count:
+            raise ValueError("Question-accuracy indices must contain one original dataset index per training prompt.")
+        if not isinstance(accuracies, list) or len(accuracies) != len(question_indices):
+            raise ValueError("question_accuracies must contain one mean accuracy per training prompt.")
+        rows: list[dict[str, object]] = []
+        for question_index, accuracy in zip(question_indices, accuracies, strict=True):
+            if isinstance(question_index, bool) or not isinstance(question_index, int) or not 0 <= question_index < len(self.train_records):
+                raise ValueError("Question-accuracy question_index must be a valid original dataset index.")
+            if isinstance(accuracy, bool) or not isinstance(accuracy, (int, float)):
+                raise ValueError("Question accuracy must be a finite number between zero and one.")
+            mean = float(accuracy)
+            if not math.isfinite(mean) or not 0.0 <= mean <= 1.0:
+                raise ValueError("Question accuracy must be a finite number between zero and one.")
+            rows.append({"question_index": question_index, "accuracy": mean})
+        return rows
 
     def _pop_message(
         self,
@@ -563,6 +834,15 @@ class Controller:
         learner_manager: LearnerManager,
         teacher_manager: TeacherManager | Mapping[str, TeacherManager] | None = None,
     ) -> None:
+        # A fresh-process Actor intentionally exits after publishing one
+        # complete turn.  Give its Manager the synchronous, locked chance to
+        # replace an explicitly acknowledged clean exit before treating the
+        # old child as a failed Worker.  Existing manager doubles and other
+        # Worker roles need no such lifecycle hook.
+        ensure_actor_workers = getattr(actor_manager, "ensure_workers_alive", None)
+        if callable(ensure_actor_workers):
+            ensure_actor_workers()
+
         def terminal_failure(manager: object) -> str | None:
             """Read a Manager's fail-fast state without constraining test doubles."""
 
@@ -656,29 +936,49 @@ class Controller:
         keys = self.queue_keys()
         dataset_summaries: dict[str, object] = {}
         detail_datasets: dict[str, object] = {}
+        evaluation_attempt = uuid.uuid4().hex
 
         for dataset_name, dataset_records in self.eval_datasets.items():
-            evaluation_id = f"eval-step-{completed_steps:06d}-{dataset_name}"
+            evaluation_id = f"eval-step-{completed_steps:06d}-{dataset_name}-{evaluation_attempt}"
             question_results: list[dict[str, object]] = []
-            for batch_index, start in enumerate(
-                range(0, len(dataset_records), self.eval_prompts_per_batch)
-            ):
-                records = dataset_records[start : start + self.eval_prompts_per_batch]
+            # Each Actor owns a contiguous question slice and at most one
+            # outstanding evaluation request. Seed every active GPU before
+            # collecting results, then refill only the GPU that just finished.
+            # This keeps the per-call rollout bound independent of training K.
+            requests_by_gpu = {}
+            batch_index = 0
+            for gpu_id, first, stop in question_shards(len(dataset_records), self.scheduling.actor_gpu_ids):
+                requests = deque()
+                for start in range(first, stop, self.eval_prompts_per_batch):
+                    records = dataset_records[start : min(stop, start + self.eval_prompts_per_batch)]
+                    requests.append((batch_index, start, records))
+                    batch_index += 1
+                requests_by_gpu[gpu_id] = requests
+            pending = {}
+            lpush = getattr(client, "lpush", None)
+            if not callable(lpush):
+                raise TypeError("Controller Redis client must provide lpush().")
+
+            def dispatch_next(gpu_id):
+                if not requests_by_gpu[gpu_id]:
+                    return
+                index, start, records = requests_by_gpu[gpu_id].popleft()
                 questions, answers = self._records_to_signals(records)
                 signals: dict[str, object] = {
                     "evaluation_id": evaluation_id,
-                    "evaluation_batch_index": batch_index,
+                    "evaluation_batch_index": index,
+                    "evaluation_gpu_id": gpu_id,
                     "policy_version": self._last_policy_version,
                     "questions": questions,
                     "answers": answers,
                     "records": copy.deepcopy(records),
                 }
-                lpush = getattr(client, "lpush", None)
-                if not callable(lpush):
-                    raise TypeError("Controller Redis client must provide lpush().")
-                # Evaluation is intentionally one request at a time. Therefore
-                # every vLLM call obeys the project-wide 64-rollout maximum.
-                lpush(keys["actor_eval"], pickle.dumps(signals, protocol=pickle.HIGHEST_PROTOCOL))
+                pending[index] = (gpu_id, start, records)
+                lpush(f"{keys['actor_eval']}:gpu:{gpu_id}", pickle.dumps(signals, protocol=pickle.HIGHEST_PROTOCOL))
+
+            for gpu_id in requests_by_gpu:
+                dispatch_next(gpu_id)
+            while pending:
                 result = self._pop_message(
                     client,
                     result_key=keys["eval_results"],
@@ -690,8 +990,17 @@ class Controller:
                     raise RuntimeError(
                         f"Expected evaluation result {evaluation_id!r}, got {result.get('evaluation_id')!r}."
                     )
-                if int(result.get("evaluation_batch_index", -1)) != batch_index:
-                    raise RuntimeError("Controller received an evaluation result for the wrong batch index.")
+                index = result.get("evaluation_batch_index")
+                if isinstance(index, bool) or not isinstance(index, int) or index not in pending:
+                    raise RuntimeError("Controller received an unknown or duplicate evaluation batch index.")
+                gpu_id, start, records = pending[index]
+                result_gpu = result.get("evaluation_gpu_id")
+                if isinstance(result_gpu, bool) or not isinstance(result_gpu, int) or result_gpu != gpu_id:
+                    raise RuntimeError("Controller received an evaluation result from the wrong GPU.")
+                actor_metrics = result.get("actor_metrics")
+                actual_version = actor_metrics.get("lora_step") if isinstance(actor_metrics, Mapping) else None
+                if isinstance(actual_version, bool) or not isinstance(actual_version, int) or actual_version != self._last_policy_version:
+                    raise RuntimeError("Actor evaluation executed the wrong LoRA policy version.")
                 trajectory = result.get("traj")
                 if not isinstance(trajectory, Mapping):
                     raise RuntimeError("Actor evaluation result does not contain a trajectory mapping.")
@@ -704,6 +1013,8 @@ class Controller:
                         start_index=start,
                     )
                 )
+                del pending[index]
+                dispatch_next(gpu_id)
 
             question_results.sort(key=lambda item: int(item["record_index"]))
             raw_metrics = compute_metrics(question_results, rollouts_per_prompt=self.eval_rollouts_per_prompt)
@@ -728,14 +1039,14 @@ class Controller:
             "elapsed_seconds": time.time() - started,
             "datasets": dataset_summaries,
         }
+        if self._run_started_at is not None:
+            result["run_elapsed_seconds"] = max(0.0, time.time() - self._run_started_at)
         if adapter_snapshot is not None:
             # Keep the immutable artifact path in local JSON. SwanLab records
             # the numeric step below, while the path remains useful for a
             # later standalone Actor evaluation or exact reproduction.
             result["adapter_snapshot"] = str(adapter_snapshot)
             result["adapter_snapshot_step"] = completed_steps
-        self.evaluation_history.append(result)
-        self._log_evaluation(result)
         details = {
             "run_name": self.run_name,
             "step": completed_steps,
@@ -744,8 +1055,11 @@ class Controller:
         }
         if adapter_snapshot is not None:
             details["adapter_snapshot"] = str(adapter_snapshot)
-        write_json(self.output_dir / "evaluations" / f"step_{completed_steps:06d}_summary.json", result)
         write_json(self.output_dir / "evaluations" / f"step_{completed_steps:06d}_details.json", details)
+        # The summary is the durable completion marker used on restart.
+        write_json(self.output_dir / "evaluations" / f"step_{completed_steps:06d}_summary.json", result)
+        self.evaluation_history.append(result)
+        self._log_evaluation(result)
         for dataset_name, dataset in dataset_summaries.items():
             metrics = dataset["metrics"]
             assert isinstance(metrics, Mapping)
@@ -784,14 +1098,17 @@ class Controller:
         *,
         elapsed_seconds: float,
     ) -> dict[str, object]:
-        """Return Controller-global metrics at one completed optimizer step."""
+        """Keep whole-run elapsed time separate from training throughput."""
 
         completed_step = int(history_item["completed_step"])
         elapsed = max(0.0, float(elapsed_seconds))
+        training_elapsed = max(
+            0.0, float(history_item.get("training_elapsed_seconds", self._training_elapsed_seconds))
+        )
         response_tokens = self._completed_response_tokens(history_item)
         return {
             "elapsed_seconds": elapsed,
-            "avg_batch_time_seconds": elapsed / completed_step,
+            "avg_batch_time_seconds": training_elapsed / completed_step,
             "response_tokens_total": response_tokens,
             "avg_batch_response_tokens": response_tokens / completed_step,
         }
@@ -802,8 +1119,17 @@ class Controller:
             "configured_max_steps": self.max_steps,
             "completed_steps": completed_steps,
             "elapsed_seconds": time.time() - started,
+            "training_elapsed_seconds": self._training_elapsed_seconds,
             "train": self.train_history,
             "evaluations": self.evaluation_history,
+            "resume_state": {
+                "seed": int(self.run_cfg.get("seed", 0)),
+                "train_prompt_batch_size": self.train_prompt_batch_size,
+                "train_candidate_count": self.train_candidate_count,
+                "train_dataset_sha256": self._train_dataset_digest,
+                "confirmed_batch_sequence": self._confirmed_batch_sequence,
+                "completed_train_offset": self._confirmed_batch_sequence * self.train_candidate_count,
+            },
         }
         write_json(self.output_dir / "training_summary.json", _json_number(summary))
 
@@ -839,7 +1165,11 @@ class Controller:
         }
         persisted_progress = history_item.get("controller_metrics")
         if isinstance(persisted_progress, Mapping):
-            progress_metrics = persisted_progress
+            progress_metrics = dict(persisted_progress)
+            if "training_elapsed_seconds" not in history_item:
+                # Old persisted averages included evaluation. Correct the
+                # resumed frontier without changing its other saved metrics.
+                progress_metrics["avg_batch_time_seconds"] = self._training_elapsed_seconds / completed_step
         else:
             progress_metrics = self._global_progress_metrics(
                 history_item,
@@ -995,11 +1325,28 @@ class Controller:
         """Launch Workers, train through ``max_steps``, and evaluate at boundaries."""
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        write_json(self.output_dir / "merged_config.json", self.config)
+        resumed_steps = self._restore_run_progress()
+        merged_config_path = self.output_dir / "merged_config.json"
+        if merged_config_path.is_file():
+            # Keep the original run artifact intact. Runtime recovery metadata
+            # is recorded separately while Workers receive self.config.
+            write_json(self.output_dir / "merged_config.resume.json", self.config)
+        else:
+            write_json(merged_config_path, self.config)
         # Credentials are read only from the already-exported process
         # environment.  Start before Workers so an invalid SwanLab setup
         # fails before any GPU model is loaded.
         self._swanlab.start()
+        if resumed_steps:
+            # Replay only the durable frontier. This repairs the crash window
+            # between committing progress and sending it to SwanLab; an SDK
+            # that already stored this step ignores the same-valued replay.
+            self._log_completed_training_batch(
+                self.train_history[-1], started=time.time() - self._restored_elapsed_seconds
+            )
+        for result in self.evaluation_history:
+            if result.get("step") == resumed_steps:
+                self._log_evaluation(result)
         client = self._redis_client()
         ping = getattr(client, "ping", None)
         if not callable(ping):
@@ -1027,10 +1374,13 @@ class Controller:
             gpu_gates=self.gpu_gates,
         )
         supervisors: list[threading.Thread] = []
-        started = time.time()
-        completed_steps = 0
-        issued_steps = 0
+        started = time.time() - self._restored_elapsed_seconds
+        self._run_started_at = started
+        completed_steps = resumed_steps
+        issued_batches = self._confirmed_batch_sequence
+        training_started: float | None = None
         pending: dict[str, dict[str, object]] = {}
+        acknowledged: set[int] = set()
         run_error: BaseException | None = None
         try:
             # Learner first means an Actor can hand off its initial trajectory
@@ -1077,7 +1427,12 @@ class Controller:
                 flush=True,
             )
 
-            if self.evaluation_enabled and self.evaluation_before_training:
+            if (
+                self.evaluation_enabled
+                and self.evaluation_before_training
+                and completed_steps == 0
+                and not self._has_completed_evaluation(0)
+            ):
                 self._run_evaluation(
                     client,
                     completed_steps=0,
@@ -1086,12 +1441,32 @@ class Controller:
                     teacher_manager=teacher_manager,
                 )
 
+            if (
+                completed_steps > 0
+                and self.evaluation_enabled
+                and self.eval_interval
+                and completed_steps % self.eval_interval == 0
+                and not self._has_completed_evaluation(completed_steps)
+            ):
+                adapter_snapshot = self._snapshot_evaluation_adapter(
+                    completed_steps=completed_steps, history_item=self.train_history[-1]
+                )
+                self._run_evaluation(
+                    client,
+                    completed_steps=completed_steps,
+                    actor_manager=actor_manager,
+                    learner_manager=learner_manager,
+                    teacher_manager=teacher_manager,
+                    adapter_snapshot=adapter_snapshot,
+                )
+            self._write_progress(started=started, completed_steps=completed_steps)
+
             while completed_steps < self.max_steps:
                 next_boundary = self.max_steps
-                if self.evaluation_enabled and self.evaluation_interval_steps:
+                if self.evaluation_enabled and self.eval_interval:
                     next_boundary = min(
                         self.max_steps,
-                        ((completed_steps // self.evaluation_interval_steps) + 1) * self.evaluation_interval_steps,
+                        ((completed_steps // self.eval_interval) + 1) * self.eval_interval,
                     )
 
                 # Keep dispatches inside the current interval.  A Worker turn
@@ -1099,22 +1474,35 @@ class Controller:
                 # filled turn is valid whenever one in-flight slot opens.
                 # This is what lets distinct GPUs pipeline through Redis
                 # without introducing Controller-owned per-batch permission.
-                remaining_to_boundary = next_boundary - issued_steps
+                remaining_to_boundary = next_boundary - completed_steps - len(pending)
                 capacity = self.max_inflight_batches - len(pending)
-                if remaining_to_boundary > 0 and capacity > 0:
-                    group_size = min(self.actor_max_batches_per_turn, capacity, remaining_to_boundary)
-                    issued_steps = self._push_training_group(
+                if self.scheduling.shared and not pending:
+                    self._wait_for_round_release(actor_manager, learner_manager, teacher_manager)
+                while remaining_to_boundary > 0 and capacity > 0:
+                    if self.scheduling.shared and pending:
+                        break
+                    group_size = min(self.actor_max_batches_per_turn, remaining_to_boundary)
+                    if capacity < group_size:
+                        break
+                    if training_started is None:
+                        # Workers are ready and boundary evaluation is done.
+                        # One clock covers the pipeline, including overlapping
+                        # batches, rather than summing per-request latencies.
+                        training_started = time.monotonic()
+                    issued_batches = self._push_training_group(
                         client,
                         pending,
                         count=group_size,
-                        issued=issued_steps,
+                        issued=issued_batches,
                     )
+                    remaining_to_boundary = next_boundary - completed_steps - len(pending)
+                    capacity = self.max_inflight_batches - len(pending)
 
                 if not pending:
                     # A positive configured limit should always have made
                     # progress above.  Keep the explicit failure rather than
                     # silently spinning on a scheduling regression.
-                    if issued_steps < next_boundary:
+                    if completed_steps < next_boundary:
                         raise RuntimeError("Controller could not dispatch a training batch before its boundary.")
                     raise RuntimeError("Controller reached an empty training queue before its boundary.")
 
@@ -1129,23 +1517,53 @@ class Controller:
                 if not isinstance(batch_id, str) or batch_id not in pending:
                     raise RuntimeError(f"Controller received an unknown training result: {batch_id!r}.")
                 pending_info = pending.pop(batch_id)
+                acknowledged.add(pending_info["sequence"])
+                # Multiple Teacher workers may return batches out of order.
+                # Only advance the data cursor across a fully confirmed prefix.
+                while self._confirmed_batch_sequence + 1 in acknowledged:
+                    self._confirmed_batch_sequence += 1
+                    acknowledged.remove(self._confirmed_batch_sequence)
+                skipped = result.get("optimizer_steps", 1) == 0
+                accuracy_rows = None
+                if self.save_question_accuracy:
+                    question_indices = pending_info.pop("question_indices", None)
+                    accuracy_rows = self._question_accuracy_rows(question_indices, result.get("question_accuracies"))
+                completed_at = time.monotonic()
                 result_timing = result.get("timing", {})
                 timing = dict(result_timing) if isinstance(result_timing, Mapping) else {}
                 dispatched_at = pending_info.get("dispatch_monotonic")
                 if isinstance(dispatched_at, (int, float)) and not isinstance(dispatched_at, bool):
-                    timing["end_to_end_seconds"] = max(0.0, time.monotonic() - float(dispatched_at))
-                completed_steps += 1
+                    timing["end_to_end_seconds"] = max(0.0, completed_at - float(dispatched_at))
                 global_step = result.get("global_step")
                 if isinstance(global_step, bool):
                     raise RuntimeError("Learner global_step must be an integer, not bool.")
                 try:
-                    self._last_policy_version = int(global_step)
+                    policy_version = int(global_step)
                 except (TypeError, ValueError) as error:
                     raise RuntimeError("Learner result does not contain an integer global_step.") from error
+                if policy_version != completed_steps + int(not skipped):
+                    raise RuntimeError("Learner and Controller disagree on the completed optimizer step.")
+                self._last_policy_version = policy_version
+                completed_steps = policy_version
+                assert training_started is not None  # Every result has a dispatched training request.
+                self._training_elapsed_seconds += max(0.0, completed_at - training_started)
+                # Freeze before snapshots/evaluation and restart only when
+                # the next training interval dispatches its first request.
+                training_started = None if completed_steps == next_boundary else completed_at
+                if accuracy_rows is not None:
+                    # Commit the compact file before confirming this update.
+                    # Recovery archives any file whose batch never reached the
+                    # durable history, allowing its replay to write new means.
+                    write_json(self.output_dir / "question_accuracy" / f"{batch_id}.json", accuracy_rows)
+                if skipped:
+                    print(f"[Controller] Skipped {batch_id}: no training rollouts survived filtering.", flush=True)
+                    self._write_progress(started=started, completed_steps=completed_steps)
+                    continue
                 history_item = {
                     "completed_step": completed_steps,
                     "batch_id": batch_id,
                     "policy_version": self._last_policy_version,
+                    "training_elapsed_seconds": self._training_elapsed_seconds,
                     "dispatch": pending_info,
                     "metrics": result.get("metrics", {}),
                     "algorithm_metrics": result.get("algorithm_metrics", result.get("metrics", {})),
@@ -1178,11 +1596,23 @@ class Controller:
                     f"avg_batch_response_tokens={float(progress_metrics['avg_batch_response_tokens']):.2f}.",
                     flush=True,
                 )
+                average = self._training_elapsed_seconds / completed_steps
+                print("GPU_PROGRESS " + json.dumps({
+                    "phase": "eval" if os.environ.get("GPU_KIND") == "eval" else "train",
+                    "step": completed_steps, "total": self.max_steps,
+                    "remaining_seconds": max(0.0, average * (self.max_steps - completed_steps)),
+                    "updated_at": int(time.time()),
+                }), flush=True)
+                # Commit the result before external telemetry. A crash must
+                # not leave an already logged step ahead of durable history.
+                self._write_progress(started=started, completed_steps=completed_steps)
                 self._log_completed_training_batch(
                     history_item,
                     started=started,
                 )
-                self._write_progress(started=started, completed_steps=completed_steps)
+
+                if self.scheduling.shared and not pending:
+                    self._wait_for_round_release(actor_manager, learner_manager, teacher_manager)
 
                 if completed_steps == next_boundary:
                     if pending:
@@ -1190,8 +1620,8 @@ class Controller:
                         # indicates a Controller scheduling regression rather
                         # than a condition to silently race through.
                         raise RuntimeError("Training batches remained in flight at an evaluation boundary.")
-                    if self.evaluation_enabled and self.evaluation_interval_steps and (
-                        completed_steps % self.evaluation_interval_steps == 0
+                    if self.evaluation_enabled and self.eval_interval and (
+                        completed_steps % self.eval_interval == 0
                     ):
                         adapter_snapshot = self._snapshot_evaluation_adapter(
                             completed_steps=completed_steps,
@@ -1211,6 +1641,7 @@ class Controller:
                 "run_name": self.run_name,
                 "completed_steps": completed_steps,
                 "elapsed_seconds": time.time() - started,
+                "training_elapsed_seconds": self._training_elapsed_seconds,
                 "output_dir": str(self.output_dir),
                 "evaluations": self.evaluation_history,
             }
@@ -1221,6 +1652,8 @@ class Controller:
             run_error = error
             raise
         finally:
+            if run_error is not None and self.gpu_gates.round_gate is not None:
+                self.gpu_gates.round_gate.abort("Controller shutdown")
             try:
                 self._shutdown_managers(
                     actor_manager=actor_manager,

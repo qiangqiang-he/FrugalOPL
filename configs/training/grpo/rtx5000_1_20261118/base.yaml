@@ -1,0 +1,24 @@
+extends: ../shared_batched_4GPU.yaml
+run:
+  name: grpo_qwen3_1p7b_dapo17k_rtx5000_1_20261118
+  policy:
+    model_name_or_path: /data/heqiangqiang/cache/models/Qwen3-1.7B
+  redis:
+    url: redis://127.0.0.1:16429/0
+    key_prefix: frugalopl_grpo_rtx5000_1_20261118
+  runtime:
+    minimum_free_gpu_memory_gb: 3
+learner:
+  distributed:
+    master_port: 29894
+actor:
+  engine:
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    enable_chunked_prefill: true
+    sleep_engine_after_turn: true
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+algorithm:
+  training_sampling:
+    top_k: -1

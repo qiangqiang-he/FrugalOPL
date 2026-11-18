@@ -1,0 +1,8 @@
+# Paired baseline for the step-50 Avg@32 run: same data/prompt/sampling.
+extends: kl_opsd_qwen3_8b_step50_avg32_5bench_4GPU.yaml
+run:
+  output_dir: /data/heqiangqiang/outputs/FrugalOPL/kl_opsd_qwen3_8b_base_avg32_5bench_20261108
+actor:
+  lora:
+    enabled: false
+    path: null

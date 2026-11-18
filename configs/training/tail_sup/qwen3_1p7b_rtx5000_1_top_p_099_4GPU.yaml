@@ -1,0 +1,13 @@
+extends: qwen3_1p7b_rtx5000_1_top_p_090_4GPU.yaml
+run:
+  name: tail_sup_qwen3_1p7b_dapo17k_p099_b64n4_r4096_100steps_20261117
+  redis:
+    key_prefix: frugalopl_tail_sup_p099_20261117
+actor:
+  gpu_ids: [4, 5, 6, 7]
+learner:
+  gpu_ids: [4, 5, 6, 7]
+  distributed:
+    master_port: 29893
+algorithm:
+  tail_sup_top_p: 0.99

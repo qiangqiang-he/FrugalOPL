@@ -1,0 +1,18 @@
+extends: shared_batched_4GPU.yaml
+run:
+  name: tail_sup_qwen3_1p7b_dapo17k_p090_b64n4_r4096_100steps_20261117
+  storage:
+    output_root: /data/heqiangqiang/outputs/FrugalOPL
+  redis:
+    url: redis://127.0.0.1:16419/0
+    key_prefix: frugalopl_tail_sup_p090_20261117
+  runtime:
+    minimum_free_gpu_memory_gb: 3
+actor:
+  gpu_ids: [0, 1, 2, 3]
+learner:
+  gpu_ids: [0, 1, 2, 3]
+  distributed:
+    master_port: 29891
+algorithm:
+  tail_sup_top_p: 0.9

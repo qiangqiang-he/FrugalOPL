@@ -1,0 +1,11 @@
+# Prepared comparison configuration; launch only when four GPUs are available.
+extends: qwen3_1p7b_rtx5000_1_top_p_090_4GPU.yaml
+run:
+  name: tail_sup_qwen3_1p7b_dapo17k_p095_b64n4_r4096_100steps_20261117
+  redis:
+    key_prefix: frugalopl_tail_sup_p095_20261117
+learner:
+  distributed:
+    master_port: 29892
+algorithm:
+  tail_sup_top_p: 0.95

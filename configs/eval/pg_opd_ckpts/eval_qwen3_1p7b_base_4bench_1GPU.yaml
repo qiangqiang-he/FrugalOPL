@@ -1,0 +1,31 @@
+# Phase C: untrained Qwen3-1.7B base model evaluated on AIME24/25/26 and
+# MATH-500 with the campaign's shared No-thinking Avg@8 preset.
+extends: common_pg_opd_ckpts_1GPU.yaml
+
+run:
+  name: eval_1p7b_base_4bench
+  output_dir: outputs/pg_opd_ckpt_eval/qwen3_1p7b/base_4bench
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-1.7B
+
+actor:
+  lora:
+    path: null
+  evaluation:
+    datasets:
+      aime24:
+        path: data/AIME-2024.json
+        prompt: evaluation
+        max_examples: null
+      aime25:
+        path: data/AIME-2025.json
+        prompt: evaluation
+        max_examples: null
+      aime26:
+        path: data/AIME-2026.json
+        prompt: evaluation
+        max_examples: null
+      math500:
+        path: data/MATH500.json
+        prompt: evaluation
+        max_examples: null

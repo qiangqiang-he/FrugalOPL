@@ -1,0 +1,27 @@
+run_name: sampled_head_tail_qwen3_1p7b_dapo17k_nothinking_8192_20261118
+model: /data/heqiangqiang/models/Qwen3-1.7B
+dataset: /data/heqiangqiang/projects/FrugalOPL/data/DAPO-17k.json
+python: /data/heqiangqiang/miniforge3/envs/rlvr/bin/python
+output: /home/ubuntu/heqiangqiang/outputs/sampled_head_tail_qwen3_1p7b_dapo17k_8192_20261118
+gpus: [0, 1, 2, 3]
+seed: 42
+expected_questions: 17255
+questions_per_batch: 32
+rollouts_per_question: 8
+enable_thinking: false
+temperature: 1.0
+top_p: 1.0
+max_tokens: 8192
+max_prompt_tokens: 2048
+max_num_seqs: 32
+max_num_batched_tokens: 4096
+gpu_memory_utilization: 0.55
+# Repeat dataset epochs indefinitely; no sleeping/offloading between batches.
+max_batches_per_gpu: null
+summary_interval_seconds: 30
+# Raw token/metric chunks rotate; all-time moments/histograms never expire.
+raw_gib_per_gpu: 4
+swanlab:
+  enabled: true
+  project: FrugalOPL-Official
+  workspace: qhe

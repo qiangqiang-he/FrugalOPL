@@ -1,0 +1,12 @@
+extends: shared_batched_4GPU.yaml
+run:
+  name: self_shot_opsd_qwen3_8b_conversation_math30k_b64n1_aime24_20261107
+  policy:
+    model_name_or_path: /data/heqiangqiang/models/Qwen3-8B-nvme-20261106
+  redis:
+    key_prefix: frugalopl_self_shot_opsd_qwen3_8b_conversation_20261107
+learner:
+  distributed:
+    master_port: 29862
+algorithm:
+  self_shot_format: conversation

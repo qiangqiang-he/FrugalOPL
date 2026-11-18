@@ -1,0 +1,71 @@
+extends: ../../common/shared_batched/4GPU.yaml
+
+pipeline:
+  - id: controller
+    class: Controller
+  - id: actor
+    class: Actor
+    plugin_hook: collect_actor_signals
+    cpu_offload: false
+  - id: learner
+    class: Learner
+    plugin_hook: collect_learner_signals
+    objective_fn: compute_objective
+    cpu_offload: false
+
+run:
+  name: ocsd_qwen3_1p7b_dapo17k_b32n8_shared_4gpu
+  group: ocsd
+  redis:
+    key_prefix: frugalopl_ocsd_qwen3_1p7b_shared_4gpu
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-1.7B
+
+controller:
+  max_steps: 100
+  max_inflight_batches: 4
+  train_prompt_batch_size: 32
+  data:
+    max_response_length: 8192
+    train:
+      name: dapo17k
+      path: data/DAPO-17k.json
+    eval:
+      - name: amc23
+        path: data/AMC-2023.json
+
+actor:
+  engine:
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    enable_chunked_prefill: true
+    sleep_engine_after_turn: true
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+  evaluation:
+    enabled: true
+    before_training: true
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      max_response_length: 16384
+
+learner:
+  execution:
+    forward_chunk_size: 32
+
+algorithm:
+  plugin: OCSDPlugin
+  algo_name: ocsd
+  loss_aggregation: token
+  enable_thinking: false
+  ocsd_gamma: 0.1
+  ocsd_tau: 0.95
+  training_sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 8192
+    n: 8

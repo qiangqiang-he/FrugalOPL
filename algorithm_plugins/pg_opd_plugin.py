@@ -16,7 +16,7 @@ from utils.algorithm_runtime import (
 from utils.prompts import render_prompt
 from utils.tensor_signals import masked_token_mean
 
-from .algorithm_base import AlgorithmPlugin, Metrics, Signals
+from .algorithm_base import AlgorithmPlugin, ObjectiveResult, Signals
 from .plugin_registry import register_plugin_class
 
 
@@ -81,11 +81,11 @@ class PGOPDPlugin(AlgorithmPlugin):
     def collect_learner_signals(self, signals: Signals) -> Signals:
         return {}
 
-    def compute_objective(self, batch: Signals) -> tuple[torch.Tensor, Metrics]:
+    def compute_objective(self, batch: Signals) -> ObjectiveResult:
         policy = self.compute_logits(batch, mode="policy_grad", return_signals=_LOGPROB_AND_TOPK)
         student_logprobs = policy["response_logprobs"]
         teacher_logprobs = batch["teacher_response_logprobs"].to(dtype=student_logprobs.dtype)
-        valid = torch.isfinite(student_logprobs) & torch.isfinite(teacher_logprobs)
+        valid = batch["response_mask"].bool() & torch.isfinite(student_logprobs) & torch.isfinite(teacher_logprobs)
         raw_advantages = teacher_logprobs - student_logprobs.detach()
         advantages = torch.where(
             valid,
@@ -105,7 +105,7 @@ class PGOPDPlugin(AlgorithmPlugin):
             torch.minimum(student_topk_logprobs, matched_teacher_logprobs).exp(),
             0.0,
         ).sum(dim=-1)
-        return objective, {
+        return ObjectiveResult(objective=objective, metrics={
             "pg_opd_loss": -objective.detach(),
             "pg_opd_advantage_mean": masked_token_mean(advantages, valid).detach(),
             "pg_opd_advantage_abs_mean": masked_token_mean(advantages.abs(), valid).detach(),
@@ -118,7 +118,7 @@ class PGOPDPlugin(AlgorithmPlugin):
             "pg_opd_top_16_symmetric_overlap_mass": masked_token_mean(symmetric_overlap_mass, valid).detach(),
             "pg_opd_teacher_prob": masked_token_mean(teacher_logprobs.exp(), valid).detach(),
             "pg_opd_student_prob": masked_token_mean(student_logprobs.exp(), valid).detach(),
-        }
+        }, valid_token_count=valid.sum().detach())
 
 
 def _match_topk(student_ids: torch.Tensor, teacher_ids: torch.Tensor, teacher_logprobs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

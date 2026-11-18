@@ -16,8 +16,11 @@ Controller process environment before the training launcher starts.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
+import re
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -128,7 +131,13 @@ class SwanLabLogger:
     network calls unless a real Controller starts an enabled logger.
     """
 
-    def __init__(self, config: Mapping[str, object], *, pipeline: "TrainingPipeline") -> None:
+    def __init__(
+        self,
+        config: Mapping[str, object],
+        *,
+        pipeline: "TrainingPipeline",
+        output_dir: str | Path | None = None,
+    ) -> None:
         if not isinstance(config, Mapping):
             raise TypeError("config must be a mapping.")
 
@@ -157,16 +166,131 @@ class SwanLabLogger:
         self.group = _optional_text(self.run_cfg.get("group"), "run.group")
         self._run: Any | None = None
         self._warned_log_failure = False
+        self._output_dir = None if output_dir is None else Path(output_dir).expanduser().resolve()
+        self._resume_step = 0
 
     @property
     def started(self) -> bool:
         return self._run is not None
 
+    @property
+    def run_identity_path(self) -> Path:
+        """The cloud run binding stored alongside this training run's state."""
+
+        return self._local_log_dir().parent / "swanlab_run.json"
+
+    @staticmethod
+    def _validate_run_id(run_id: object) -> str:
+        if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
+            raise ValueError("SwanLab run ID must be a non-empty identifier containing letters, digits, '_' or '-'.")
+        return run_id
+
+    def _run_identity(self, run_id: str) -> dict[str, object]:
+        # Store only the cloud identity, never config, credentials, or environment.
+        return {
+            "version": 1,
+            "workspace": self.workspace,
+            "project": self.project,
+            "run_name": self.run_name,
+            "mode": "online",
+            "run_id": run_id,
+        }
+
+    def _online_run_id(self, run: Any) -> str:
+        run_id = self._validate_run_id(run.id)
+        # Run.id reflects init settings in SwanLab 0.10.1. Run.path instead
+        # comes from the backend's project path and experiment slug/CUID.
+        cloud_path = getattr(run, "path", None)
+        parts = cloud_path.strip("/").split("/") if isinstance(cloud_path, str) else []
+        if (
+            len(parts) != 3
+            or parts[2] != run_id
+            or (self.project is not None and parts[1] != self.project)
+            or (self.workspace is not None and parts[0] != self.workspace)
+        ):
+            raise RuntimeError("SwanLab cloud run path does not match the requested experiment identity.")
+        return run_id
+
+    def _saved_run_id(self) -> str | None:
+        path = self.run_identity_path
+        try:
+            with path.open(encoding="utf-8") as handle:
+                identity = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            raise RuntimeError(f"Cannot read saved SwanLab run identity: {path}.") from None
+        if not isinstance(identity, dict):
+            raise RuntimeError(f"Invalid saved SwanLab run identity: {path}.")
+        try:
+            run_id = self._validate_run_id(identity.get("run_id"))
+        except ValueError:
+            raise RuntimeError(f"Invalid saved SwanLab run identity: {path}.") from None
+        if identity != self._run_identity(run_id) or type(identity.get("version")) is not int:
+            raise RuntimeError(f"Saved SwanLab run identity does not match this training run: {path}.")
+        return run_id
+
+    def seed_run_id(self, run_id: str) -> Path:
+        """Bind an already-running online experiment without initializing SDK.
+
+        This also persists the ID returned by first initialization. An existing
+        binding is immutable: a conflicting or malformed record is never replaced.
+        """
+
+        if not self.enabled or self.mode != "online":
+            raise ValueError("A SwanLab run identity requires enabled online logging.")
+        run_id = self._validate_run_id(run_id)
+        if self._run is not None and self._run.id != run_id:
+            raise RuntimeError("Cannot bind a different SwanLab ID while a run is active.")
+        saved_run_id = self._saved_run_id()
+        if saved_run_id is not None:
+            if saved_run_id != run_id:
+                raise RuntimeError("Cannot replace an existing SwanLab run identity with another run.")
+            return self.run_identity_path
+        path = self.run_identity_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".swanlab-run-", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(self._run_identity(run_id), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                # Publish a complete record atomically, without replacing a
+                # conflicting binding from another Controller startup.
+                os.link(temporary, path)
+            except FileExistsError:
+                if self._saved_run_id() != run_id:
+                    raise RuntimeError("A conflicting SwanLab run identity was saved during initialization.") from None
+        finally:
+            os.unlink(temporary)
+        return path
+
     def start(self) -> None:
-        """Initialize the one Controller-owned SwanLab experiment."""
+        """Initialize or strictly resume the Controller-owned cloud experiment.
+
+        Controller sets FRUGALOPL_RESUME_STEP before calling this method. A
+        positive checkpoint step requires an existing matching cloud binding.
+        """
 
         if not self.enabled or self._run is not None:
             return
+        raw_resume_step = os.environ.get("FRUGALOPL_RESUME_STEP", "0")
+        if not re.fullmatch(r"[0-9]+", raw_resume_step):
+            raise ValueError("FRUGALOPL_RESUME_STEP must be a non-negative integer.")
+        self._resume_step = int(raw_resume_step)
+        saved_run_id = self._saved_run_id() if self.mode == "online" else None
+        if self.mode == "online" and self._resume_step > 0 and saved_run_id is None:
+            raise RuntimeError(
+                "Cannot resume training without its saved SwanLab run identity; "
+                "bind the existing experiment with seed_run_id() before restarting."
+            )
+        if self.mode == "online" and saved_run_id is None and os.environ.get("SWANLAB_RUN_ID"):
+            raise RuntimeError(
+                "A new training run must not inherit SWANLAB_RUN_ID; "
+                "unset it or seed the verified existing experiment identity."
+            )
         if not os.environ.get("SWANLAB_API_KEY"):
             raise RuntimeError(
                 "SwanLab logging is enabled, but SWANLAB_API_KEY is absent from this process environment. "
@@ -181,7 +305,12 @@ class SwanLabLogger:
 
         local_dir = self._local_log_dir()
         local_dir.mkdir(parents=True, exist_ok=True)
-        self._run = swanlab.init(
+        resume_options = {}
+        if self.mode == "online":
+            resume_options = {"resume": "never", "parallel": "none"}
+            if saved_run_id is not None:
+                resume_options.update(id=saved_run_id, resume="must")
+        run = swanlab.init(
             project=self.project,
             workspace=self.workspace,
             name=self.run_name,
@@ -190,7 +319,21 @@ class SwanLabLogger:
             config=self.config,
             mode=self.mode,
             log_dir=str(local_dir),
+            **resume_options,
         )
+        if self.mode == "online":
+            try:
+                run_id = self._online_run_id(run)
+                if saved_run_id is not None and run_id != saved_run_id:
+                    raise RuntimeError("SwanLab resumed a different experiment than the saved identity.")
+                self.seed_run_id(run_id)
+            except Exception:
+                try:
+                    run.finish(state="crashed", error="SwanLab cloud run identity could not be persisted.")
+                except Exception:
+                    pass
+                raise
+        self._run = run
         print(
             f"[SwanLab] Started Controller-owned experiment project={self.project}, "
             f"group={self.group!r}, name={self.run_name}.",
@@ -214,6 +357,8 @@ class SwanLabLogger:
             return
         if isinstance(step, bool) or not isinstance(step, int) or step < 0:
             raise ValueError("SwanLab metric step must be a non-negative integer.")
+        if step < self._resume_step:
+            raise ValueError("SwanLab metric step must not precede the restored training step.")
 
         payload: dict[str, float | int] = {}
         for raw_component, values in components.items():
@@ -249,13 +394,15 @@ class SwanLabLogger:
             print(f"[SwanLab] WARNING: finish failed: {finish_error}", flush=True)
 
     def _local_log_dir(self) -> Path:
+        if self._output_dir is not None:
+            return self._output_dir / "swanlab"
         storage = _mapping(self.run_cfg.get("storage", {}), "run.storage")
         configured_root = storage.get("output_root", "outputs")
         if not isinstance(configured_root, str) or not configured_root.strip():
             raise ValueError("run.storage.output_root must be a non-empty path string.")
         root = Path(configured_root).expanduser()
         if not root.is_absolute():
-            root = Path.cwd() / root
+            root = Path(__file__).resolve().parents[1] / root
         return root.resolve() / self.run_name / "swanlab"
 
 

@@ -1,0 +1,28 @@
+# Dedicated dual-4090 deployment of the existing Qwen3-4B PG-OPSD profile.
+extends: pg_opsd_qwen3_4b_r64_100steps_2GPU.yaml
+
+run:
+  name: pg_opsd_qwen3_4b_openthoughts_math30k_r64_100steps_2GPU_server_20261017_0817
+  storage:
+    output_root: /root/projects/FrugalOPL/outputs
+  redis:
+    url: redis://127.0.0.1:6388/0
+    key_prefix: frugalopl_server_pg_opsd_4b_20261017_0817
+  runtime:
+    minimum_free_gpu_memory_gb: 0
+  policy:
+    model_name_or_path: /root/projects/models/Qwen3-4B
+
+actor:
+  engine:
+    gpu_memory_utilization: 0.80
+    enforce_eager: false
+    max_num_seqs: 64
+    max_num_batched_tokens: 4096
+    enable_chunked_prefill: true
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+
+learner:
+  distributed:
+    master_port: 29689

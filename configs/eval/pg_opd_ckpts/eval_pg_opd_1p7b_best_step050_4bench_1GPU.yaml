@@ -1,0 +1,31 @@
+# Phase B: best PG-OPD Qwen3-1.7B checkpoint (step 50, selected by the
+# AMC23 Avg@8 sweep) evaluated on AIME24/25/26 and MATH-500.
+extends: common_pg_opd_ckpts_1GPU.yaml
+
+run:
+  name: eval_pg_opd_1p7b_best_step050_4bench
+  output_dir: outputs/pg_opd_ckpt_eval/qwen3_1p7b/best_step050_4bench
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-1.7B
+
+actor:
+  lora:
+    path: outputs/pg_opd_qwen3_4b_instruct_2507_to_1p7b_dapo17k_r64_100steps_2GPU_amc23_20/eval_adapters/step_50
+  evaluation:
+    datasets:
+      aime24:
+        path: data/AIME-2024.json
+        prompt: evaluation
+        max_examples: null
+      aime25:
+        path: data/AIME-2025.json
+        prompt: evaluation
+        max_examples: null
+      aime26:
+        path: data/AIME-2026.json
+        prompt: evaluation
+        max_examples: null
+      math500:
+        path: data/MATH500.json
+        prompt: evaluation
+        max_examples: null

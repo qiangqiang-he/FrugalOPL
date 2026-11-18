@@ -1,0 +1,99 @@
+# Standard GRPO: 8 total GPUs, disjoint_async, K=4.
+# Use the group mean baseline and fixed unit advantage scales.
+extends: ../../common/disjoint_async/8GPU.yaml
+eval_interval: 100
+save_ckpt_interval: 50
+save_question_accuracy: true
+pipeline:
+- id: controller
+  class: Controller
+- id: actor
+  class: Actor
+  plugin_hook: collect_actor_signals
+  cpu_offload: false
+- id: learner
+  class: Learner
+  plugin_hook: collect_learner_signals
+  objective_fn: compute_objective
+  cpu_offload: false
+
+run:
+  name: grpo_qwen3_1p7b_dapo17k_fixed_disjoint_async_8gpu_lr1e6_clip010_020
+  group: grpo
+  seed: 42
+  swanlab:
+    enabled: true
+    mode: online
+    project: FrugalOPL-Official
+    workspace: qhe
+  storage:
+    output_root: /data/heqiangqiang/outputs/FrugalOPL
+  redis:
+    url: redis://127.0.0.1:16379/0
+    key_prefix: frugalopl_grpo_fixed_disjoint_async_8gpu_lr1e6_clip010_020
+  policy:
+    model_name_or_path: /data/heqiangqiang/models/Qwen3-1.7B
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+
+controller:
+  max_steps: 1000
+  train_prompt_batch_size: 32
+  data:
+    train:
+      name: dapo_17k
+      path: data/DAPO-17k.json
+    eval:
+      name: amc23
+      path: data/AMC-2023.json
+    max_prompt_length: 2048
+    max_response_length: 8192
+
+actor:
+  evaluation:
+    enabled: true
+    before_training: true
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 8
+    save_rollouts: false
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      max_response_length: 16384
+
+learner:
+  max_sequence_length: 12288
+  distributed:
+    master_addr: 127.0.0.1
+    master_port: 29687
+  execution:
+    forward_chunk_size: 512
+    gradient_checkpointing: true
+    clip_grad_norm: 0.05
+  optimizer:
+    lr: 1.0e-06
+
+algorithm:
+  plugin: GRPOPlugin
+  algo_name: grpo
+  advantage_estimator: grpo
+  loss_aggregation: sequence
+  enable_thinking: false
+  training_sampling:
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 8192
+    n: 8
+  epsilon_low: 0.1
+  epsilon_high: 0.2
+  positive_advantage_scale: 1.0
+  negative_advantage_scale: 1.0
+  dynamic_advantage:
+    enabled: false
+    baseline_steps: 100
+    window_steps: 10
+    min_negative_scale: 0.1
+  kl_coef: 0.0
+  answer_probe_threshold: 0.4

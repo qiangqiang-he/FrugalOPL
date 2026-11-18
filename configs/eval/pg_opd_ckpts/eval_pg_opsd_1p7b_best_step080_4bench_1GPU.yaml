@@ -1,0 +1,32 @@
+# PG-OPSD follow-up: best Qwen3-1.7B checkpoint (step 80, selected by the
+# SwanLab run 4ebnn2tc AMC23 40-question Avg@8 curve) evaluated on
+# AIME24/25/26 and MATH-500 with the campaign's shared No-thinking preset.
+extends: common_pg_opd_ckpts_1GPU.yaml
+
+run:
+  name: eval_pg_opsd_1p7b_best_step080_4bench
+  output_dir: outputs/pg_opd_ckpt_eval/qwen3_1p7b_opsd/best_step080_4bench
+  policy:
+    model_name_or_path: ~/projects/models/Qwen3-1.7B
+
+actor:
+  lora:
+    path: tests/outputs/pg_opsd_qwen3_1p7b_openthoughts_math30k_r64_100steps_1GPU_local_ctx8192_r4096/eval_adapters/step_80
+  evaluation:
+    datasets:
+      aime24:
+        path: data/AIME-2024.json
+        prompt: evaluation
+        max_examples: null
+      aime25:
+        path: data/AIME-2025.json
+        prompt: evaluation
+        max_examples: null
+      aime26:
+        path: data/AIME-2026.json
+        prompt: evaluation
+        max_examples: null
+      math500:
+        path: data/MATH500.json
+        prompt: evaluation
+        max_examples: null
