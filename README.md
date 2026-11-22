@@ -44,7 +44,12 @@ validation uses an explicit window of one in the validation entry point.
 The three scheduling smoke configurations under `tests/configs/` each request
 ten GRPO updates over DAPO-17K, with 32 questions and eight rollouts per update.
 Their model and dataset paths are specific to the selected validation server.
-Launch training with `bash scripts/start_train.sh <config.yaml>`. The detached
+On the dual RTX 4090, launch training with `bash scripts/start_train.sh --tmux <config.yaml>`
+(tmux is also the default). On the user-operated eight-GPU server, use
+`bash scripts/start_train.sh --no-tmux <config.yaml>` to exec Python in the foreground.
+`scripts/start_eval.sh` accepts the same mode flags. Foreground mode preserves
+the Python PID, signals and exit code, mirrors output to the launcher log, and
+does not create a tmux session or `.status` file. The detached
 tmux command explicitly carries `GPU_OWNER`, `GPU_TASK`, `GPU_HOURS`, `GPU_KIND`,
 `GPU_LOG`, and an optional `GPU_RUN` into Python. `GPU_LOG` defaults to the actual
 launcher log; test configurations keep their logs and outputs in `tests/outputs/`.
@@ -256,7 +261,7 @@ per question and a 16384-token generation limit; checkpoints are saved every
 prefix.
 
 For example, launch the shared eight-GPU configuration with
-`bash scripts/start_train.sh configs/training/grpo/shared_batched_8GPU.yaml`.
+`bash scripts/start_train.sh --no-tmux configs/training/grpo/shared_batched_8GPU.yaml`.
 
 `configs/training/pg_opsd/shared_batched_4GPU.yaml` deploys Actor and Learner
 on the same four GPUs with `K=4`. It retains the original PG-OPSD Qwen3-1.7B

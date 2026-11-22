@@ -27,17 +27,27 @@ export MODEL_ROOT="$HOME/projects/models"  # 改成服务器实际模型父目�
 
 ```bash
 export FRUGALOPL_MODEL_PATH="$MODEL_ROOT/DeepSeek-R1-Distill-Qwen-1.5B"
-bash scripts/start_train.sh configs/training/ratio_opsd/deepseek_r1_distill_qwen_1p5b_100steps_8GPU.yaml
+bash scripts/start_train.sh --no-tmux configs/training/ratio_opsd/deepseek_r1_distill_qwen_1p5b_100steps_8GPU.yaml
 ```
 
 上一场结束后，7B 的启动命令：
 
 ```bash
 export FRUGALOPL_MODEL_PATH="$MODEL_ROOT/DeepSeek-R1-Distill-Qwen-7B"
-bash scripts/start_train.sh configs/training/ratio_opsd/deepseek_r1_distill_qwen_7b_100steps_8GPU.yaml
+bash scripts/start_train.sh --no-tmux configs/training/ratio_opsd/deepseek_r1_distill_qwen_7b_100steps_8GPU.yaml
 ```
 
-`FRUGALOPL_MODEL_PATH` 会覆盖 YAML 中的 `run.policy.model_name_or_path`，检查本地目录存在，并把实际路径保存到本次运行的合并配置。启动器会显式传入 tmux，避免继承旧模型路径；未设置时使用 YAML 默认路径。数据文件需要预先存在：`data/openthoughts_math30k.json`、`data/AMC-2023.json`、`data/AIME-2024.json`。Redis 默认 `127.0.0.1:6379`。脚本会通过 tmux 持续运行，并输出日志和退出状态文件路径。
+`FRUGALOPL_MODEL_PATH` 会覆盖 YAML 中的 `run.policy.model_name_or_path`，检查本地目录存在，并把实际路径保存到本次运行的合并配置。两种启动模式都使用该路径；未设置时使用 YAML 默认路径。数据文件需要预先存在：`data/openthoughts_math30k.json`、`data/AMC-2023.json`、`data/AIME-2024.json`。Redis 默认 `127.0.0.1:6379`。
+
+8 卡使用 `--no-tmux`：shell 脚本直接在前台 `exec` Python，保留进程 PID、信号和退出码，不创建 tmux 会话。输出同时显示在终端并写入启动日志；前台退出码由调用方或调度器接收，不生成 tmux 的 `.status` 文件。
+
+双卡 4090 必须由 tmux 托管，使用默认模式或显式 `--tmux`：
+
+```bash
+bash scripts/start_train.sh --tmux tests/configs/ratio_opsd/deepseek_1p5b_2GPU_smoke.yaml
+```
+
+启动器会输出 tmux 会话名、日志和 `.status` 文件路径。独立评估脚本 `scripts/start_eval.sh` 使用相同的 `--tmux` / `--no-tmux` 参数约定。若在双卡验证前台入口，先创建外层 tmux 托管任务，再在该会话中调用 `--no-tmux`，避免双卡任务依赖 SSH 会话存活。
 
 | 设置 | 值 |
 |---|---|

@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 
-# Start one Controller-managed training run in a detached tmux session.  The
+# Start training in tmux (default, required on the dual 4090) or in the
+# foreground (--no-tmux, for the user-operated eight-GPU server). The
 # training YAML is a complete, recursively composed configuration: its
 # explicit ``extends`` chain supplies the framework and hardware profile.
 set -euo pipefail
 
 usage() {
-    echo "Usage: bash scripts/start_train.sh <algorithm-config.yaml>" >&2
+    echo "Usage: bash scripts/start_train.sh [--tmux|--no-tmux] <algorithm-config.yaml>" >&2
 }
+
+launch_mode=tmux
+case "${1:-}" in
+    --tmux) shift ;;
+    --no-tmux) launch_mode=foreground; shift ;;
+    --help|-h) usage; exit 0 ;;
+esac
 
 if [[ $# -ne 1 ]]; then
     usage
@@ -27,7 +35,7 @@ if [[ ! -f "${config_path}" || ! -r "${config_path}" ]]; then
     echo "Error: training configuration is not readable: ${config_path}" >&2
     exit 1
 fi
-if ! command -v tmux >/dev/null 2>&1; then
+if [[ "${launch_mode}" == tmux ]] && ! command -v tmux >/dev/null 2>&1; then
     echo "Error: tmux is required to start training durably." >&2
     exit 1
 fi
@@ -74,7 +82,7 @@ if [[ ! "${session_name}" =~ ^[[:alnum:]_.-]+$ ]]; then
     echo "Error: FRUGALOPL_TMUX_SESSION contains unsupported characters: ${session_name}" >&2
     exit 1
 fi
-if tmux has-session -t "=${session_name}" 2>/dev/null; then
+if [[ "${launch_mode}" == tmux ]] && tmux has-session -t "=${session_name}" 2>/dev/null; then
     echo "Error: tmux session already exists: ${session_name}" >&2
     exit 1
 fi
@@ -162,6 +170,26 @@ for environment_variable in GPU_OWNER GPU_TASK GPU_HOURS GPU_KIND GPU_LOG GPU_RU
         training_environment+=("${environment_variable}=${!environment_variable}")
     fi
 done
+if [[ "${launch_mode}" == foreground ]]; then
+    # The scheduler owns this foreground process. exec preserves its PID,
+    # signals and Python exit code; tee only mirrors console output to a log.
+    set +x
+    if [[ -n "${swanlab_env_file}" ]]; then
+        set -a
+        if ! source "${swanlab_env_file}" >/dev/null 2>&1; then
+            set +x
+            echo "Error: could not load SwanLab environment file." >&2
+            exit 1
+        fi
+        set +x
+        set +a
+    fi
+    echo "Training running in foreground (no tmux)."
+    echo "Log: ${log_path}"
+    cd -- "${project_root}"
+    exec > >(tee -a "${log_path}") 2>&1
+    exec "${training_environment[@]}" "${python_bin}" -m engine.controller --config "${config_path}"
+fi
 printf -v python_command '%q ' \
     "${training_environment[@]}" \
     "${python_bin}" -m engine.controller \

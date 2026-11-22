@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 
-# Start one durable offline evaluation.  The launcher deliberately creates a
-# detached tmux session: an evaluation may run for hours, and must survive a
-# terminal, SSH, or Codex-session disconnect.
+# Offline evaluation: tmux by default for the dual 4090; --no-tmux directly
+# executes foreground Python for the user-operated eight-GPU server.
 set -euo pipefail
 
 usage() {
-    echo "Usage: bash scripts/start_eval.sh <config.yaml>" >&2
+    echo "Usage: bash scripts/start_eval.sh [--tmux|--no-tmux] <config.yaml>" >&2
 }
+
+launch_mode=tmux
+case "${1:-}" in
+    --tmux) shift ;;
+    --no-tmux) launch_mode=foreground; shift ;;
+    --help|-h) usage; exit 0 ;;
+esac
 
 if [[ $# -ne 1 ]]; then
     usage
@@ -35,7 +41,7 @@ if [[ ! -r "${config_path}" ]]; then
     exit 1
 fi
 
-if ! command -v tmux >/dev/null 2>&1; then
+if [[ "${launch_mode}" == tmux ]] && ! command -v tmux >/dev/null 2>&1; then
     echo "Error: tmux is required to start evaluations durably." >&2
     exit 1
 fi
@@ -72,7 +78,7 @@ if [[ ! "${session_name}" =~ ^[[:alnum:]_.-]+$ ]]; then
     echo "Error: FRUGALOPL_TMUX_SESSION contains unsupported characters: ${session_name}" >&2
     exit 1
 fi
-if tmux has-session -t "=${session_name}" 2>/dev/null; then
+if [[ "${launch_mode}" == tmux ]] && tmux has-session -t "=${session_name}" 2>/dev/null; then
     echo "Error: tmux session already exists: ${session_name}" >&2
     exit 1
 fi
@@ -121,6 +127,13 @@ for environment_variable in GPU_OWNER GPU_TASK GPU_HOURS GPU_KIND GPU_LOG GPU_RU
         evaluation_environment+=("${environment_variable}=${!environment_variable}")
     fi
 done
+if [[ "${launch_mode}" == foreground ]]; then
+    echo "Evaluation running in foreground (no tmux)."
+    echo "Log: ${log_path}"
+    cd -- "${project_root}"
+    exec > >(tee -a "${log_path}") 2>&1
+    exec "${evaluation_environment[@]}" "${python_bin}" "${project_root}/utils/eval.py" --config "${config_path}"
+fi
 printf -v python_command '%q ' "${evaluation_environment[@]}" "${python_bin}" "${project_root}/utils/eval.py" --config "${config_path}"
 python_command="${python_command% }"
 printf -v quoted_log '%q' "${log_path}"

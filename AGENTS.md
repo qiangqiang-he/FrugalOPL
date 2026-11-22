@@ -47,20 +47,23 @@
 ## 训练与评估启动规范
 
 - 训练和评估一律通过“启动脚本 + 配置文件”启动；不得直接运行底层 Python 入口。
-- 训练命令固定为：
+- 双卡 4090 的训练命令为：
 
   ```bash
-  bash scripts/start_train.sh configs/xxxx.yaml
+  bash scripts/start_train.sh --tmux configs/xxxx.yaml
   ```
 
-- 评估命令固定为：
+- 双卡 4090 的评估命令为：
 
   ```bash
-  bash scripts/start_eval.sh configs/xxxx.yaml
+  bash scripts/start_eval.sh --tmux configs/xxxx.yaml
   ```
 
 - 每次运行由 `configs/` 下的 YAML 配置文件完整定义；正式训练配置默认面向 8 卡服务器。
-- 两个启动脚本必须默认使用 `tmux` 启动长期运行任务，避免终端、SSH 或 Codex 会话断开导致训练或评估中止。
+- **双卡 4090 的训练、评估和 GPU 调试必须使用 tmux 托管**，避免终端、SSH 或 Codex 会话断开导致任务中止。两个启动脚本均默认使用 tmux，也可显式传入 `--tmux`；不得因为 8 卡使用前台启动而取消双卡的 tmux 保护。
+- **8 卡服务器由用户操作，Codex 无法直接连接。8 卡服务器的训练和评估使用 shell 脚本加 `--no-tmux` 启动**，脚本直接在前台 `exec` Python，不创建 tmux 会话、不自行转为后台任务。命令分别为 `bash scripts/start_train.sh --no-tmux configs/xxxx.yaml` 和 `bash scripts/start_eval.sh --no-tmux configs/xxxx.yaml`。
+- 编写或更新 8 卡启动方案时，交付说明必须明确标注无 tmux 的 8 卡命令，以及有 tmux 的双卡验证命令。先用双卡和小模型验证同一套算法与训练流程，再交付 8 卡配置；不能把双卡通过描述成已经在 8 卡上实测。
+- 如需在双卡验证 `--no-tmux` 前台入口本身，必须先由外层 tmux 托管该验证任务；入口脚本仍直接执行 Python，不再创建内层 tmux。普通双卡训练和评估继续使用默认模式或显式 `--tmux`。
 
 ## 本地轻量训练测试
 
