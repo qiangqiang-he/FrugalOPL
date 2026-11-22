@@ -409,11 +409,20 @@ def load_merged_config(
     framework_config_path: str | Path,
     algorithm_config_path: str | Path | None = None,
 ) -> dict[str, object]:
-    """Load the framework config and, optionally, its algorithm overlay."""
+    """Load a config and optionally select a server-local policy model."""
 
     framework = load_yaml_config_tree(framework_config_path)
     algorithm = load_yaml_config_tree(algorithm_config_path) if algorithm_config_path is not None else None
-    return merge_configs(framework, algorithm)
+    config = merge_configs(framework, algorithm)
+    model_override = os.environ.get("FRUGALOPL_MODEL_PATH")
+    if model_override is not None:
+        if not model_override.strip():
+            raise ValueError("FRUGALOPL_MODEL_PATH must name an existing local model directory.")
+        model_path = Path(model_override).expanduser().resolve()
+        if not model_path.is_dir():
+            raise FileNotFoundError(f"FRUGALOPL_MODEL_PATH directory does not exist: {model_path}")
+        config.setdefault("run", {}).setdefault("policy", {})["model_name_or_path"] = str(model_path)
+    return config
 
 
 def gpu_memory_headroom_is_safe(

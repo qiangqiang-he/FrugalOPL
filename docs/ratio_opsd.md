@@ -17,17 +17,27 @@ Teacher 为关闭 LoRA 的冻结基础模型；特权上下文为同一题目的
 两个入口共享 `configs/common/ratio_opsd_8GPU.yaml`，默认 8×80 GB。
 
 ```bash
-# 使用服务器已安装的环境，并加载仓库外的 SwanLab 凭据文件。
-export FRUGALOPL_PYTHON=/path/to/post_train/bin/python
-export FRUGALOPL_SWANLAB_ENV_FILE=/path/to/private/swanlab.env
+conda activate post_train
+export FRUGALOPL_PYTHON="$(command -v python)"
+export FRUGALOPL_SWANLAB_ENV_FILE="$HOME/.config/frugalopl/swanlab.env"
+export MODEL_ROOT="$HOME/projects/models"  # 改成服务器实际模型父目录。
+```
 
+1.5B 的启动命令：
+
+```bash
+export FRUGALOPL_MODEL_PATH="$MODEL_ROOT/DeepSeek-R1-Distill-Qwen-1.5B"
 bash scripts/start_train.sh configs/training/ratio_opsd/deepseek_r1_distill_qwen_1p5b_100steps_8GPU.yaml
+```
 
-# 另一场独立实验使用：
+上一场结束后，7B 的启动命令：
+
+```bash
+export FRUGALOPL_MODEL_PATH="$MODEL_ROOT/DeepSeek-R1-Distill-Qwen-7B"
 bash scripts/start_train.sh configs/training/ratio_opsd/deepseek_r1_distill_qwen_7b_100steps_8GPU.yaml
 ```
 
-启动前将对应 YAML 的 `run.policy.model_name_or_path` 改为服务器已有模型目录。默认路径为 `/models/DeepSeek-R1-Distill-Qwen-1.5B` 和 `/models/DeepSeek-R1-Distill-Qwen-7B`。数据文件需要预先存在：`data/openthoughts_math30k.json`、`data/AMC-2023.json`、`data/AIME-2024.json`。Redis 默认 `127.0.0.1:6379`。脚本会通过 tmux 持续运行，并输出日志和退出状态文件路径。
+`FRUGALOPL_MODEL_PATH` 会覆盖 YAML 中的 `run.policy.model_name_or_path`，检查本地目录存在，并把实际路径保存到本次运行的合并配置。启动器会显式传入 tmux，避免继承旧模型路径；未设置时使用 YAML 默认路径。数据文件需要预先存在：`data/openthoughts_math30k.json`、`data/AMC-2023.json`、`data/AIME-2024.json`。Redis 默认 `127.0.0.1:6379`。脚本会通过 tmux 持续运行，并输出日志和退出状态文件路径。
 
 | 设置 | 值 |
 |---|---|
