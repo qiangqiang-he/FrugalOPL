@@ -1,0 +1,149 @@
+# 8 x 80 GB; independent TP=1 Actors and an eight-rank stage-zero Learner.
+# Actors split ONE logical batch by question, then sleep before optimization.
+eval_interval: 10
+save_ckpt_interval: 10
+save_question_accuracy: true
+
+run:
+  name: ratio_opsd_override_model_name
+  group: tcdo-ratio-opsd-deepseek-r1
+  seed: 42
+  prompts:
+    train: KL_OPSD_STUDENT_PROMPT
+    evaluation: KL_OPSD_STUDENT_PROMPT
+  storage:
+    output_root: outputs
+    lora_adapter_root: null
+  swanlab:
+    enabled: true
+    project: TCDO
+    workspace: qhe
+    mode: online
+  redis:
+    url: redis://127.0.0.1:6379/0
+    key_prefix: tcdo_ratio_opsd
+    clear_run_keys_on_start: true
+    serializer: pickle
+  runtime:
+    process_start_method: spawn
+    minimum_free_gpu_memory_gb: 0
+    pause_on_cuda_oom_only: false
+    restart:
+      enabled: false
+      worker_restart_delay_sec: 5
+      manager_poll_interval_sec: 2
+  policy:
+    dtype: bfloat16
+    lora:
+      enabled: true
+      rank: 64
+      alpha: 128
+      dropout: 0.0
+      target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+pipeline:
+  - id: controller
+    class: Controller
+  - id: actor
+    class: Actor
+    plugin_hook: collect_actor_signals
+    cpu_offload: false
+  - id: learner
+    class: Learner
+    plugin_hook: collect_learner_signals
+    objective_fn: compute_objective
+    cpu_offload: false
+
+controller:
+  max_inflight_batches: 1
+  max_steps: 100
+  train_prompt_batch_size: 32
+  queue_poll_timeout_sec: 1
+  data:
+    train:
+      name: openthoughts_math30k
+      path: data/openthoughts_math30k.json
+    eval:
+      - name: amc23
+        path: data/AMC-2023.json
+      - name: aime24
+        path: data/AIME-2024.json
+    max_prompt_length: 8192
+    max_response_length: 20480
+
+actor:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  engine:
+    tensor_parallel_size: 1
+    enforce_eager: false
+    max_model_len: 40960
+    gpu_memory_utilization: 0.55
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    enable_chunked_prefill: true
+    sleep_engine_after_turn: true
+    sleep_level: 1
+    collect_timeout_sec: 0.03
+    logprobs:
+      default: 0
+      max: 16
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+  lora:
+    enabled: true
+    max_rank: 64
+  evaluation:
+    enabled: true
+    before_training: true
+    max_examples: null
+    rollouts_per_batch: 64
+    rollouts_per_prompt: 16
+    save_rollouts: true
+    generation:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: -1
+      max_response_length: 32768
+      seed: 42
+
+learner:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  max_sequence_length: 28672
+  distributed:
+    backend: nccl
+    master_addr: 127.0.0.1
+    master_port: 29673
+    timeout_sec: 3600
+  execution:
+    forward_chunk_size: 64
+    gradient_checkpointing: true
+    clip_grad_norm: 0.1
+  optimizer:
+    type: adamw
+    lr: 5.0e-6
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.0
+  scheduler:
+    type: constant
+  checkpoint:
+    save_initial: true
+    max_keep: 2
+
+algorithm:
+  plugin: RatioOPSDPlugin
+  algo_name: ratio_opsd
+  loss_aggregation: token
+  enable_thinking: false
+  self_shot_format: conversation
+  teacher_sync_interval: -1
+  kl_temperature: 1.0
+  kl_token_clip: null
+  kl_chunk_size: 64
+  ratio_plausible_fraction: 0.1
+  training_sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 20480
+    n: 8

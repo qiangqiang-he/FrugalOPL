@@ -1,0 +1,6 @@
+extends: ../../common/ratio_opsd_8GPU.yaml
+
+run:
+  name: ratio_opsd_deepseek_r1_distill_qwen_7b_b32n8_r20k_eval32k_avg16_100steps_8GPU
+  policy:
+    model_name_or_path: /models/DeepSeek-R1-Distill-Qwen-7B

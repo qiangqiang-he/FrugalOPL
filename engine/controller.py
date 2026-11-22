@@ -225,6 +225,11 @@ class Controller:
             _mapping(data_cfg.get("train"), "controller.data.train"),
         )
         self.eval_datasets = _load_evaluation_datasets(data_cfg.get("eval")) if self.evaluation_enabled else {}
+        max_eval_examples = evaluation_cfg.get("max_examples")
+        if max_eval_examples is not None:
+            if isinstance(max_eval_examples, bool) or not isinstance(max_eval_examples, int) or max_eval_examples < 1:
+                raise ValueError("actor.evaluation.max_examples must be null or a positive integer per dataset.")
+            self.eval_datasets = {name: records[:max_eval_examples] for name, records in self.eval_datasets.items()}
         # Retain the flattened view for lightweight callers that only need to
         # inspect the configured evaluation corpus. Runtime evaluation always
         # keeps dataset boundaries intact through ``eval_datasets``.
@@ -978,6 +983,12 @@ class Controller:
 
             for gpu_id in requests_by_gpu:
                 dispatch_next(gpu_id)
+            print(
+                f"[Controller] Evaluation step={completed_steps}, dataset={dataset_name}: "
+                f"parallel Actor GPUs={list(requests_by_gpu)}, "
+                f"at most {self.eval_prompts_per_batch * self.eval_rollouts_per_prompt} rollouts per Actor call.",
+                flush=True,
+            )
             while pending:
                 result = self._pop_message(
                     client,
@@ -1027,6 +1038,9 @@ class Controller:
                 pass_at_k: raw_metrics[pass_at_k],
                 "avg_response_length": raw_metrics["average_response_length"],
                 "truncation_rate": raw_metrics["truncation_rate"],
+                "response_count": raw_metrics["response_count"],
+                "truncated_response_count": round(raw_metrics["truncation_rate"] * raw_metrics["response_count"]),
+                "actor_count": len(requests_by_gpu),
                 "correct_response_count": raw_metrics["correct_response_count"],
                 "incorrect_response_count": raw_metrics["incorrect_response_count"],
             }
@@ -1263,8 +1277,9 @@ class Controller:
                 )
                 if all(key in raw_metrics for key in metric_keys):
                     values[dataset_name] = {key: raw_metrics[key] for key in metric_keys}
-                    if "truncation_rate" in raw_metrics:
-                        values[dataset_name]["truncation_rate"] = raw_metrics["truncation_rate"]
+                    for key in ("truncation_rate", "response_count", "truncated_response_count", "actor_count"):
+                        if key in raw_metrics:
+                            values[dataset_name][key] = raw_metrics[key]
         self._swanlab.log_components({"evaluation": values}, step=step)
 
     @staticmethod

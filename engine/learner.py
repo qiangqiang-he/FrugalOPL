@@ -507,6 +507,9 @@ class Learner:
             raise ValueError("learner.execution.loss_aggregation is unsupported; use algorithm.loss_aggregation.")
         self.distributed_cfg = _mapping(self.learner_cfg.get("distributed", {}), "learner.distributed")
         self.checkpoint_cfg = _mapping(self.learner_cfg.get("checkpoint", {}), "learner.checkpoint")
+        self.save_initial_checkpoint = self.checkpoint_cfg.get("save_initial", False)
+        if not isinstance(self.save_initial_checkpoint, bool):
+            raise ValueError("learner.checkpoint.save_initial must be a boolean.")
         if "interval_steps" in self.checkpoint_cfg:
             raise ValueError("learner.checkpoint.interval_steps is unsupported; use top-level save_ckpt_interval.")
         self.save_ckpt_interval = self.config.get("save_ckpt_interval", 0)
@@ -1677,6 +1680,8 @@ class Learner:
         temperature: float = 1.0,
         token_clip: float | None = None,
         chunk_size: int | None = None,
+        _token_scorer: Callable | None = None,
+        _score_keys: tuple[str, ...] | None = None,
     ) -> Signals:
         """Score one rollout's exact full-vocabulary forward KL on this rank.
 
@@ -1718,6 +1723,8 @@ class Learner:
             "response_forward_kl", "response_forward_kl_unclipped",
             "response_forward_kl_clipped_fraction",
         )
+        if _score_keys is not None:
+            keys = _score_keys
 
         def score_chunk(student_chunk: torch.Tensor, teacher_chunk: torch.Tensor) -> tuple[torch.Tensor, ...]:
             # This closure is executed both now and during checkpoint backward.
@@ -1730,7 +1737,7 @@ class Learner:
                     teacher_logits = head(teacher_chunk)
                 module.train()
                 student_logits = head(student_chunk)
-                values = forward_kl_token_values(
+                values = (_token_scorer or forward_kl_token_values)(
                     student_logits, teacher_logits, temperature=temperature, token_clip=token_clip,
                 )
                 return tuple(values[key] for key in keys)
@@ -1766,10 +1773,24 @@ class Learner:
                     use_reentrant=False,
                 )
                 for key, value in zip(keys, values, strict=True):
-                    chunks[key].append(value if key == "response_forward_kl" else value.detach())
+                    chunks[key].append(value if key == keys[0] else value.detach())
             return {key: torch.cat(values, dim=1) for key, values in chunks.items()}
         finally:
             module.train(prior_training)
+
+    def _plugin_compute_ratio_kl(
+        self, batch: Signals, *, teacher_prompts: Sequence[str], temperature: float,
+        plausible_fraction: float, chunk_size: int | None,
+    ) -> Signals:
+        from utils.ratio_kl import RATIO_KEYS, ratio_kl_scores
+
+        def scorer(student, teacher, *, temperature, token_clip):
+            return ratio_kl_scores(student, teacher, temperature=temperature, plausible_fraction=plausible_fraction)
+
+        return self._plugin_compute_forward_kl(
+            batch, teacher_prompts=teacher_prompts, temperature=temperature,
+            token_clip=None, chunk_size=chunk_size, _token_scorer=scorer, _score_keys=RATIO_KEYS,
+        )
 
     def _plugin_compute_tail_suppression(
         self, batch: Signals, *, top_p: float = 0.99, temperature: float = 1.0,
@@ -2886,7 +2907,7 @@ class Learner:
         self._restore_plugin_training_state()
         print(f"[Learner] Restored adapter and optimizer at global_step={self.global_step}.", flush=True)
 
-    def _maybe_publish_adapter(self) -> str:
+    def _maybe_publish_adapter(self, *, initial_only: bool = False) -> str:
         if not self.lora_enabled or self.rank != 0:
             return ""
         save = getattr(self._module(), "save_pretrained", None)
@@ -2895,11 +2916,19 @@ class Learner:
                 raise RuntimeError("Scheduled training checkpoint requires a model exposing save_pretrained().")
             return ""
         root = _lora_adapter_root(self.config)
+        if initial_only:
+            if self.global_step != 0:
+                raise ValueError("Initial checkpoint requires global_step=0.")
+            storage = _mapping(self.run_cfg.get("storage", {}), "run.storage")
+            root = Path(str(storage.get("output_root", "outputs"))).expanduser() / str(self.run_cfg["name"]) / "checkpoints"
         root.mkdir(parents=True, exist_ok=True)
         final_dir = root / f"step_{self.global_step}"
         adapter_dir = final_dir / "adapter_lora"
         if adapter_dir.is_dir():
-            self._snapshot_periodic_checkpoint(final_dir)
+            if initial_only:
+                self._validate_complete_checkpoint(final_dir)
+            else:
+                self._snapshot_periodic_checkpoint(final_dir)
             return str(adapter_dir)
         temporary_dir = root / f"step_{self.global_step}_tmp"
         if temporary_dir.exists():
@@ -2931,8 +2960,9 @@ class Learner:
         os.replace(temporary_dir, final_dir)
         # Preserve scheduled training state before temporary publications can
         # be pruned. This schedule is independent of Actor evaluation.
-        self._snapshot_periodic_checkpoint(final_dir)
-        self._prune_old_adapters(root)
+        if not initial_only:
+            self._snapshot_periodic_checkpoint(final_dir)
+            self._prune_old_adapters(root)
         return str(adapter_dir)
 
     @staticmethod
@@ -3840,6 +3870,8 @@ def _learner_worker_main(
                 plugin = _build_plugin(plugin_factory, tokenizer)
                 if plugin is not None:
                     learner.set_plugin(plugin)
+                if learner.save_initial_checkpoint and learner.global_step == 0:
+                    learner._maybe_publish_adapter(initial_only=True)
             except BaseException:
                 # Model/optimizer teardown can call CUDA APIs.  Do it before
                 # releasing the permit so a failed retry cannot overlap a

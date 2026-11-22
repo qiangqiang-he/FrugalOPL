@@ -132,6 +132,11 @@ class _PluginRuntime(Protocol):
         chunk_size: int | None = None,
     ) -> Signals: ...
 
+    def _plugin_compute_ratio_kl(
+        self, batch: Signals, *, teacher_prompts: Sequence[str], temperature: float,
+        plausible_fraction: float, chunk_size: int | None,
+    ) -> Signals: ...
+
     def _plugin_compute_tail_suppression(
         self, batch: Signals, *, top_p: float, temperature: float, chunk_size: int | None,
     ) -> Signals: ...
@@ -412,6 +417,30 @@ class AlgorithmPlugin:
         return scope.runtime._plugin_compute_forward_kl(
             dict(batch), teacher_prompts=prompts, temperature=temperature,
             token_clip=token_clip, chunk_size=chunk_size,
+        )
+
+    def compute_ratio_kl(
+        self, batch: Signals, *, teacher_prompts: Sequence[str],
+        temperature: float = 1.0, plausible_fraction: float = 0.1,
+        chunk_size: int | None = None,
+    ) -> Signals:
+        """Score KL(stopgrad(normalize(p²/q * 1[p>=fraction*pmax])) || p).
+
+        Reuse bounded, checkpointed full-vocabulary paired scoring. Targets
+        and the privileged Teacher are detached; only Student LoRA learns.
+        """
+        scope = _ACTIVE_PLUGIN_SCOPE.get()
+        if scope is None or scope.worker != "learner" or scope.phase != "objective":
+            raise RuntimeError("compute_ratio_kl() is only available inside a Learner objective.")
+        prompts, temperature, _, chunk_size = _validate_forward_kl_request(
+            batch, teacher_prompts, temperature, None, chunk_size,
+        )
+        if (isinstance(plausible_fraction, bool) or not isinstance(plausible_fraction, (int, float))
+                or not math.isfinite(plausible_fraction) or not 0 < plausible_fraction <= 1):
+            raise ValueError("plausible_fraction must lie in (0, 1].")
+        return scope.runtime._plugin_compute_ratio_kl(
+            dict(batch), teacher_prompts=prompts, temperature=temperature,
+            plausible_fraction=float(plausible_fraction), chunk_size=chunk_size,
         )
 
     def compute_tail_suppression(

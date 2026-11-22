@@ -225,6 +225,9 @@ def _merge_actor_shards(shards: Sequence[Mapping[str, object]]) -> Signals:
         combined_metrics["batch_generation_entropy_tokens"] = entropy_tokens
         combined_metrics["batch_generation_entropy_nats"] = entropy_sum / entropy_tokens if entropy_tokens else 0.0
     result["actor_metrics"] = combined_metrics
+    if "response_truncated" in result["traj"]:
+        flags = _torch().as_tensor(result["traj"]["response_truncated"], dtype=_torch().float32)
+        combined_metrics["truncation_rate"] = float(flags.mean().item()) if flags.numel() else 0.0
     worker_timings = []
     for shard in ordered:
         timing = _mapping(shard.get("timing", {}), "timing")
@@ -1556,6 +1559,9 @@ class Actor:
             result["question_accuracies"] = question_accuracies
         if metadata:
             result["actor_metrics"] = dict(metadata)
+        if "response_truncated" in trajectory:
+            flags = _torch().as_tensor(trajectory["response_truncated"], dtype=_torch().float32)
+            result.setdefault("actor_metrics", {})["truncation_rate"] = float(flags.mean().item()) if flags.numel() else 0.0
         return self.plugin.finalize_actor_batch(result)
 
     @staticmethod
