@@ -40,15 +40,15 @@ if ! command -v tmux >/dev/null 2>&1; then
     exit 1
 fi
 
-# Prefer an explicitly selected interpreter, then an activated Conda env, then
-# the project's required local WSL environment.  The fallback retains normal
-# portability for a server whose Conda installation lives elsewhere.
+# Prefer the explicit override, then the installed post_train runtime.
 if [[ -n "${FRUGALOPL_PYTHON:-}" ]]; then
     python_bin="${FRUGALOPL_PYTHON}"
+elif [[ -x "${HOME}/miniconda3/envs/post_train/bin/python" ]]; then
+    python_bin="${HOME}/miniconda3/envs/post_train/bin/python"
+elif [[ -x "/usr/local/miniconda3/envs/post_train/bin/python" ]]; then
+    python_bin="/usr/local/miniconda3/envs/post_train/bin/python"
 elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
     python_bin="${CONDA_PREFIX}/bin/python"
-elif [[ -x "/home/qqh/miniconda3/envs/py312-th210-vl019-cu128/bin/python" ]]; then
-    python_bin="/home/qqh/miniconda3/envs/py312-th210-vl019-cu128/bin/python"
 else
     python_bin="$(command -v python)"
 fi

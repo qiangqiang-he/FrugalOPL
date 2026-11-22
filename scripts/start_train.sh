@@ -32,15 +32,15 @@ if ! command -v tmux >/dev/null 2>&1; then
     exit 1
 fi
 
-# Prefer an explicit interpreter, then the active Conda environment, then the
-# documented local WSL runtime.  A normal PATH fallback keeps server use
-# portable without making a new environment part of the launcher.
+# Prefer the explicit override, then the installed post_train runtime.
 if [[ -n "${FRUGALOPL_PYTHON:-}" ]]; then
     python_bin="${FRUGALOPL_PYTHON}"
+elif [[ -x "${HOME}/miniconda3/envs/post_train/bin/python" ]]; then
+    python_bin="${HOME}/miniconda3/envs/post_train/bin/python"
+elif [[ -x "/usr/local/miniconda3/envs/post_train/bin/python" ]]; then
+    python_bin="/usr/local/miniconda3/envs/post_train/bin/python"
 elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
     python_bin="${CONDA_PREFIX}/bin/python"
-elif [[ -x "/home/qqh/miniconda3/envs/rlvr/bin/python" ]]; then
-    python_bin="/home/qqh/miniconda3/envs/rlvr/bin/python"
 else
     python_bin="$(command -v python)"
 fi
