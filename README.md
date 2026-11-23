@@ -1,6 +1,8 @@
 # FrugalOPL
 A lightweight framework for efficient on-policy learning in LLMs.
 
+TCPO_v1 的 Qwen3-1.7B 八卡配置、三分支目标、32K AIME24 评测和自适应权重启动方式见 [TCPO_v1](docs/tcpo_v1.md)。
+
 `GRPOPlugin` is the shared binary-reward RL baseline for both training and
 Controller/Actor/Learner integration checks. It renders prompts, obtains verified
 rewards (with answer probing for truncated responses), computes group-relative
@@ -10,7 +12,7 @@ log probability under the `grpo_*` metric prefix. The standard GRPO advantage
 normalization, clipping settings, optional KL, and probe threshold are shared
 across these uses.
 
-`configs/common/` contains only `shared_batched/` and `disjoint_async/`, each with
+`configs/common/shared_batched/` and `configs/common/disjoint_async/` each contain
 `2GPU.yaml`, `4GPU.yaml`, and `8GPU.yaml`. All six configurations are complete and
 self-contained: they do not use `extends` or reference another configuration to
 fill in missing settings. Training and evaluation entry points may extend a

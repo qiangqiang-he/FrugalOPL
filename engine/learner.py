@@ -693,6 +693,9 @@ class Learner:
             raise RuntimeError("transformers is required to initialize the Learner.") from error
 
         dtype = _torch_dtype(self.policy_cfg.get("dtype", "bfloat16"))
+        seed = int(self.run_cfg.get("seed", 42))
+        random.seed(seed)
+        torch.manual_seed(seed)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model_kwargs: dict[str, object] = {
             "torch_dtype": dtype,
@@ -1792,6 +1795,14 @@ class Learner:
             token_clip=None, chunk_size=chunk_size, _token_scorer=scorer, _score_keys=RATIO_KEYS,
         )
 
+    def _plugin_compute_tcdo(self, batch: Signals, *, teacher_prompts: Sequence[str], state: int,
+                             temperature: float, plausible_fraction: float, chunk_size: int | None) -> Signals:
+        from utils.tcdo import TCDO_KEYS, tcdo_token_values
+        def scorer(student, teacher, *, temperature, token_clip):
+            return tcdo_token_values(student, teacher, state=state, temperature=temperature, plausible_fraction=plausible_fraction)
+        return self._plugin_compute_forward_kl(batch, teacher_prompts=teacher_prompts, temperature=temperature,
+            token_clip=None, chunk_size=chunk_size, _token_scorer=scorer, _score_keys=TCDO_KEYS)
+
     def _plugin_compute_tail_suppression(
         self, batch: Signals, *, top_p: float = 0.99, temperature: float = 1.0,
         chunk_size: int | None = None,
@@ -2400,6 +2411,7 @@ class Learner:
             "global_step": self.global_step,
             "rollout_count": rollout_count,
             "optimizer_steps": int(raw_learner_metrics["optimizer_steps"]),
+            "logical_steps": int(raw_learner_metrics.get("logical_steps", raw_learner_metrics["optimizer_steps"])),
             # ``metrics`` remains the legacy algorithm-metric name for
             # existing result consumers.  New Controller code should prefer
             # the explicit centralized ``algorithm_metrics`` envelope.
@@ -2458,6 +2470,7 @@ class Learner:
         objective_sum = 0.0
         objective_weight = 0.0
         local_valid_tokens = 0
+        local_update_tokens = 0
         counted_rollouts = 0
         self._zero_grad()
 
@@ -2471,10 +2484,17 @@ class Learner:
                     computed = getattr(self.plugin, self.objective_fn)(batch)  # type: ignore[union-attr]
                 if isinstance(computed, ObjectiveResult):
                     objective, raw_metrics = computed
+                    needs_update_backward = computed.requires_optimizer_step
                     valid_token_count = self._objective_valid_token_count(computed, batch)
                     local_valid_tokens += valid_token_count
+                    if not isinstance(computed.requires_optimizer_step, bool):
+                        raise TypeError("requires_optimizer_step must be a boolean")
+                    if computed.requires_optimizer_step:
+                        local_update_tokens += valid_token_count
+                    token_weighted_metrics = computed.token_weighted_metrics
                     counted_rollouts += 1
                 elif isinstance(computed, tuple) and len(computed) == 2:
+                    needs_update_backward = True
                     if token_aggregation:
                         raise TypeError(
                             "Token loss aggregation requires ObjectiveResult with valid_token_count; "
@@ -2482,6 +2502,7 @@ class Learner:
                         )
                     objective, raw_metrics = computed
                     valid_token_count = None
+                    token_weighted_metrics = frozenset()
                 else:
                     raise TypeError("Learner objectives must return ObjectiveResult or (objective, metrics).")
                 if not isinstance(objective, torch.Tensor) or objective.numel() != 1:
@@ -2497,7 +2518,14 @@ class Learner:
                 weight = float(valid_token_count) if token_aggregation else 1.0
                 denominator = response_token_total if token_aggregation else total_rollouts
                 scale = self.world_size * weight / float(denominator)
-                self._backward(-objective * scale)
+                if needs_update_backward:
+                    self._backward(-objective * scale)
+                else:
+                    if float(objective.detach().item()) != 0.0:
+                        raise ValueError('An objective without an optimizer update must be exactly zero.')
+                    # Preserve every rank's backward/collective slot without
+                    # differentiating a zero loss through the full backbone.
+                    self._backward(self._dummy_loss())
                 objective_sum += float(objective.detach().float().cpu().item()) * weight
                 objective_weight += weight
                 for key, value in raw_metrics.items():
@@ -2508,6 +2536,8 @@ class Learner:
                     if numeric is None:
                         continue
                     metric_weight = weight if token_aggregation and (name == "loss" or name.endswith("_loss")) else 1.0
+                    if name in token_weighted_metrics:
+                        metric_weight = float(valid_token_count)
                     metric_sums[name] = metric_sums.get(name, 0.0) + numeric * metric_weight
                     metric_weights[name] = metric_weights.get(name, 0.0) + metric_weight
             else:
@@ -2518,10 +2548,11 @@ class Learner:
 
         global_valid_tokens: int | None = None
         if token_aggregation:
-            token_count = torch.tensor(local_valid_tokens, dtype=torch.int64, device=self.device)
+            token_count = torch.tensor([local_valid_tokens, local_update_tokens], dtype=torch.int64, device=self.device)
             if _distributed_active():
                 dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-            global_valid_tokens = int(token_count.item())
+            global_valid_tokens = int(token_count[0].item())
+            global_update_tokens = int(token_count[1].item())
             if global_valid_tokens == 0:
                 self._zero_grad()
             else:
@@ -2535,13 +2566,15 @@ class Learner:
         # accumulated and before optional clipping.  This is the only point
         # where a meaningful logical-batch raw gradient exists.  Keep the
         # ordering explicit: raw -> clip -> clipped -> optimizer step.
-        did_update = global_valid_tokens != 0
+        advance_step = global_valid_tokens != 0
+        did_update = advance_step and (not token_aggregation or global_update_tokens > 0)
         raw_gradient = self._gradient_norm() if did_update else 0.0
         if did_update:
             self._clip_gradients()
         clip_gradient = self._gradient_norm() if did_update else 0.0
         if did_update:
             self._step()
+        if advance_step:
             self.global_step += 1
         if _distributed_active():
             gathered: list[object | None] = [None for _ in range(self.world_size)]
@@ -2585,9 +2618,9 @@ class Learner:
             if metric_weights[key] > 0
         }
         metrics["loss"] = -(objective_sum / objective_weight) if objective_weight > 0 else 0.0
-        if did_update:
+        if advance_step:
             self._complete_algorithm_training_step(metrics)
-        adapter_path = self._maybe_publish_adapter() if did_update else None
+        adapter_path = self._maybe_publish_adapter() if advance_step else None
         if (
             did_update and self.teacher_sync_interval > 0
             and self.global_step % self.teacher_sync_interval == 0
@@ -2599,6 +2632,7 @@ class Learner:
             "train_rollouts": float(total_rollouts),
             "micro_batches": float(len(micro_batches)),
             "optimizer_steps": float(did_update),
+            "logical_steps": float(advance_step),
             "lr": self._current_lr(),
             # ``grad_norm`` remains the public compatibility spelling for
             # the pre-clip global L2 norm.  New consumers should use the
@@ -3143,9 +3177,12 @@ class Learner:
         if stop_event.is_set():  # type: ignore[union-attr]
             return {"kind": "stop"}
         if self.round_gate is not None:
-            manifest = self.round_gate.wait_learner(last_round, stop_event)
+            # Rank 1 is already waiting for a CPU control broadcast. Return
+            # periodically during long Actor-only evaluation so idle Learners
+            # exchange heartbeats instead of expiring their Gloo collective.
+            manifest = self.round_gate.wait_learner(last_round, stop_event, timeout=1.0)
             if manifest is None:
-                return {"kind": "stop"}
+                return {"kind": "stop" if stop_event.is_set() else "idle"}
             batches = self._collect_round_batches(client, manifest, stop_event)
             if batches is None:
                 self.round_gate.abort("Learner stopped while collecting a shared round.")

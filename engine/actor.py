@@ -1074,6 +1074,7 @@ class Actor:
             self._sampling_params_factory = SamplingParams
             llm_kwargs = {
                 "model": model_path,
+                "seed": int(self.run_cfg.get("seed", 42)),
                 "tensor_parallel_size": 1,
                 "enable_lora": self.lora_enabled,
                 "max_lora_rank": self._max_lora_rank,
@@ -3030,6 +3031,9 @@ class ActorManager:
             name=f"FrugalOPL-Actor-GPU{gpu_id}",
         )
         process.start()
+        from multiprocessing.process import BaseProcess
+        if isinstance(process, BaseProcess):
+            process._frugalopl_owns_process_group = os.name == "posix"
         return process
 
     def _uses_shared_gpu_gate(self, gpu_id: int) -> bool:
@@ -3272,6 +3276,10 @@ class ActorManager:
         """Invoke one process-control primitive on each still-owned child."""
 
         for process in processes:
+            from utils.process_lifecycle import signal_owned_worker_group
+            signum = signal.SIGKILL if method_name == "kill" else signal.SIGTERM
+            if signal_owned_worker_group(process, signum):
+                continue
             method = getattr(process, method_name, None)
             if method_name == "kill" and not callable(method):
                 # ``Process.kill`` is available in the supported WSL runtime.
@@ -3303,6 +3311,8 @@ class ActorManager:
         self._join_processes(processes, timeout_sec=grace_sec)
         remaining = self._alive_processes(processes)
         if not remaining:
+            from utils.process_lifecycle import cleanup_exited_worker_groups
+            cleanup_exited_worker_groups(processes)
             return
 
         print(
@@ -3314,6 +3324,8 @@ class ActorManager:
         self._join_processes(remaining, timeout_sec=_TERMINATE_SHUTDOWN_GRACE_SEC)
         remaining = self._alive_processes(remaining)
         if not remaining:
+            from utils.process_lifecycle import cleanup_exited_worker_groups
+            cleanup_exited_worker_groups(processes)
             return
 
         # Worker signal handlers intentionally translate SIGTERM into a
@@ -3326,6 +3338,8 @@ class ActorManager:
         self._signal_processes(remaining, "kill")
         self._join_processes(remaining, timeout_sec=_KILL_SHUTDOWN_JOIN_SEC)
         remaining = self._alive_processes(remaining)
+        from utils.process_lifecycle import cleanup_exited_worker_groups
+        cleanup_exited_worker_groups(processes)
         if remaining:
             raise RuntimeError(
                 "Actor Manager could not reap all owned workers after forced shutdown; "
@@ -3350,6 +3364,8 @@ def _actor_worker_main(
     round_gate: object | None = None,
 ) -> None:
     # Set this before vLLM, transformers, or torch are imported in the child.
+    from utils.process_lifecycle import isolate_worker_group
+    isolate_worker_group()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     # Direct manager use has no Controller-created registry, but it must still
     # follow the same ownership path as a Controller-managed worker.  Keeping

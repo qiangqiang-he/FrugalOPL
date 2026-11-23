@@ -75,11 +75,17 @@ class ObjectiveResult:
     Sequence aggregation continues to average micro-batch objectives equally.
     Two-value iteration preserves existing ``objective, metrics = result``
     callers without exposing normalization as an experiment metric.
+
+    ``requires_optimizer_step=False`` marks an exactly zero contribution.
+    Its tokens still enter the loss denominator, and Learner supplies the
+    zero parameter backward needed to match distributed collective slots.
     """
 
     objective: torch.Tensor
     metrics: Metrics
     valid_token_count: torch.Tensor | int
+    token_weighted_metrics: frozenset[str] = frozenset()
+    requires_optimizer_step: bool = True
 
     def __iter__(self) -> Iterator[object]:
         yield self.objective
@@ -136,6 +142,9 @@ class _PluginRuntime(Protocol):
         self, batch: Signals, *, teacher_prompts: Sequence[str], temperature: float,
         plausible_fraction: float, chunk_size: int | None,
     ) -> Signals: ...
+
+    def _plugin_compute_tcdo(self, batch: Signals, *, teacher_prompts: Sequence[str], state: int,
+                             temperature: float, plausible_fraction: float, chunk_size: int | None) -> Signals: ...
 
     def _plugin_compute_tail_suppression(
         self, batch: Signals, *, top_p: float, temperature: float, chunk_size: int | None,
@@ -442,6 +451,18 @@ class AlgorithmPlugin:
             dict(batch), teacher_prompts=prompts, temperature=temperature,
             plausible_fraction=float(plausible_fraction), chunk_size=chunk_size,
         )
+
+    def compute_tcdo(self, batch: Signals, *, teacher_prompts: Sequence[str], state: int,
+                     temperature: float = 1.0, plausible_fraction: float = 0.01,
+                     chunk_size: int | None = None) -> Signals:
+        scope = _ACTIVE_PLUGIN_SCOPE.get()
+        if scope is None or scope.worker != "learner" or scope.phase != "objective":
+            raise RuntimeError("compute_tcdo requires a Learner objective scope")
+        prompts, temperature, _, chunk_size = _validate_forward_kl_request(batch, teacher_prompts, temperature, None, chunk_size)
+        if state not in (1, 2) or not 0 < plausible_fraction <= 1:
+            raise ValueError("Invalid TCDO state or support threshold")
+        return scope.runtime._plugin_compute_tcdo(dict(batch), teacher_prompts=prompts, state=state,
+            temperature=temperature, plausible_fraction=plausible_fraction, chunk_size=chunk_size)
 
     def compute_tail_suppression(
         self, batch: Signals, *, top_p: float = 0.99, temperature: float = 1.0,

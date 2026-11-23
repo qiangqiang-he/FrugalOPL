@@ -1,0 +1,6 @@
+extends: ../../common/tcpo_v1_8GPU.yaml
+run:
+  name: tcpo_v1_qwen3_1p7b_100steps_8gpu
+  group: tcpo_v1-qwen3-1p7b-8gpu
+  policy:
+    model_name_or_path: Qwen/Qwen3-1.7B

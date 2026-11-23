@@ -138,7 +138,8 @@ class SharedRoundGate:
                 self._phase.value = 2
             self._condition.notify_all()
 
-    def wait_learner(self, after_round: int = 0, stop_event=None) -> RoundManifest | None:
+    def wait_learner(self, after_round: int = 0, stop_event=None, *, timeout: float | None = None) -> RoundManifest | None:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         with self._condition:
             while True:
                 self._check()
@@ -146,7 +147,10 @@ class SharedRoundGate:
                     return None
                 if self._phase.value == 2 and self._round.value > after_round:
                     return self._read_manifest()
-                self._condition.wait(0.1)
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                self._condition.wait(0.1 if remaining is None else min(0.1, remaining))
 
     def learner_ready(self, rank: int, round_id: int, stop_event=None) -> bool:
         if rank not in range(self.learner_ranks):

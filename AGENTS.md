@@ -19,6 +19,7 @@
 
 ## SwanLab 凭据
 
+- OPSD、OPSD 的所有变体以及 TCDO 的训练、评估和相关诊断，统一记录到 SwanLab 的 `TCDO` Project。
 - 需要记录 SwanLab 的 WSL 任务，应在启动前加载仓库外的
   `/home/qqh/.config/frugalopl/swanlab.env`；该文件提供
   `SWANLAB_API_KEY`，目录权限应为 `700`、文件权限应为 `600`。
@@ -67,6 +68,7 @@
 
 ## 本地轻量训练测试
 
+- **双卡 4090 默认全局训练 batch 为 32 个问题 × 每题 4 个回复，共 128 条 rollout**；32 是整个 batch 的问题总数。用户明确要求的小规模链路验证可缩小 batch，正式双卡实验按此默认值配置。
 - 测试算法时，可在 `tests/configs/` 中创建轻量配置，使用更短的生成长度、更小的模型和更小的 batch size。
 - 本地单卡训练统一使用 GSM8K：训练集为 `tests/data/gsm8k_train.json`，评测集为 `tests/data/gsm8k_test.json`。`tests/configs/` 中的单卡训练配置必须分别使用这两个文件作为训练集和评测集。
 - 本地单卡训练的最大生成长度统一设置为 `1024`，即 `data.max_response_length: 1024`。

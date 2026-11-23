@@ -243,6 +243,7 @@ class Controller:
         self.output_dir = self._resolve_output_dir()
         self.train_history: list[dict[str, object]] = []
         self.evaluation_history: list[dict[str, object]] = []
+        self._evaluation_stop_reason = None
         self._last_policy_version = 0
         self._restored_elapsed_seconds = 0.0
         self._training_elapsed_seconds = 0.0
@@ -941,33 +942,105 @@ class Controller:
         keys = self.queue_keys()
         dataset_summaries: dict[str, object] = {}
         detail_datasets: dict[str, object] = {}
+        from utils.eval_cache import EvaluationBatchCache
+        from utils.evaluation_stop import partial_evaluation_stop_reason
+        caches = []
         evaluation_attempt = uuid.uuid4().hex
 
         for dataset_name, dataset_records in self.eval_datasets.items():
             evaluation_id = f"eval-step-{completed_steps:06d}-{dataset_name}-{evaluation_attempt}"
             question_results: list[dict[str, object]] = []
-            # Each Actor owns a contiguous question slice and at most one
-            # outstanding evaluation request. Seed every active GPU before
-            # collecting results, then refill only the GPU that just finished.
-            # This keeps the per-call rollout bound independent of training K.
+            adapter_hash = None
+            if adapter_snapshot is not None:
+                adapter_hash = hashlib.sha256((adapter_snapshot/'adapter_model.safetensors').read_bytes()).hexdigest()
+            cache = EvaluationBatchCache(self.output_dir,completed_steps,dataset_name,{
+                'policy_version':self._last_policy_version,'adapter_sha256':adapter_hash,
+                'records':dataset_records,'generation':getattr(self,'actor_cfg',{}).get('evaluation',{}).get('generation',{}),
+                'prompts':self.run_cfg.get('prompts',{}),'policy':self.run_cfg.get('policy',{}),
+                'thinking':self.config.get('algorithm',{}).get('enable_thinking'),
+                'rollouts_per_prompt':self.eval_rollouts_per_prompt,'prompts_per_batch':self.eval_prompts_per_batch,
+                'actor_gpu_ids':list(self.scheduling.actor_gpu_ids),'save_rollouts':self.save_eval_rollouts})
+            caches.append(cache)
+            expected_responses=len(dataset_records)*self.eval_rollouts_per_prompt
+            def stop_from_partial():
+                progress=cache.progress(question_results,expected_responses)
+                reason=partial_evaluation_stop_reason(self.controller_cfg.get('evaluation_stop'),completed_steps,dataset_name,progress)
+                if reason:
+                    self._evaluation_stop_reason=reason
+                    write_json(self.output_dir/'evaluation_stop.json',reason)
+                    self._swanlab.log_components({'evaluation':{dataset_name:{
+                        'evaluation_complete':0,'evaluated_response_count':progress['received_response_count'],
+                        'expected_response_count':expected_responses,
+                        'truncation_lower_bound':progress['dataset_truncation_lower_bound']}}},step=completed_steps)
+                    print(f'[Controller] Confirmed partial truncation lower bound: {reason}',flush=True)
+                    return {'step':completed_steps,'complete':False,'stop_reason':reason}
+                return None
+            # Preserve the original shard/batch identities for deterministic
+            # journals, but optionally let an idle Actor take a queued batch
+            # from a slower peer. Each GPU still has at most one request.
+            work_stealing=getattr(self,'actor_cfg',{}).get('evaluation',{}).get('work_stealing',False)
+            if not isinstance(work_stealing,bool):
+                raise ValueError('actor.evaluation.work_stealing must be boolean')
             requests_by_gpu = {}
             batch_index = 0
             for gpu_id, first, stop in question_shards(len(dataset_records), self.scheduling.actor_gpu_ids):
                 requests = deque()
                 for start in range(first, stop, self.eval_prompts_per_batch):
                     records = dataset_records[start : min(stop, start + self.eval_prompts_per_batch)]
-                    requests.append((batch_index, start, records))
+                    cached=cache.load(batch_index,start,len(records),self.eval_rollouts_per_prompt)
+                    if cached is not None:
+                        question_results.extend(cached)
+                    else:
+                        requests.append((batch_index, start, records))
                     batch_index += 1
                 requests_by_gpu[gpu_id] = requests
+            prioritized_requests=None
+            # A few long AIME questions can keep the final GPU busy after
+            # its peer has emptied its queue. Start previously expensive
+            # batches first, preserving every batch/sample identity and seed.
+            if work_stealing:
+                previous=[row['step'] for row in self.evaluation_history
+                          if row['step']<completed_steps and dataset_name in row['datasets']]
+                if previous:
+                    prior_path=self.output_dir/'evaluations'/f'step_{max(previous):06d}_details.json'
+                    if prior_path.is_file():
+                        try:
+                            prior=json.loads(prior_path.read_text())['datasets'][dataset_name]['questions']
+                            costs={int(q['record_index']):sum(int(r['response_token_length']) for r in q['rollouts']) for q in prior}
+                        except (OSError,ValueError,KeyError,TypeError):
+                            costs={}
+                        jobs=[job for queue in requests_by_gpu.values() for job in queue]
+                        if all(i in costs for _,start,records in jobs for i in range(start,start+len(records))):
+                            prioritized_requests=deque(sorted(jobs,key=lambda job:(
+                                -sum(costs[i] for i in range(job[1],job[1]+len(job[2]))),job[0])))
+                            for queue in requests_by_gpu.values():
+                                queue.clear()
+                            print(f'[Controller] Evaluation batches ordered by step {max(previous)} response lengths: '
+                                  f'{[job[0] for job in prioritized_requests]}',flush=True)
             pending = {}
+            if question_results:
+                print(f'[Controller] Reused {len(question_results)*self.eval_rollouts_per_prompt} saved evaluation replies.',flush=True)
+            partial_stop=stop_from_partial()
+            if partial_stop:
+                return partial_stop
             lpush = getattr(client, "lpush", None)
             if not callable(lpush):
                 raise TypeError("Controller Redis client must provide lpush().")
 
             def dispatch_next(gpu_id):
-                if not requests_by_gpu[gpu_id]:
-                    return
-                index, start, records = requests_by_gpu[gpu_id].popleft()
+                if prioritized_requests is not None:
+                    if not prioritized_requests:
+                        return
+                    index,start,records=prioritized_requests.popleft()
+                else:
+                    owner=gpu_id
+                    if not requests_by_gpu[owner] and work_stealing:
+                        owner=max(requests_by_gpu,key=lambda key:len(requests_by_gpu[key]))
+                    if not requests_by_gpu[owner]:
+                        return
+                    index, start, records = requests_by_gpu[owner].popleft()
+                    if owner!=gpu_id:
+                        print(f'[Controller] Idle Actor GPU {gpu_id} took queued evaluation batch {index} from GPU {owner}.',flush=True)
                 questions, answers = self._records_to_signals(records)
                 signals: dict[str, object] = {
                     "evaluation_id": evaluation_id,
@@ -1015,16 +1088,19 @@ class Controller:
                 trajectory = result.get("traj")
                 if not isinstance(trajectory, Mapping):
                     raise RuntimeError("Actor evaluation result does not contain a trajectory mapping.")
-                question_results.extend(
-                    build_question_results(
+                completed_questions=build_question_results(
                         records,
                         trajectory,
                         rollouts_per_prompt=self.eval_rollouts_per_prompt,
                         save_rollouts=self.save_eval_rollouts,
                         start_index=start,
                     )
-                )
+                cache.save(index,start,completed_questions)
+                question_results.extend(completed_questions)
                 del pending[index]
+                partial_stop=stop_from_partial()
+                if partial_stop:
+                    return partial_stop
                 dispatch_next(gpu_id)
 
             question_results.sort(key=lambda item: int(item["record_index"]))
@@ -1072,6 +1148,8 @@ class Controller:
         write_json(self.output_dir / "evaluations" / f"step_{completed_steps:06d}_details.json", details)
         # The summary is the durable completion marker used on restart.
         write_json(self.output_dir / "evaluations" / f"step_{completed_steps:06d}_summary.json", result)
+        for cache in caches:
+            cache.clear()
         self.evaluation_history.append(result)
         self._log_evaluation(result)
         for dataset_name, dataset in dataset_summaries.items():
@@ -1085,6 +1163,12 @@ class Controller:
                 f"truncation_rate={float(metrics['truncation_rate']):.4f}.",
                 flush=True,
             )
+        from utils.evaluation_stop import evaluation_stop_reason
+        reason = evaluation_stop_reason(self.controller_cfg.get("evaluation_stop"), result)
+        if reason:
+            self._evaluation_stop_reason = reason
+            write_json(self.output_dir / "evaluation_stop.json", reason)
+            print(f"[Controller] Evaluation stop triggered: {reason}", flush=True)
         return result
 
     def _completed_response_tokens(self, current_item: Mapping[str, object]) -> int:
@@ -1136,6 +1220,7 @@ class Controller:
             "training_elapsed_seconds": self._training_elapsed_seconds,
             "train": self.train_history,
             "evaluations": self.evaluation_history,
+            "evaluation_stop_reason": getattr(self,"_evaluation_stop_reason",None),
             "resume_state": {
                 "seed": int(self.run_cfg.get("seed", 0)),
                 "train_prompt_batch_size": self.train_prompt_batch_size,
@@ -1476,7 +1561,7 @@ class Controller:
                 )
             self._write_progress(started=started, completed_steps=completed_steps)
 
-            while completed_steps < self.max_steps:
+            while completed_steps < self.max_steps and not self._evaluation_stop_reason:
                 next_boundary = self.max_steps
                 if self.evaluation_enabled and self.eval_interval:
                     next_boundary = min(
@@ -1538,7 +1623,7 @@ class Controller:
                 while self._confirmed_batch_sequence + 1 in acknowledged:
                     self._confirmed_batch_sequence += 1
                     acknowledged.remove(self._confirmed_batch_sequence)
-                skipped = result.get("optimizer_steps", 1) == 0
+                skipped = result.get("logical_steps", result.get("optimizer_steps", 1)) == 0
                 accuracy_rows = None
                 if self.save_question_accuracy:
                     question_indices = pending_info.pop("question_indices", None)
@@ -1660,7 +1745,9 @@ class Controller:
                 "output_dir": str(self.output_dir),
                 "evaluations": self.evaluation_history,
             }
-            write_json(self.output_dir / "run_complete.json", _json_number(final))
+            if self._evaluation_stop_reason:
+                final["stop_reason"] = self._evaluation_stop_reason
+            write_json(self.output_dir / ("run_stopped.json" if self._evaluation_stop_reason else "run_complete.json"), _json_number(final))
             print(f"[Controller] Training completed: {final}", flush=True)
             return final
         except BaseException as error:
@@ -1724,8 +1811,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.algorithm_config is None:
             parser.error("--framework-config requires --algorithm-config.")
         config = load_merged_config(args.framework_config, args.algorithm_config)
-    controller = Controller(config, plugin_factory=_configured_plugin_factory(config))
-    controller.run()
+    tuning = _mapping(_mapping(config.get("run"), "run").get("tcpo_v1_tuning", {}), "run.tcpo_v1_tuning")
+    enabled = tuning.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("run.tcpo_v1_tuning.enabled must be boolean.")
+    if enabled:
+        from engine.tcpo_v1_campaign import run_campaign
+        run_campaign(config, run_trial=lambda trial: Controller(
+            trial, plugin_factory=_configured_plugin_factory(trial)).run())
+    else:
+        controller = Controller(config, plugin_factory=_configured_plugin_factory(config))
+        controller.run()
 
 
 if __name__ == "__main__":
