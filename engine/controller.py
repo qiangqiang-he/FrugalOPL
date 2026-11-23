@@ -212,6 +212,9 @@ class Controller:
             else (1, 1, 1)
         )
         self.save_eval_rollouts = bool(evaluation_cfg.get("save_rollouts", False))
+        if "final_rollouts_per_prompt" in evaluation_cfg:
+            evaluation_batch_limits({**evaluation_cfg,
+                "rollouts_per_prompt": evaluation_cfg["final_rollouts_per_prompt"]})
 
         self.learner_cfg = _mapping(
             self.config.get(self.learner_node.node_id), self.learner_node.node_id
@@ -938,6 +941,13 @@ class Controller:
 
         if not self.evaluation_enabled:
             return {}
+        evaluation_cfg = getattr(self, 'actor_cfg', {}).get('evaluation', {})
+        scheduled_count = 'final_rollouts_per_prompt' in evaluation_cfg
+        if scheduled_count:
+            count = (evaluation_cfg['final_rollouts_per_prompt']
+                     if completed_steps == self.max_steps else evaluation_cfg['rollouts_per_prompt'])
+            self.eval_rollouts_per_batch, self.eval_rollouts_per_prompt, self.eval_prompts_per_batch = (
+                evaluation_batch_limits({**evaluation_cfg, 'rollouts_per_prompt': count}))
         started = time.time()
         keys = self.queue_keys()
         dataset_summaries: dict[str, object] = {}
@@ -1051,6 +1061,8 @@ class Controller:
                     "answers": answers,
                     "records": copy.deepcopy(records),
                 }
+                if scheduled_count:
+                    signals['evaluation_rollouts_per_prompt'] = self.eval_rollouts_per_prompt
                 pending[index] = (gpu_id, start, records)
                 lpush(f"{keys['actor_eval']}:gpu:{gpu_id}", pickle.dumps(signals, protocol=pickle.HIGHEST_PROTOCOL))
 

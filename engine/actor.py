@@ -1661,13 +1661,18 @@ class Actor:
                 for question, answer in zip(source["questions"], source["answers"])
             ]
         evaluation = _mapping(self.actor_cfg.get("evaluation", {}), "actor.evaluation")
-        rollouts_per_prompt = int(evaluation.get("rollouts_per_prompt", 8))
+        requested_count = source.get('evaluation_rollouts_per_prompt')
+        if requested_count is not None and (isinstance(requested_count, bool)
+                or not isinstance(requested_count, int) or not 1 <= requested_count <= 64):
+            raise ValueError('evaluation_rollouts_per_prompt must be an integer from 1 to 64.')
+        rollouts_per_prompt = requested_count if requested_count is not None else int(evaluation.get("rollouts_per_prompt", 8))
         if len(records) * rollouts_per_prompt > 64:
             raise ValueError("A Redis Actor evaluation request may not exceed 64 rollouts.")
         previous_version = self._wave_policy_version
         self._wave_policy_version = version
         try:
-            generated = self.generate_evaluation_rollouts(records)
+            generated = (self.generate_evaluation_rollouts(records, rollouts_per_prompt=requested_count)
+                         if requested_count is not None else self.generate_evaluation_rollouts(records))
             actual_version = self.current_lora_step
             if actual_version == -1:
                 actual_version = 0
@@ -1697,6 +1702,7 @@ class Actor:
         records: list[Mapping[str, object]],
         *,
         prompt_alias: str | None = None,
+        rollouts_per_prompt: int | None = None,
     ) -> dict[str, object]:
         """Generate evaluation trajectories from complete dataset records.
 
@@ -1716,7 +1722,10 @@ class Actor:
             raise RuntimeError("Actor tokenizer is not initialized for evaluation prompt rendering.")
 
         generation = _mapping(evaluation.get("generation"), "actor.evaluation.generation")
-        rollouts_per_prompt = int(evaluation.get("rollouts_per_prompt", 8))
+        if rollouts_per_prompt is None:
+            rollouts_per_prompt = int(evaluation.get("rollouts_per_prompt", 8))
+        elif isinstance(rollouts_per_prompt, bool) or not isinstance(rollouts_per_prompt, int):
+            raise ValueError('rollouts_per_prompt override must be a positive integer.')
         rollouts_per_batch = int(evaluation.get("rollouts_per_batch", 64))
         if rollouts_per_prompt < 1 or rollouts_per_batch < 1:
             raise ValueError("actor.evaluation rollout counts must be positive.")

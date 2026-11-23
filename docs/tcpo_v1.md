@@ -48,6 +48,15 @@ bash scripts/start_train.sh --no-tmux configs/training/tcpo_v1/qwen3_1p7b_100ste
 
 如需指定 Python，可另设 `FRUGALOPL_PYTHON`。本地双卡验证使用 `--tmux` 和 `tests/configs/` 下的小规模配置。
 
+当前双卡长期实验按用户指定，中间评测使用 Avg@8，第 100 步使用 Avg@16，生成上限仍为 20480。可在 `actor.evaluation` 下设置：
+
+```yaml
+rollouts_per_prompt: 8
+final_rollouts_per_prompt: 16
+```
+
+`final_rollouts_per_prompt` 仅在达到 `controller.max_steps` 的最终评测时生效，Actor 按该次请求采样，结果记录实际的 `avg_at_8` 或 `avg_at_16`。不设置该选项则各次评测均使用 `rollouts_per_prompt`；八卡正式配置仍全程 Avg@16。双卡此前已经完成的 Avg@16 结果保留，第 50 步起中间评测改用 Avg@8。
+
 ## 自适应权重与保存
 
 `run.tcpo_v1_tuning.enabled: true` 启用与当前实验相同的调权规则。每轮从同一 seed=42 的初始模型重新开始；权重改变后不接着优化上一轮的 LoRA。
@@ -61,6 +70,6 @@ bash scripts/start_train.sh --no-tmux configs/training/tcpo_v1/qwen3_1p7b_100ste
 
 `outputs/<run.name>_campaign/manifest.json` 保存每轮配置、权重、评测及决策。各轮 `checkpoints/step_0/adapter_lora` 保留初始 LoRA，`eval_adapters/step_10` 至 `step_100` 保存评测 LoRA；原始回复与分批评测缓存保留。每轮退出且 Worker 已关闭后，删除该轮不再使用的 optimizer 临时检查点。
 
-双卡 4090 已完成两轮真实验证，每轮 1 步、4 题 × 2 个回复，覆盖正确、错误和截断三个分支。测试完成双卡并行评测、CUDA Graph、40960 上下文窗口与 32768 生成上限，并验证了截断权重从 1 减半到 0.5 后以相同初始 LoRA 重启、仅首轮评测基线、两轮使用不同 SwanLab 实验及清理 optimizer 检查点。验证采用 2 道短 AIME24 题，回复约 600 tokens；32K 是配置上限。另有 49 项 CPU 检查通过，包括新旧目标逐参数一致和八卡配置协议检查。
+双卡 4090 已完成两轮真实验证，每轮 1 步、4 题 × 2 个回复，覆盖正确、错误和截断三个分支。测试完成双卡并行评测、CUDA Graph、40960 上下文窗口与 32768 生成上限，并验证了截断权重从 1 减半到 0.5 后以相同初始 LoRA 重启、仅首轮评测基线、两轮使用不同 SwanLab 实验及清理 optimizer 检查点。验证采用 2 道短 AIME24 题，回复约 600 tokens；32K 是配置上限。另有 57 项 CPU 检查通过，包括新旧目标逐参数一致、八卡配置协议检查及中间/最终评测采样数切换。额外的双卡 2 步测试在初始、第 1 步、第 2 步分别实际生成 2、2、4 条评测回复，验证最终评测自动增加采样数，三个评测点均由两个 Actor 共同完成。
 
 八卡 80 GB 配置由用户运行，尚无八卡硬件实测结果。
