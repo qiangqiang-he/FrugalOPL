@@ -1,4 +1,5 @@
-extends: ../../common/tcpo_v1_8GPU.yaml
+# Historical zero-correct / Teacher-on-cut objective, retained for reproduction.
+extends: ../../common/tcdo_legacy_8GPU.yaml
 run:
   name: tcpo_v1_qwen3_1p7b_100steps_8gpu
   group: tcpo_v1-qwen3-1p7b-8gpu

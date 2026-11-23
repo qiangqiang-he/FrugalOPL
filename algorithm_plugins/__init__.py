@@ -19,6 +19,7 @@ from .self_shot_opsd_plugin import SelfShotOPSDPlugin
 from .ratio_opsd_plugin import RatioOPSDPlugin
 from .tcdo_plugin import TCDOPlugin
 from .tcpo_v1_plugin import TCPOV1Plugin
+from .tca_plugin import TCAPlugin
 from .tail_sup_plugin import TailSupPlugin
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "RatioOPSDPlugin",
     "TCDOPlugin",
     "TCPOV1Plugin",
+    "TCAPlugin",
     "TailSupPlugin",
     "plugin_class_from_name",
     "plugin_factory_from_config",

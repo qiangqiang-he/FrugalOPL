@@ -1,0 +1,11 @@
+extends: ../../common/tcpo_v1_8GPU.yaml
+run:
+  name: tcpo_v1_qwen3_4b_200steps_8gpu_b16n16
+  group: tcpo_v1-qwen3-4b-8gpu
+  redis:
+    key_prefix: tcpo_v1_qwen3_4b_8gpu
+  policy:
+    model_name_or_path: Qwen/Qwen3-4B
+actor:
+  engine:
+    gpu_memory_utilization: 0.80

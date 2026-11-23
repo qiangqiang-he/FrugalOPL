@@ -38,6 +38,8 @@ def run_campaign(config: Mapping, *, run_trial: Callable[[dict], object]) -> dic
         raise ValueError('run.tcpo_v1_tuning.max_trials must be a positive integer.')
     if base['algorithm']['plugin'] not in {'TCPOV1Plugin', 'TCDOPlugin'}:
         raise ValueError('TCPO_v1 tuning requires TCPOV1Plugin.')
+    if base['algorithm'].get('tcpo_objective_version') == 2:
+        raise ValueError('Legacy automatic weight tuning does not apply to new TCPO_v1; disable tcpo_v1_tuning.')
     name = base['run']['name']
     if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
         raise ValueError('A TCPO_v1 campaign name must be one safe path component.')

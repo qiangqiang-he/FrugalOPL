@@ -1,4 +1,4 @@
-# 8 x 80 GB. All eight Actors generate, then all eight Learners optimize.
+# TCPO_v1, 8 x 80 GB. One synchronous batch, all Actors then all Learners.
 eval_interval: 10
 save_ckpt_interval: 0
 save_question_accuracy: true
@@ -7,8 +7,7 @@ run:
   group: tcpo_v1
   seed: 42
   tcpo_v1_tuning:
-    enabled: true
-    max_trials: 6
+    enabled: false
   prompts:
     train: KL_OPSD_STUDENT_PROMPT
     evaluation: KL_OPSD_STUDENT_PROMPT
@@ -55,24 +54,21 @@ pipeline:
     cpu_offload: false
 controller:
   max_inflight_batches: 1
-  max_steps: 100
-  train_prompt_batch_size: 32
+  max_steps: 200
+  train_prompt_batch_size: 16
   queue_poll_timeout_sec: 1
   data:
     train:
       name: openthoughts_math30k
       path: data/openthoughts_math30k.json
     eval:
+      - name: amc23
+        path: data/AMC-2023.json
       - name: aime24
         path: data/AIME-2024.json
     max_prompt_length: 8192
     max_response_length: 8192
-  evaluation_stop:
-    dataset: aime24
-    metric: truncation_rate
-    above: 0.5
-    min_step: 10
-    allow_partial_lower_bound: true
+  evaluation_stop: null
 actor:
   gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
   engine:
@@ -141,13 +137,15 @@ algorithm:
   kl_temperature: 1.0
   kl_token_clip: null
   kl_chunk_size: 64
-  tcdo_plausible_fraction: 0.01
-  tcdo_incorrect_weight: 1.0
-  tcdo_truncated_weight: 1.0
+  tcpo_objective_version: 2
+  tcpo_plausible_fraction: 0.01
+  tcpo_alpha_plus: 0.25
+  tcpo_alpha_minus: 1.0
+  tcpo_alpha_tru: 1.0
   training_sampling:
     temperature: 1.0
     top_p: 1.0
     top_k: -1
     max_tokens: 8192
-    n: 8
+    n: 16
     seed: 42

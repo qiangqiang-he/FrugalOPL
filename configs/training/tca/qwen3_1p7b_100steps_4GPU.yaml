@@ -1,0 +1,8 @@
+extends: ../../common/tca_4GPU.yaml
+run:
+  name: tca_qwen3_1p7b_100steps_4gpu_b16n16
+  group: tca-qwen3-1p7b-4gpu
+  redis:
+    key_prefix: tca_qwen3_1p7b_4gpu
+  policy:
+    model_name_or_path: Qwen/Qwen3-1.7B

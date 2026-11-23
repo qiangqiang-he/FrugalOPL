@@ -1,0 +1,11 @@
+extends: ../../common/tca_4GPU.yaml
+run:
+  name: tca_qwen3_4b_100steps_4gpu_b16n16
+  group: tca-qwen3-4b-4gpu
+  redis:
+    key_prefix: tca_qwen3_4b_4gpu
+  policy:
+    model_name_or_path: Qwen/Qwen3-4B
+actor:
+  engine:
+    gpu_memory_utilization: 0.80
