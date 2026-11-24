@@ -113,7 +113,6 @@ learner:
     master_port: 29683
     timeout_sec: 3600
   execution:
-    forward_chunk_size: 64
     gradient_checkpointing: true
     clip_grad_norm: 0.1
   optimizer:
@@ -128,6 +127,7 @@ learner:
     save_initial: true
     max_keep: 1
 algorithm:
+  kl_top_k: 512
   plugin: TCAPlugin
   algo_name: TCA
   loss_aggregation: token
@@ -136,7 +136,6 @@ algorithm:
   teacher_sync_interval: -1
   kl_temperature: 1.0
   kl_token_clip: null
-  kl_chunk_size: 64
   tca_plausible_fraction: 0.01
   training_sampling:
     temperature: 1.0

@@ -69,7 +69,6 @@ learner:
     master_addr: 127.0.0.1
     master_port: 29684
   execution:
-    forward_chunk_size: 512
     gradient_checkpointing: true
     clip_grad_norm: 0.05
   optimizer:

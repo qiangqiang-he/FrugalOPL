@@ -176,6 +176,7 @@ class Controller:
 
         self.run_name, self.redis_prefix = self._run_name_and_redis()
         self.max_steps = _positive_int(self.controller_cfg.get("max_steps"), "controller.max_steps")
+        self.rado_enabled = self.config.get('algorithm', {}).get('plugin') == 'RADOPlugin'
         self.train_prompt_batch_size = _positive_int(
             self.controller_cfg.get("train_prompt_batch_size"),
             "controller.train_prompt_batch_size",
@@ -187,6 +188,8 @@ class Controller:
             self.controller_cfg.get("max_inflight_batches", 1),
             "controller.max_inflight_batches",
         )
+        if self.rado_enabled and self.max_inflight_batches != 1:
+            raise ValueError('RADO rollout reuse requires a single synchronous in-flight batch.')
 
         self.scheduling = resolve_scheduling(self.config)
         self.actor_max_batches_per_turn = self.scheduling.actor_batches_per_wave
@@ -386,7 +389,8 @@ class Controller:
         if saved_state is not None:
             state = _mapping(saved_state, "saved resume_state")
             confirmed_sequence = _positive_int(
-                state.get("confirmed_batch_sequence", completed), "saved confirmed_batch_sequence", minimum=completed,
+                state.get("confirmed_batch_sequence", completed), "saved confirmed_batch_sequence",
+                minimum=0 if self.rado_enabled else completed,
             )
             if (
                 state.get("train_dataset_sha256") != self._train_dataset_digest
@@ -414,7 +418,8 @@ class Controller:
                 or self.train_candidate_count != self.train_prompt_batch_size
             ):
                 raise RuntimeError("Legacy training data configuration changed; cannot reconstruct its cursor safely.")
-        if len(set(sequences)) != len(sequences) or any(sequence > confirmed_sequence for sequence in sequences):
+        if ((not self.rado_enabled and len(set(sequences)) != len(sequences))
+                or any(sequence > confirmed_sequence for sequence in sequences)):
             raise RuntimeError("Saved training requests do not match the confirmed dataset prefix.")
 
         adapter_root = self._lora_adapter_root()
@@ -506,7 +511,13 @@ class Controller:
             if path.is_file() and re.fullmatch(r"train-[0-9]+\.json", path.name)
             and int(path.stem.removeprefix("train-")) > confirmed_sequence
         ] if accuracy_root.is_dir() else []
-        if ahead or periodic_ahead or accuracy_orphans:
+        rado_root = self.output_dir / 'rado_batches'
+        rado_orphans = [
+            path for path in rado_root.iterdir()
+            if path.is_dir() and re.fullmatch(r'train-[0-9]+', path.name)
+            and int(path.name.removeprefix('train-')) > confirmed_sequence
+        ] if self.rado_enabled and rado_root.is_dir() else []
+        if ahead or periodic_ahead or accuracy_orphans or rado_orphans:
             archive = self.output_dir / "recovery" / f"unconfirmed-{uuid.uuid4().hex}"
             archive.mkdir(parents=True, exist_ok=False)
             for _step, path in ahead:
@@ -521,9 +532,15 @@ class Controller:
                 accuracy_archive.mkdir()
                 for path in accuracy_orphans:
                     path.rename(accuracy_archive / path.name)
+            if rado_orphans:
+                rado_archive = archive / 'rado_batches'
+                rado_archive.mkdir()
+                for path in rado_orphans:
+                    path.rename(rado_archive / path.name)
             print(
                 f"[Controller] Preserved {len(ahead)} live and {len(periodic_ahead)} periodic "
-                f"unconfirmed checkpoint(s), and {len(accuracy_orphans)} unconfirmed question-accuracy file(s) under {archive}.",
+                f"unconfirmed checkpoint(s), {len(accuracy_orphans)} unconfirmed question-accuracy file(s), "
+                f"and {len(rado_orphans)} unconfirmed RADO audit batch(es) under {archive}.",
                 flush=True,
             )
         self.train_history = copy.deepcopy(history)
@@ -1244,6 +1261,26 @@ class Controller:
         }
         write_json(self.output_dir / "training_summary.json", _json_number(summary))
 
+    def _log_rado_batch(self, result, *, step):
+        decisions = result.get('rado_decisions', [])
+        for decision in decisions:
+            values = {f'decision/{key}': value for key, value in decision.items()
+                      if isinstance(value, (int, float))}
+            values['decision/optimizer_step'] = decision['optimizer_step_before']
+            self._swanlab.log_components({'algorithm': values}, step=step)
+        if decisions:
+            chosen = next((d for d in decisions if d['eta'] != 0), decisions[0])
+            self._swanlab.log_components({'algorithm': {
+                'batch/index': chosen['batch_index'], 'batch/eta': chosen['eta'],
+                'batch/eta_positive': int(chosen['eta'] > 0),
+                'batch/eta_negative': int(chosen['eta'] < 0),
+                'batch/no_update': int(result['optimizer_steps'] == 0),
+                'batch/optimizer_updates': result['optimizer_steps'],
+                'batch/optimizer_step': step,
+                'batch/g_hat_initial': decisions[0]['g_hat'],
+                'batch/ess_fraction_initial': decisions[0]['ess_fraction'],
+            }}, step=step)
+
     def _log_completed_training_batch(
         self,
         history_item: Mapping[str, object],
@@ -1635,6 +1672,18 @@ class Controller:
                 while self._confirmed_batch_sequence + 1 in acknowledged:
                     self._confirmed_batch_sequence += 1
                     acknowledged.remove(self._confirmed_batch_sequence)
+                rado_prefix = []
+                if self.rado_enabled:
+                    update_results = result.get('update_results')
+                    if not isinstance(update_results, list) or len(update_results) != result.get('optimizer_steps'):
+                        raise RuntimeError('Invalid RADO per-update result envelope.')
+                    if len(update_results) > 4 or completed_steps + len(update_results) > next_boundary:
+                        raise RuntimeError('RADO reuse crossed an optimizer/evaluation boundary.')
+                    for offset, update in enumerate(update_results, start=1):
+                        if update.get('global_step') != completed_steps + offset or update.get('optimizer_steps') != 1:
+                            raise RuntimeError('RADO updates are not consecutive real optimizer steps.')
+                    rado_prefix = update_results[:-1]
+                    completed_steps += len(rado_prefix)
                 skipped = result.get("logical_steps", result.get("optimizer_steps", 1)) == 0
                 accuracy_rows = None
                 if self.save_question_accuracy:
@@ -1668,9 +1717,26 @@ class Controller:
                     # durable history, allowing its replay to write new means.
                     write_json(self.output_dir / "question_accuracy" / f"{batch_id}.json", accuracy_rows)
                 if skipped:
-                    print(f"[Controller] Skipped {batch_id}: no training rollouts survived filtering.", flush=True)
+                    print(f"[Controller] Skipped {batch_id}: no accepted optimizer update.", flush=True)
                     self._write_progress(started=started, completed_steps=completed_steps)
+                    if self.rado_enabled:
+                        self._log_rado_batch(result, step=completed_steps)
                     continue
+                prefix_history = []
+                for update in rado_prefix:
+                    item = {
+                        'completed_step': update['global_step'], 'policy_version': update['global_step'],
+                        'batch_id': batch_id, 'dispatch': copy.deepcopy(pending_info),
+                        'training_elapsed_seconds': self._training_elapsed_seconds,
+                        'metrics': update.get('metrics', {}),
+                        'algorithm_metrics': update.get('algorithm_metrics', {}),
+                        'learner_metrics': update.get('learner_metrics', {}), 'timing': {},
+                    }
+                    if 'actor_metrics' in result:
+                        item['actor_metrics'] = result['actor_metrics']
+                    self.train_history.append(item)
+                    item['controller_metrics'] = self._global_progress_metrics(item, elapsed_seconds=time.time()-started)
+                    prefix_history.append(item)
                 history_item = {
                     "completed_step": completed_steps,
                     "batch_id": batch_id,
@@ -1718,10 +1784,14 @@ class Controller:
                 # Commit the result before external telemetry. A crash must
                 # not leave an already logged step ahead of durable history.
                 self._write_progress(started=started, completed_steps=completed_steps)
+                for item in prefix_history:
+                    self._log_completed_training_batch(item, started=started)
                 self._log_completed_training_batch(
                     history_item,
                     started=started,
                 )
+                if self.rado_enabled:
+                    self._log_rado_batch(result, step=completed_steps)
 
                 if self.scheduling.shared and not pending:
                     self._wait_for_round_release(actor_manager, learner_manager, teacher_manager)

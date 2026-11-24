@@ -1,9 +1,10 @@
-"""Full-vocabulary OCSD loss and probability transfer at temperature one."""
+"""Student-top-k OCSD loss and probability transfer at temperature one."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from utils.topk_kl import DEFAULT_KL_TOP_K, student_topk_logits
 
 
 def validate_ocsd_parameters(gamma: object, tau: object) -> tuple[float, float]:
@@ -21,18 +22,20 @@ def ocsd_token_values(
     gamma_pos: float,
     gamma_neg: float,
     tau: float,
+    top_k: int = DEFAULT_KL_TOP_K,
 ) -> dict[str, torch.Tensor]:
-    """Return token KL and detached diagnostics for a chunk of response positions.
+    """Return token KL and detached diagnostics for the whole response.
 
     Logits are [batch, tokens, vocab], sampled_ids are [batch, tokens], and
     correct is one boolean per rollout. The two KL sides share one forward.
     The batch-level coefficients are fixed throughout the optimizer update.
     """
+    sampled_logits = logits.detach().gather(-1, sampled_ids.unsqueeze(-1))
+    logits, _ = student_topk_logits(logits, top_k=top_k)
     dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
     logp = F.log_softmax(logits, dim=-1, dtype=dtype)
     with torch.no_grad():
         detached_logits = logits.detach()
-        sampled_logits = detached_logits.gather(-1, sampled_ids.unsqueeze(-1))
         # Softmax preserves order. Using logits preserves that order even when
         # very small probabilities underflow to zero.
         head = detached_logits >= sampled_logits

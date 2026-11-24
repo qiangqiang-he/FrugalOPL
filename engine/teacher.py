@@ -157,10 +157,7 @@ class Teacher:
             raise ValueError(
                 "teacher.forward.micro_batch_size has been removed; Teacher always forwards one rollout at a time."
             )
-        self.forward_chunk_size = int(self.forward_cfg.get("chunk_size", 512))
         self.max_batches_per_turn = int(self.forward_cfg.get("max_batches_per_turn", 1))
-        if self.forward_chunk_size < 1:
-            raise ValueError("teacher.forward.chunk_size must be positive.")
         if self.max_batches_per_turn < 1:
             raise ValueError("teacher.forward.max_batches_per_turn must be positive.")
         self.max_sequence_length = int(self.teacher_cfg.get("max_sequence_length", 0))
@@ -542,44 +539,10 @@ class Teacher:
         response_ids: torch.Tensor,
         required: Mapping[str, object],
     ) -> Signals:
-        """Select sampled-token logprobs and optional top-k without full-L logits."""
-
-        want_logprobs = bool(required.get("response_logprobs", True))
-        want_entropy = bool(required.get("response_entropy", False))
-        topk_cfg = _mapping(required.get("topk", {}), "return_signals.topk")
-        want_topk = bool(topk_cfg.get("enabled", False))
-        top_k = int(topk_cfg.get("top_k", 0) or 0)
-        if want_topk and top_k <= 0:
-            raise ValueError("return_signals.topk.top_k must be positive when enabled.")
-
-        outputs: dict[str, list[torch.Tensor]] = {
-            "response_logprobs": [],
-            "response_entropy": [],
-            "topk_token_ids": [],
-            "topk_logprobs": [],
-        }
-        lm_head = self._lm_head(module)
-        length = int(response_ids.size(1))
-        for start in range(0, length, self.forward_chunk_size):
-            end = min(start + self.forward_chunk_size, length)
-            hidden_chunk = response_hidden[:, start:end, :]
-            ids_chunk = response_ids[:, start:end]
-            logits = lm_head(hidden_chunk)
-            float_logits = logits.float()
-            normalization = torch.logsumexp(float_logits, dim=-1)
-            if want_logprobs:
-                selected = float_logits.gather(-1, ids_chunk.unsqueeze(-1)).squeeze(-1) - normalization
-                outputs["response_logprobs"].append(selected)
-            if want_entropy:
-                log_probs = float_logits - normalization.unsqueeze(-1)
-                probabilities = torch.exp(log_probs)
-                entropy = -(probabilities * log_probs).sum(dim=-1)
-                outputs["response_entropy"].append(entropy)
-            if want_topk:
-                values, token_ids = torch.topk(float_logits - normalization.unsqueeze(-1), k=top_k, dim=-1)
-                outputs["topk_token_ids"].append(token_ids.to(dtype=torch.int32))
-                outputs["topk_logprobs"].append(values)
-        return {key: torch.cat(chunks, dim=1) for key, chunks in outputs.items() if chunks}
+        """Select statistics for the complete response in one head call."""
+        from utils.topk_kl import response_token_statistics
+        return response_token_statistics(self._lm_head(module), response_hidden, response_ids,
+            required, kl_top_k=self.config.get("algorithm", {}).get("kl_top_k", 512))
 
     def process_training_batch(self, signals: Mapping[str, object]) -> Signals:
         """Run the Teacher plugin hook and preserve every upstream signal.

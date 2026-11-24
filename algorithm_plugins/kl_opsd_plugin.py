@@ -1,4 +1,4 @@
-"""On-policy self-distillation using the official full-vocabulary Forward KL."""
+"""On-policy self-distillation using Student-top-k Forward KL."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import torch
 from utils.algorithm_runtime import AlgorithmRuntimeConfig, ChatTemplateTokenizer, apply_generation_chat_template
 from utils.prompts import KL_OPSD_TEACHER_PROMPT, render_prompt_from_record
 from utils.tensor_signals import masked_token_mean
+from utils.topk_kl import validate_kl_top_k
 
 from .algorithm_base import ObjectiveResult, Signals
 from .pg_opsd_plugin import PGOPSDPlugin
@@ -21,8 +22,8 @@ class KLOPSDPlugin(PGOPSDPlugin):
     """Match a frozen, solution-conditioned Teacher on Student trajectories.
 
     Only prompt construction/validation is shared with PG-OPSD. There are no
-    advantages, rewards, sampled-token KL estimates, or top-k approximations
-    in this objective. Reference logits are computed locally during each
+    advantages, rewards, or sampled-token KL estimates in this objective.
+    Both distributions normalize over Student top-k. Reference logits run in each
     Learner objective, with LoRA disabled and without Teacher gradients.
     """
 
@@ -35,10 +36,7 @@ class KLOPSDPlugin(PGOPSDPlugin):
         )
         clip = runtime.algorithm.get("kl_token_clip", 1.0e-7)
         self._kl_token_clip = None if clip is None else self._positive_number(clip, "kl_token_clip")
-        chunk_size = runtime.algorithm.get("kl_chunk_size", 128)
-        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
-            raise ValueError("KL-OPSD kl_chunk_size must be a positive integer.")
-        self._kl_chunk_size = chunk_size
+        self._kl_top_k = validate_kl_top_k(runtime.algorithm.get("kl_top_k", 512))
 
     @staticmethod
     def _positive_number(value: object, name: str) -> float:
@@ -59,6 +57,11 @@ class KLOPSDPlugin(PGOPSDPlugin):
     def collect_teacher_signals(self, signals: Signals) -> Signals:
         del signals
         raise RuntimeError("KL-OPSD uses the Learner's frozen reference; omit separate Teacher nodes.")
+
+    def collect_actor_signals(self, signals: Signals) -> Signals:
+        request = super().collect_actor_signals(signals)
+        request["return_signals"] = {**request["return_signals"], "response_truncated": True}
+        return request
 
     def collect_learner_signals(self, signals: Signals) -> Signals:
         records = self._training_records(signals)
@@ -89,7 +92,7 @@ class KLOPSDPlugin(PGOPSDPlugin):
     def compute_objective(self, batch: Signals) -> ObjectiveResult:
         values = self.compute_forward_kl(
             batch, teacher_prompts=batch.get("teacher_prompts"),
-            temperature=self._kl_temperature, token_clip=self._kl_token_clip, chunk_size=self._kl_chunk_size,
+            temperature=self._kl_temperature, token_clip=self._kl_token_clip,
         )
         mask = batch.get("response_mask")
         if not isinstance(mask, torch.Tensor):
@@ -103,6 +106,8 @@ class KLOPSDPlugin(PGOPSDPlugin):
                 "kl_opsd_loss": loss.detach(),
                 "kl_opsd_unclipped_kl": masked_token_mean(values["response_forward_kl_unclipped"], mask).detach(),
                 "kl_opsd_clip_fraction": masked_token_mean(values["response_forward_kl_clipped_fraction"], mask).detach(),
+                "student_entropy_nats": masked_token_mean(values["response_student_entropy_nats"], mask).detach(),
+                "teacher_entropy_nats": masked_token_mean(values["response_teacher_entropy_nats"], mask).detach(),
             },
             valid_token_count=mask.sum().detach(),
         )
@@ -114,6 +119,8 @@ class KLOPSDPlugin(PGOPSDPlugin):
             "temperature": self._kl_temperature,
             "token_clip": self._kl_token_clip,
             "loss_aggregation": "token",
+            "distribution_support": "student_top_k",
+            "kl_top_k": self._kl_top_k,
         }
 
     def load_training_state_dict(self, state: Mapping[str, object], *, step: int) -> None:

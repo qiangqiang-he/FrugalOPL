@@ -77,7 +77,6 @@ learner:
   distributed:
     master_port: 29749
   execution:
-    forward_chunk_size: 128
     gradient_checkpointing: true
     clip_grad_norm: 0.1
   optimizer:
@@ -98,4 +97,3 @@ algorithm:
     n: 1
   kl_temperature: 1.1
   kl_token_clip: 1.0e-7
-  kl_chunk_size: 128

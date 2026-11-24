@@ -21,6 +21,7 @@ from .tcdo_plugin import TCDOPlugin
 from .tcpo_v1_plugin import TCPOV1Plugin
 from .tca_plugin import TCAPlugin
 from .tail_sup_plugin import TailSupPlugin
+from .rado_plugin import RADOPlugin
 
 __all__ = [
     "ActorTestPlugin",
@@ -41,6 +42,7 @@ __all__ = [
     "TCPOV1Plugin",
     "TCAPlugin",
     "TailSupPlugin",
+    "RADOPlugin",
     "plugin_class_from_name",
     "plugin_factory_from_config",
     "plugin_factory_from_name",

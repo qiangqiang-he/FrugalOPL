@@ -68,8 +68,7 @@ class TCDOPlugin(SelfShotOPSDPlugin):
             weight = 0.0
         else:
             values = self.compute_tcdo(batch, teacher_prompts=batch["teacher_prompts"], state=state,
-                                       temperature=self._kl_temperature, plausible_fraction=self.fraction,
-                                       chunk_size=self._kl_chunk_size)
+                                       temperature=self._kl_temperature, plausible_fraction=self.fraction)
             weight = self.incorrect_weight if state == INCORRECT else self.truncated_weight
             loss = masked_token_mean(values["tcdo_kl_loss"], mask) * weight
             metrics = {name: masked_token_mean(value, mask).detach() for name, value in values.items()}

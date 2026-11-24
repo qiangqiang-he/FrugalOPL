@@ -15,7 +15,7 @@ from .self_shot_opsd_plugin import SelfShotOPSDPlugin
 
 @register_plugin_class
 class RatioOPSDPlugin(SelfShotOPSDPlugin):
-    """Ordinary full-vocabulary KL with no CLIP, reward or prefix weight."""
+    """Student-top-k KL with no CLIP, reward or prefix weight."""
 
     def __init__(self, *, tokenizer, runtime):
         super().__init__(tokenizer=tokenizer, runtime=runtime)
@@ -40,7 +40,6 @@ class RatioOPSDPlugin(SelfShotOPSDPlugin):
         values = self.compute_ratio_kl(
             batch, teacher_prompts=batch.get("teacher_prompts"),
             temperature=self._kl_temperature, plausible_fraction=self._plausible_fraction,
-            chunk_size=self._kl_chunk_size,
         )
         mask = batch["response_mask"].bool()
         loss = masked_token_mean(values["ratio_kl_loss"], mask)

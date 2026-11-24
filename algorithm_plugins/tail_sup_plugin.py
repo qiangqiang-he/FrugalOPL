@@ -1,4 +1,4 @@
-"""On-policy full-vocabulary tail suppression, without rewards or a teacher."""
+"""On-policy Student-top-k tail suppression, without rewards or a teacher."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from utils.algorithm_runtime import (
 from utils.prompts import render_prompt
 from utils.tail_suppression import validate_tail_sup_parameters
 from utils.tensor_signals import masked_token_mean
+from utils.topk_kl import validate_kl_top_k
 
 from .algorithm_base import AlgorithmPlugin, ObjectiveResult, Signals
 from .plugin_registry import register_plugin_class
@@ -39,9 +40,7 @@ class TailSupPlugin(AlgorithmPlugin):
             runtime.algorithm.get("tail_sup_top_p", 0.99),
             runtime.algorithm.get("tail_sup_temperature", 1.0),
         )
-        self._chunk_size = runtime.algorithm.get("tail_sup_chunk_size", 32)
-        if type(self._chunk_size) is not int or self._chunk_size < 1:
-            raise ValueError("tail_sup_chunk_size must be a positive integer.")
+        self._kl_top_k = validate_kl_top_k(runtime.algorithm.get("kl_top_k", 512))
 
     @classmethod
     def from_runtime_config(cls, tokenizer: object, runtime: AlgorithmRuntimeConfig) -> "TailSupPlugin":
@@ -73,7 +72,7 @@ class TailSupPlugin(AlgorithmPlugin):
 
     def compute_objective(self, batch: Signals) -> ObjectiveResult:
         values = self.compute_tail_suppression(
-            batch, top_p=self._top_p, temperature=self._temperature, chunk_size=self._chunk_size,
+            batch, top_p=self._top_p, temperature=self._temperature,
         )
         response_mask = batch.get("response_mask")
         if not isinstance(response_mask, torch.Tensor):
@@ -92,7 +91,8 @@ class TailSupPlugin(AlgorithmPlugin):
     def training_state_dict(self) -> dict[str, object]:
         return {"version": 1, "algorithm": "tail_sup", "top_p": self._top_p,
                 "temperature": self._temperature, "loss_aggregation": "token",
-                "target_policy": "rollout_policy_version", "skip_rule": "max_probability > top_p"}
+                "target_policy": "rollout_policy_version", "skip_rule": "max_probability > top_p",
+                "distribution_support": "student_top_k", "kl_top_k": self._kl_top_k}
 
     def load_training_state_dict(self, state: Mapping[str, object], *, step: int) -> None:
         if not isinstance(state, Mapping):

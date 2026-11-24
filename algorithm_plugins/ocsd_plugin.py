@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 
 import torch
 
@@ -14,6 +15,7 @@ from utils.answer_verifier import verify_response_answers
 from utils.ocsd import validate_ocsd_parameters
 from utils.prompts import render_prompt
 from utils.tensor_signals import masked_token_mean, require_tensor_batch_field
+from utils.topk_kl import validate_kl_top_k
 
 from .algorithm_base import AlgorithmPlugin, ObjectiveResult, Signals
 from .plugin_registry import register_plugin_class
@@ -26,6 +28,7 @@ class OCSDPlugin(AlgorithmPlugin):
         self._train_template = require_train_template(runtime)
         self._sampling = require_training_sampling(runtime)
         self._enable_thinking = runtime.enable_thinking
+        self._kl_top_k = validate_kl_top_k(runtime.algorithm.get("kl_top_k", 512))
         if runtime.algorithm.get("loss_aggregation") != "token":
             raise ValueError("OCSD requires algorithm.loss_aggregation='token'.")
         if self._sampling.get("temperature", 1.0) != 1.0:
@@ -102,6 +105,19 @@ class OCSDPlugin(AlgorithmPlugin):
             metrics=metrics,
             valid_token_count=mask.sum().detach(),
         )
+
+    def training_state_dict(self):
+        return {"version": 1, "algorithm": "OCSD", "distribution_support": "student_top_k",
+                "kl_top_k": self._kl_top_k, "gamma_pos": self._gamma_pos, "tau": self._tau}
+
+    def load_training_state_dict(self, state, *, step):
+        if not state and step == 0:
+            return
+        expected = self.training_state_dict()
+        if not isinstance(state, Mapping) or set(state) != set(expected) or any(
+            type(state[key]) is not type(value) or state[key] != value for key, value in expected.items()
+        ):
+            raise ValueError("OCSD checkpoint objective settings do not match this run.")
 
 
 __all__ = ["OCSDPlugin"]

@@ -16,8 +16,8 @@ dictionaries and call worker-local helpers inherited from
     It returns token-aligned signals, never full-vocabulary logits.
 
 ``self.compute_forward_kl(batch, teacher_prompts=...)``
-    Computes full-vocabulary frozen-Teacher-to-Student KL inside the objective.
-    Token chunks are recomputed during backward; only tokenwise KL leaves the
+    Computes Student-top-k frozen-Teacher-to-Student KL inside the objective.
+    The whole response is recomputed during backward; only tokenwise KL leaves the
     Worker, and Teacher logits are never cached across the logical batch.
 
 No algorithm code receives a Learner, Redis client, rank, CUDA device, or
@@ -490,6 +490,8 @@ class Learner:
         self.policy_cfg = _mapping(self.run_cfg.get("policy"), "run.policy")
         self.learner_cfg = _mapping(self.config.get("learner"), "learner")
         algorithm_cfg = _mapping(self.config.get("algorithm", {}), "algorithm")
+        from utils.topk_kl import validate_kl_top_k
+        validate_kl_top_k(algorithm_cfg.get("kl_top_k", 512))
         self.teacher_sync_interval = resolve_teacher_sync_interval(algorithm_cfg)
         self._teacher_adapter_step = 0
         self.loss_aggregation = algorithm_cfg.get("loss_aggregation", "sequence")
@@ -584,9 +586,6 @@ class Learner:
         # CUDA so reactivation does not migrate that valid CPU metadata.
         self._optimizer_cuda_tensor_ids: set[int] = set()
 
-        self.forward_chunk_size = int(self.execution_cfg.get("forward_chunk_size", 512))
-        if self.forward_chunk_size <= 0:
-            raise ValueError("learner.execution.forward_chunk_size must be positive.")
         self.max_batches_per_turn = self.scheduling_plan.learner_batches_per_turn
         self.clip_grad_norm = float(self.execution_cfg.get("clip_grad_norm", 0.0) or 0.0)
         if not math.isfinite(self.clip_grad_norm) or self.clip_grad_norm < 0:
@@ -605,6 +604,11 @@ class Learner:
         if torch.cuda.is_available():
             return torch.device("cuda", 0)
         return torch.device("cpu")
+
+    @property
+    def kl_top_k(self) -> int:
+        from utils.topk_kl import validate_kl_top_k
+        return validate_kl_top_k(self.config.get("algorithm", {}).get("kl_top_k", 512))
 
     def set_plugin(self, plugin: AlgorithmPlugin) -> None:
         if not isinstance(plugin, AlgorithmPlugin):
@@ -1685,15 +1689,18 @@ class Learner:
         chunk_size: int | None = None,
         _token_scorer: Callable | None = None,
         _score_keys: tuple[str, ...] | None = None,
+        _scoring_only: bool = False,
+        _include_response_ids: bool = False,
+        _teacher_hidden_cache: dict | None = None,
+        _frozen_head_fast_path: bool = True,
     ) -> Signals:
-        """Score one rollout's exact full-vocabulary forward KL on this rank.
+        """Score one whole rollout on Student top-k on this rank.
 
         Unlike collection signals, neither hidden states nor vocabulary
         tensors cross the Worker boundary or enter all_gather_object. The
         Teacher can be recomputed with the same adapter until this logical
-        optimizer step finishes. Each head/KL token chunk is
-        checkpointed as a unit so backward retains O(L * hidden_size), rather
-        than retaining all vocabulary tensors from the complete response.
+        optimizer step finishes. One checkpoint covers the entire head/loss.
+        Legacy chunk_size arguments are accepted but do not split sequences.
         """
 
         from torch.utils.checkpoint import checkpoint
@@ -1704,7 +1711,7 @@ class Learner:
         )
         if not self.lora_enabled:
             raise ValueError("Forward KL requires LoRA to keep its reference Teacher frozen.")
-        if not torch.is_grad_enabled():
+        if not torch.is_grad_enabled() and not _scoring_only:
             raise RuntimeError("Forward KL must run with gradients enabled for the Student objective.")
         module = self._module()
         if not any(callable(getattr(candidate, "disable_adapter", None)) for candidate in (
@@ -1716,20 +1723,37 @@ class Learner:
         response_length = int(student_batch["response_ids"].size(1))
         student_prompt_length = int(student_batch["prompt_ids"].size(1))
         teacher_prompt_length = int(teacher_batch["prompt_ids"].size(1))
-        width = self.forward_chunk_size if chunk_size is None else chunk_size
-        if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
-            raise ValueError("Forward KL requires a positive forward chunk size.")
         head = self._lm_head(module)
         teacher_step = self._forward_kl_teacher_step()
         prior_training = bool(module.training)
         keys = (
             "response_forward_kl", "response_forward_kl_unclipped",
             "response_forward_kl_clipped_fraction",
+            "response_student_entropy_nats", "response_teacher_entropy_nats",
         )
         if _score_keys is not None:
             keys = _score_keys
+        frozen_linear_head = (
+            _frozen_head_fast_path and type(head) is torch.nn.Linear
+            and not any(parameter.requires_grad for parameter in head.parameters())
+            and not head._forward_hooks and not head._forward_pre_hooks
+        )
+        if _include_response_ids:
+            self._rado_frozen_head_fast_path = frozen_linear_head
 
-        def score_chunk(student_chunk: torch.Tensor, teacher_chunk: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        def score_sequence(student_chunk: torch.Tensor, teacher_chunk: torch.Tensor,
+                        sampled_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            if frozen_linear_head:
+                # A plain frozen Linear has no adapters, dropout, hooks or
+                # train/eval-dependent behavior. Walking the entire PEFT
+                # module tree for every vocabulary chunk is unnecessary.
+                with torch.no_grad():
+                    teacher_logits = head(teacher_chunk)
+                extra = {"response_ids": sampled_ids} if _include_response_ids else {}
+                values = (_token_scorer or forward_kl_token_values)(
+                    head(student_chunk), teacher_logits, temperature=temperature,
+                    token_clip=token_clip, top_k=self.kl_top_k, **extra)
+                return tuple(values[key] for key in keys)
             # This closure is executed both now and during checkpoint backward.
             # Reapply Teacher context to the head as well: LoRA may target the
             # output head, so reference hidden states alone are insufficient.
@@ -1738,10 +1762,12 @@ class Learner:
                 module.eval()
                 with self._forward_kl_teacher_adapter(module, teacher_step), torch.no_grad():
                     teacher_logits = head(teacher_chunk)
-                module.train()
+                module.train(not _scoring_only)
                 student_logits = head(student_chunk)
+                extra = {"response_ids": sampled_ids} if _include_response_ids else {}
                 values = (_token_scorer or forward_kl_token_values)(
                     student_logits, teacher_logits, temperature=temperature, token_clip=token_clip,
+                    top_k=self.kl_top_k, **extra,
                 )
                 return tuple(values[key] for key in keys)
             finally:
@@ -1750,15 +1776,33 @@ class Learner:
         try:
             self._load_forward_kl_teacher_adapter(module, teacher_step)
             module.eval()
-            with self._forward_kl_teacher_adapter(module, teacher_step), torch.no_grad():
-                teacher_all_hidden = self._forward_hidden(
-                    module, input_ids=teacher_batch["input_ids"],
-                    attention_mask=teacher_batch["attention_mask"], position_ids=teacher_batch["position_ids"],
-                )
-                teacher_hidden = teacher_all_hidden[
-                    :, teacher_prompt_length - 1:teacher_prompt_length - 1 + response_length, :
-                ].detach()
-            module.train()
+            cache_key = None
+            cached = None
+            if _teacher_hidden_cache is not None:
+                if self.teacher_sync_interval != -1:
+                    raise ValueError('Teacher hidden caching requires the frozen base reference.')
+                cache_key = (batch['batch_id'], int(batch['rollout_indices'].item()))
+                cached = _teacher_hidden_cache.get(cache_key)
+            if cached is not None:
+                hidden_cpu, cached_prompt, cached_ids = cached
+                if cached_prompt != prompts[0] or not torch.equal(cached_ids, student_batch['response_ids'].cpu()):
+                    raise RuntimeError('A RADO cache entry was reused for a different Teacher prefix/response.')
+                teacher_hidden = hidden_cpu.to(self.device)
+                self._rado_teacher_cache_hits += 1
+            else:
+                with self._forward_kl_teacher_adapter(module, teacher_step), torch.no_grad():
+                    teacher_all_hidden = self._forward_hidden(
+                        module, input_ids=teacher_batch["input_ids"],
+                        attention_mask=teacher_batch["attention_mask"], position_ids=teacher_batch["position_ids"],
+                    )
+                    teacher_hidden = teacher_all_hidden[
+                        :, teacher_prompt_length - 1:teacher_prompt_length - 1 + response_length, :
+                    ].detach()
+                if _teacher_hidden_cache is not None:
+                    _teacher_hidden_cache[cache_key] = (teacher_hidden.to('cpu', copy=True), prompts[0],
+                                                       student_batch['response_ids'].cpu().clone())
+                    self._rado_teacher_cache_misses += 1
+            module.train(not _scoring_only)
             student_all_hidden = self._forward_hidden(
                 module, input_ids=student_batch["input_ids"],
                 attention_mask=student_batch["attention_mask"], position_ids=student_batch["position_ids"],
@@ -1766,20 +1810,54 @@ class Learner:
             student_hidden = student_all_hidden[
                 :, student_prompt_length - 1:student_prompt_length - 1 + response_length, :
             ]
-            chunks: dict[str, list[torch.Tensor]] = {key: [] for key in keys}
-            for start in range(0, response_length, width):
-                end = min(start + width, response_length)
-                # Slice tensors are explicit arguments, not late-bound loop
-                # variables captured by checkpoint's recomputation closure.
-                values = checkpoint(
-                    score_chunk, student_hidden[:, start:end, :], teacher_hidden[:, start:end, :],
-                    use_reentrant=False,
-                )
-                for key, value in zip(keys, values, strict=True):
-                    chunks[key].append(value if key == keys[0] else value.detach())
-            return {key: torch.cat(values, dim=1) for key, values in chunks.items()}
+            args = (student_hidden, teacher_hidden, student_batch["response_ids"])
+            values = score_sequence(*args) if _scoring_only else checkpoint(
+                score_sequence, *args, use_reentrant=False)
+            return {key: value if key == keys[0] else value.detach()
+                    for key, value in zip(keys, values, strict=True)}
         finally:
             module.train(prior_training)
+
+    def _plugin_compute_rado(self, batch, *, teacher_prompts, eta, scoring_only=False):
+        from utils.rado import RADO_KEYS, rado_token_values
+        def scorer(student, teacher, **kwargs):
+            return rado_token_values(student, teacher, eta=eta, **kwargs)
+        with torch.set_grad_enabled(not scoring_only):
+            return self._plugin_compute_forward_kl(
+                batch, teacher_prompts=teacher_prompts, temperature=1., token_clip=None,
+                _token_scorer=scorer,
+                _score_keys=RADO_KEYS, _scoring_only=scoring_only, _include_response_ids=True,
+                _teacher_hidden_cache=getattr(self, '_rado_teacher_hidden_cache', None),
+                _frozen_head_fast_path=bool(self.execution_cfg.get('rado_frozen_head_fast_path', True)))
+
+    def _plugin_collect_rado(self, batch, *, teacher_prompts):
+        """Gather only sequence sufficient statistics, never vocabulary tensors."""
+        logical = self._normalize_logical_signals(batch)
+        total = int(logical['rollout_count'])
+        local = []
+        with self._bounded_sdpa_context():
+            for index in _balanced_indices(total, self.world_size, self.rank):
+                micro = self._build_rollout_micro_batch(logical, index)
+                values = self._plugin_compute_rado(micro,
+                    teacher_prompts=[teacher_prompts[index]], eta=0., scoring_only=True)
+                # Float64 accumulation matters for long trajectory log ratios.
+                local.append((index, {key: float(value.double().sum().cpu())
+                                      for key, value in values.items() if key != 'rado_kl_loss'}))
+        gathered = [None]*self.world_size
+        if _distributed_active():
+            dist.all_gather_object(gathered, local)
+        else:
+            gathered = [local]
+        ordered = [None]*total
+        for rows in gathered:
+            for index, values in rows:
+                if ordered[index] is not None:
+                    raise RuntimeError('Duplicate RADO scoring index.')
+                ordered[index] = values
+        if any(row is None for row in ordered):
+            raise RuntimeError('Missing RADO sequence statistics.')
+        return {key: torch.tensor([row[key] for row in ordered], dtype=torch.float64)
+                for key in ordered[0]}
 
     def _plugin_compute_ratio_kl(
         self, batch: Signals, *, teacher_prompts: Sequence[str], temperature: float,
@@ -1787,8 +1865,9 @@ class Learner:
     ) -> Signals:
         from utils.ratio_kl import RATIO_KEYS, ratio_kl_scores
 
-        def scorer(student, teacher, *, temperature, token_clip):
-            return ratio_kl_scores(student, teacher, temperature=temperature, plausible_fraction=plausible_fraction)
+        def scorer(student, teacher, *, temperature, token_clip, top_k):
+            return ratio_kl_scores(student, teacher, temperature=temperature,
+                                   plausible_fraction=plausible_fraction, top_k=top_k)
 
         return self._plugin_compute_forward_kl(
             batch, teacher_prompts=teacher_prompts, temperature=temperature,
@@ -1798,8 +1877,9 @@ class Learner:
     def _plugin_compute_tcdo(self, batch: Signals, *, teacher_prompts: Sequence[str], state: int,
                              temperature: float, plausible_fraction: float, chunk_size: int | None) -> Signals:
         from utils.tcdo import TCDO_KEYS, tcdo_token_values
-        def scorer(student, teacher, *, temperature, token_clip):
-            return tcdo_token_values(student, teacher, state=state, temperature=temperature, plausible_fraction=plausible_fraction)
+        def scorer(student, teacher, *, temperature, token_clip, top_k):
+            return tcdo_token_values(student, teacher, state=state, temperature=temperature,
+                                     plausible_fraction=plausible_fraction, top_k=top_k)
         return self._plugin_compute_forward_kl(batch, teacher_prompts=teacher_prompts, temperature=temperature,
             token_clip=None, chunk_size=chunk_size, _token_scorer=scorer, _score_keys=TCDO_KEYS)
 
@@ -1810,7 +1890,7 @@ class Learner:
         """Score the exact rollout policy, including a lagged shared-round policy.
 
         An immutable LoRA snapshot supplies the old student's backbone AND
-        output head. Recompute bounded vocabulary chunks during backward;
+        output head. Checkpoint the entire response head/loss during backward;
         never transport/cache full distributions or recompute targets from
         the student's changing parameters.
         """
@@ -1828,9 +1908,6 @@ class Learner:
             raise ValueError("Tail suppression requires LoRA and teacher_sync_interval=1.")
         if not torch.is_grad_enabled():
             raise RuntimeError("Tail suppression requires a differentiable Student objective.")
-        width = self.forward_chunk_size if chunk_size is None else chunk_size
-        if type(width) is not int or width < 1:
-            raise ValueError("Tail suppression chunk_size must be a positive integer.")
         module = self._module()
         prepared = self._prepare_forward_batch(batch, prompts=None, prompt_ids=None)
         length = int(prepared["response_ids"].size(1))
@@ -1850,6 +1927,7 @@ class Learner:
                 module.train()
                 values = tail_suppression_token_values(
                     head(student_chunk), old_logits, top_p=top_p, temperature=temperature,
+                    top_k=self.kl_top_k,
                 )
                 return tuple(values[key] for key in keys)
             finally:
@@ -1869,20 +1947,14 @@ class Learner:
                 module, input_ids=prepared["input_ids"], attention_mask=prepared["attention_mask"],
                 position_ids=prepared["position_ids"],
             )[:, first:first + length, :]
-            chunks: dict[str, list[torch.Tensor]] = {key: [] for key in keys}
-            for start in range(0, length, width):
-                values = checkpoint(
-                    score_chunk, student_hidden[:, start:start + width, :], old_hidden[:, start:start + width, :],
-                    use_reentrant=False,
-                )
-                for key, value in zip(keys, values, strict=True):
-                    chunks[key].append(value if key == "response_tail_sup_kl" else value.detach())
-            return {key: torch.cat(values, dim=1) for key, values in chunks.items()}
+            values = checkpoint(score_chunk, student_hidden, old_hidden, use_reentrant=False)
+            return {key: value if key == "response_tail_sup_kl" else value.detach()
+                    for key, value in zip(keys, values, strict=True)}
         finally:
             module.train(prior_training)
 
     def _plugin_compute_ocsd(self, batch: Signals, *, gamma_pos: float, gamma_neg: float, tau: float) -> Signals:
-        """Compute OCSD from one current-policy forward with bounded LM-head chunks."""
+        """Compute Student-top-k OCSD in one whole-response head/loss call."""
         from torch.utils.checkpoint import checkpoint
 
         from utils.ocsd import ocsd_token_values
@@ -1907,6 +1979,7 @@ class Learner:
             try:
                 return ocsd_token_values(
                     head(hidden), sampled_ids, correct, gamma_pos=gamma_pos, gamma_neg=gamma_neg, tau=tau,
+                    top_k=self.kl_top_k,
                 )
             finally:
                 if restore_eval:
@@ -1919,15 +1992,7 @@ class Learner:
                 module, input_ids=prepared["input_ids"], attention_mask=prepared["attention_mask"],
                 position_ids=prepared["position_ids"],
             )[:, first:first + length, :]
-            width = self.forward_chunk_size
-            chunks = [
-                checkpoint(
-                    score_chunk, hidden[:, start:start + width, :], response_ids[:, start:start + width],
-                    use_reentrant=False,
-                )
-                for start in range(0, length, width)
-            ]
-            return {key: torch.cat([chunk[key] for chunk in chunks], dim=1) for key in chunks[0]}
+            return checkpoint(score_chunk, hidden, response_ids, use_reentrant=False)
         finally:
             module.train(was_training)
 
@@ -2130,54 +2195,10 @@ class Learner:
         response_ids: torch.Tensor,
         required: Mapping[str, object],
     ) -> Signals:
-        """Compute selected response-token statistics in bounded vocab chunks."""
-
-        want_logprobs = bool(required.get("response_logprobs", True))
-        want_entropy = bool(required.get("response_entropy", False))
-        entropy_requires_grad = bool(required.get("entropy_requires_grad", True))
-        topk_cfg = _mapping(required.get("topk", {}), "return_signals.topk")
-        want_topk = bool(topk_cfg.get("enabled", False))
-        top_k = int(topk_cfg.get("top_k", 0) or 0)
-        if want_topk and top_k <= 0:
-            raise ValueError("return_signals.topk.top_k must be positive when enabled.")
-
-        outputs: dict[str, list[torch.Tensor]] = {
-            "response_logprobs": [],
-            "response_entropy": [],
-            "topk_token_ids": [],
-            "topk_logprobs": [],
-        }
-        lm_head = self._lm_head(module)
-        length = int(response_ids.size(1))
-        for start in range(0, length, self.forward_chunk_size):
-            end = min(start + self.forward_chunk_size, length)
-            hidden_chunk = response_hidden[:, start:end, :]
-            ids_chunk = response_ids[:, start:end]
-            logits = lm_head(hidden_chunk)
-            float_logits = logits.float()
-            normalization = torch.logsumexp(float_logits, dim=-1)
-            if want_logprobs:
-                selected = float_logits.gather(-1, ids_chunk.unsqueeze(-1)).squeeze(-1) - normalization
-                outputs["response_logprobs"].append(selected)
-            if want_entropy:
-                # Logging-only entropy shares logits without retaining vocab-sized gradients.
-                with torch.set_grad_enabled(torch.is_grad_enabled() and entropy_requires_grad):
-                    log_probs = float_logits - normalization.unsqueeze(-1)
-                    probabilities = torch.exp(log_probs)
-                    entropy = -(probabilities * log_probs).sum(dim=-1)
-                outputs["response_entropy"].append(entropy)
-                del log_probs, probabilities
-            if want_topk:
-                values, token_ids = torch.topk(float_logits - normalization.unsqueeze(-1), k=top_k, dim=-1)
-                token_ids = token_ids.to(dtype=torch.int32)
-                outputs["topk_token_ids"].append(token_ids)
-                outputs["topk_logprobs"].append(values)
-
-        result: Signals = {}
-        for key, chunks in outputs.items():
-            if chunks:
-                result[key] = torch.cat(chunks, dim=1)
-        return result
+        """Compute whole-response statistics without token chunking."""
+        from utils.topk_kl import response_token_statistics
+        return response_token_statistics(self._lm_head(module), response_hidden, response_ids,
+                                         required, kl_top_k=self.kl_top_k)
 
     def build_micro_batches(self, signals: Mapping[str, object]) -> list[Signals]:
         """Build one unpadded ``[1, sequence_length]`` batch per rollout."""
@@ -2371,6 +2392,8 @@ class Learner:
                 rollout_count=0, question_accuracies=question_accuracies,
             )
         logical = self._normalize_logical_signals(prepared)
+        if getattr(self.plugin, 'max_updates', None) is not None and type(self.plugin).__name__ == 'RADOPlugin':
+            return self._process_rado_training_batch(logical, question_accuracies=question_accuracies)
         with _learner_plugin_scope(self, phase="collect"):
             additions = getattr(self.plugin, self.plugin_hook)(copy.deepcopy(logical))
         if not isinstance(additions, Mapping):
@@ -2393,6 +2416,76 @@ class Learner:
             logical, metrics, raw_learner_metrics,
             rollout_count=int(logical["rollout_count"]), question_accuracies=question_accuracies,
         )
+
+    def _process_rado_training_batch(self, logical, *, question_accuracies):
+        use_cache = bool(self.execution_cfg.get('rado_cache_teacher_hidden', True))
+        self._rado_teacher_hidden_cache = {} if use_cache else None
+        self._rado_teacher_cache_hits = self._rado_teacher_cache_misses = 0
+        try:
+            return self._process_rado_training_batch_impl(logical, question_accuracies=question_accuracies)
+        finally:
+            # No old window's activations survive the handoff to Actors.
+            self._rado_teacher_hidden_cache = None
+
+    def _process_rado_training_batch_impl(self, logical, *, question_accuracies):
+        """Reuse one immutable rollout batch, stopping at evaluation boundaries.
+
+        Only real optimizer updates advance global_step. A rejected direction
+        produces a diagnostic result and asks Controller for fresh rollouts.
+        """
+        controller_cfg = self.config.get('controller', {})
+        remaining = int(controller_cfg['max_steps']) - self.global_step
+        interval = self.config.get('eval_interval', 0)
+        if interval:
+            remaining = min(remaining, interval-self.global_step % interval)
+        limit = min(self.plugin.max_updates, remaining)
+        updates, decisions = [], []
+        storage = self.run_cfg.get('storage', {})
+        root = Path(storage.get('output_root', 'outputs')) / self.run_cfg['name'] / 'rado_batches'
+        batch_dir = root / logical['batch_id']
+        if self.rank == 0:
+            batch_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(_deep_cpu_detach(logical), batch_dir/'rollout.pt')
+            # Retain compact audits for all batches; raw trajectories for the
+            # latest two windows suffice for immediate debugging/resumption.
+            older = sorted(root.glob('train-*/rollout.pt'))[:-2]
+            for path in older:
+                path.unlink()
+        for reuse in range(limit):
+            with _learner_plugin_scope(self, phase='collect'):
+                additions = self.plugin.collect_learner_signals(copy.deepcopy(logical))
+            decision = dict(additions['rado_decision'])
+            decision['optimizer_step_before'] = self.global_step
+            decisions.append(decision)
+            if self.rank == 0:
+                audit = {'decision': decision, 'statistics': additions['rado_audit'],
+                         'rewards': additions['rado_rewards'].tolist(),
+                         'log_weights': additions['rado_log_weights'].tolist()}
+                (batch_dir/f'decision_{reuse}.json').write_text(json.dumps(audit, allow_nan=False), encoding='utf-8')
+                print('[RADO] '+json.dumps(decision, allow_nan=False), flush=True)
+            if decision['eta'] == 0:
+                break
+            enriched = {**logical, **additions}
+            # Large batch-only audit lists need not be replicated into each
+            # micro-batch. Keep the scalar direction diagnostics for losses.
+            enriched.pop('rado_audit')
+            metrics, raw = self._train_micro_batches(self.build_micro_batches(enriched))
+            raw['rado_teacher_cache_hits_per_rank'] = self._rado_teacher_cache_hits
+            raw['rado_teacher_cache_misses_per_rank'] = self._rado_teacher_cache_misses
+            raw['rado_frozen_head_fast_path'] = int(getattr(self, '_rado_frozen_head_fast_path', False))
+            if int(raw['optimizer_steps']) != 1:
+                raise RuntimeError('An accepted RADO direction did not produce exactly one optimizer update.')
+            result = self._training_result(logical, metrics, raw,
+                rollout_count=int(logical['rollout_count']), question_accuracies=question_accuracies)
+            updates.append(result)
+        if updates:
+            result = copy.deepcopy(updates[-1])
+        else:
+            result = self._training_result(logical, {}, {'optimizer_steps': 0, 'logical_steps': 0},
+                rollout_count=int(logical['rollout_count']), question_accuracies=question_accuracies)
+        result.update(optimizer_steps=len(updates), logical_steps=len(updates),
+                      update_results=updates, rado_decisions=decisions)
+        return _deep_cpu_detach(result)
 
     def _training_result(
         self,
@@ -2631,6 +2724,7 @@ class Learner:
         learner_metrics: Metrics = {
             "train_rollouts": float(total_rollouts),
             "micro_batches": float(len(micro_batches)),
+            "kl_top_k": float(self.kl_top_k),
             "optimizer_steps": float(did_update),
             "logical_steps": float(advance_step),
             "lr": self._current_lr(),

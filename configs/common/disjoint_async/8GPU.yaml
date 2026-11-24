@@ -45,7 +45,6 @@ worker_defaults:
   Teacher:
     max_sequence_length: 10496
     forward:
-      chunk_size: 512
       max_batches_per_turn: 4
     gpu_ids: [0, 1, 2, 3]
 
@@ -89,7 +88,6 @@ learner:
     master_port: 29573
     timeout_sec: 3600
   execution:
-    forward_chunk_size: 512
     gradient_checkpointing: true
     clip_grad_norm: 0.0
   optimizer:
@@ -103,3 +101,6 @@ learner:
   checkpoint:
     max_keep: 4
   gpu_ids: [4, 5, 6, 7]
+
+algorithm:
+  kl_top_k: 512

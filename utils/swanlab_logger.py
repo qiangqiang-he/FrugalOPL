@@ -168,6 +168,15 @@ class SwanLabLogger:
         self._warned_log_failure = False
         self._output_dir = None if output_dir is None else Path(output_dir).expanduser().resolve()
         self._resume_step = 0
+        # RADO can reject multiple fresh batches at the same optimizer step.
+        # A separate event axis preserves every decision instead of replacing
+        # equal-step SwanLab points. The real optimizer step is always logged.
+        self._event_steps = bool(swanlab_cfg.get('event_steps', False))
+        self._event_step = -1
+        if self._event_steps:
+            event_path = self._local_log_dir().parent / 'swanlab_event_step.json'
+            if event_path.is_file():
+                self._event_step = int(json.loads(event_path.read_text(encoding='utf-8'))['event_step'])
 
     @property
     def started(self) -> bool:
@@ -374,6 +383,15 @@ class SwanLabLogger:
             payload.update(_flatten_numeric_metrics(dict(values), prefix=namespace))
         if not payload:
             return
+        if self._event_steps:
+            payload['controller/optimizer_step'] = step
+            self._event_step += 1
+            event_path = self._local_log_dir().parent / 'swanlab_event_step.json'
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = event_path.with_suffix('.tmp')
+            temporary.write_text(json.dumps({'event_step': self._event_step}), encoding='utf-8')
+            os.replace(temporary, event_path)
+            step = self._event_step
         try:
             self._run.log(payload, step=step)
         except Exception as error:  # Telemetry must not abort a valid optimization step.

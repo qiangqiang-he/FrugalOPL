@@ -275,18 +275,36 @@ checkpoint saving. The fixed solution-conditioned Teacher forward runs inside
 each Learner with LoRA disabled; there is no separate Teacher Worker. The common
 profile supplies the 40 GB per-GPU Actor budget and CUDA Graph execution.
 
-`KLOPSDPlugin` implements the official OPSD full-vocabulary Forward KL with a
+All distribution losses use Student-selected top-k support. Set
+`algorithm.kl_top_k` to a positive integer; the two-, four- and eight-GPU
+profiles default to **512**. Each response position selects its own Student
+top-k IDs. Teacher and Student normalize on these same IDs, and Ratio/TCA
+retain their plausible-support filter inside the selected set. This is a
+conditional top-k objective, distinct from full-vocabulary KL.
+The physical training micro-batch remains **one rollout**. The complete
+response uses one head/loss checkpoint, without token chunking; the old
+`kl_chunk_size`, `tail_sup_chunk_size` and `forward_chunk_size` settings are
+removed from configuration. Model output logits are still needed to find
+exact top-k; FP32 loss distributions and their targets are k-wide. Actual
+sampled-action probabilities used by policy gradients and RADO importance
+weights retain the original sampling normalization, including actions
+outside top-k. Checkpoints record the support and k, and reject mismatched
+objective settings on resume.
+RADO's direction score is centered within the selected support and zero for
+sampled actions outside it, preserving the support's total probability mass.
+
+`KLOPSDPlugin` implements OPSD Forward KL on this top-k support with a
 frozen, solution-conditioned base Teacher. Its separate four-GPU entry point,
 `configs/training/kl_opsd/shared_batched_4GPU.yaml`, follows the authors' 8B
 non-thinking recipe with token reduction and fresh `K=1` sampling. See
 [the KL-OPSD implementation notes](docs/kl_opsd.md) for the pinned upstream
 sources, pointwise clipping semantics, hyperparameters, and local validation.
 
-`TailSupPlugin` (`tail_sup`) implements full-vocabulary tail suppression using
+`TailSupPlugin` (`tail_sup`) implements tail suppression within Student top-k using
 the frozen student policy that generated each rollout. It sorts that policy's
-complete temperature-scaled distribution, includes the token crossing
+conditional temperature-scaled distribution, includes the token crossing
 `algorithm.tail_sup_top_p`, and renormalizes the head into a detached target.
-Forward KL uses the current student's full-vocabulary softmax without KL
+Forward KL uses the current student's conditional top-k softmax without KL
 clipping or a temperature-squared multiplier. Positions whose old maximum
 probability strictly exceeds the head threshold are excluded from both the
 loss and its token denominator. Training uses no teacher, reward, solution or

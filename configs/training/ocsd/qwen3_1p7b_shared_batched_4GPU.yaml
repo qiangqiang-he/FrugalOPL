@@ -55,7 +55,6 @@ actor:
 
 learner:
   execution:
-    forward_chunk_size: 32
 
 algorithm:
   plugin: OCSDPlugin

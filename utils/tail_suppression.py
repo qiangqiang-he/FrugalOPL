@@ -1,4 +1,4 @@
-"""Exact full-vocabulary self-distillation onto the old policy's top-p head."""
+"""Self-distillation onto the old top-p head within Student top-k."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from utils.topk_kl import DEFAULT_KL_TOP_K, student_topk_logits
 
 
 def validate_tail_sup_parameters(top_p: float, temperature: float) -> tuple[float, float]:
@@ -23,14 +24,15 @@ def tail_suppression_token_values(
     *,
     top_p: float = 0.99,
     temperature: float = 1.0,
+    top_k: int = DEFAULT_KL_TOP_K,
 ) -> dict[str, torch.Tensor]:
     """Return exact KL(q_TS || p_student) and detached position diagnostics.
 
     Include the token crossing the cumulative threshold. A position is
     inactive only when its old maximum probability is strictly above top_p.
-    Both softmaxes normalize over the entire vocabulary; there is no clipping
+    Both softmaxes normalize over Student top-k; there is no clipping
     or T-squared multiplier. The target, head and validity mask are detached.
-    Call on checkpointed response chunks to bound vocabulary-sized memory.
+    The runtime checkpoints one whole-response head/loss call.
     """
 
     top_p, temperature = validate_tail_sup_parameters(top_p, temperature)
@@ -42,6 +44,7 @@ def tail_suppression_token_values(
         raise TypeError("Tail suppression logits must be floating point.")
     if student_logits.device != old_logits.device:
         raise ValueError("Tail suppression logits must be on the same device.")
+    student_logits, old_logits = student_topk_logits(student_logits, old_logits, top_k=top_k)
     dtype = torch.float64 if torch.float64 in (student_logits.dtype, old_logits.dtype) else torch.float32
     with torch.no_grad():
         old_logp = F.log_softmax(old_logits.detach().to(dtype=dtype) / temperature, dim=-1)

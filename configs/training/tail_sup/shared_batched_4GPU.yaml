@@ -71,7 +71,6 @@ actor:
 learner:
   max_sequence_length: 6144
   execution:
-    forward_chunk_size: 32
     gradient_checkpointing: true
     clip_grad_norm: 0.1
   optimizer:
@@ -95,4 +94,3 @@ algorithm:
   # Head selection is independent of rollout sampling settings above.
   tail_sup_top_p: 0.9
   tail_sup_temperature: 1.0
-  tail_sup_chunk_size: 32

@@ -115,7 +115,6 @@ learner:
     master_port: 29673
     timeout_sec: 3600
   execution:
-    forward_chunk_size: 64
     gradient_checkpointing: true
     clip_grad_norm: 0.1
   optimizer:
@@ -131,6 +130,7 @@ learner:
     max_keep: 2
 
 algorithm:
+  kl_top_k: 512
   plugin: RatioOPSDPlugin
   algo_name: ratio_opsd
   loss_aggregation: token
@@ -139,7 +139,6 @@ algorithm:
   teacher_sync_interval: -1
   kl_temperature: 1.0
   kl_token_clip: null
-  kl_chunk_size: 64
   ratio_plausible_fraction: 0.1
   training_sampling:
     temperature: 1.0

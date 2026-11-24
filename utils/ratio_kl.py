@@ -1,17 +1,19 @@
-"""Detached full-vocabulary p²/q targets on the Student's plausible support."""
+"""Detached p²/q targets on Student top-k, retaining plausible filtering."""
 
 from __future__ import annotations
 
 import math
 
 import torch
+from utils.topk_kl import DEFAULT_KL_TOP_K, sampled_log_prob, student_topk_logits
 
 
 RATIO_KEYS = ("ratio_kl_loss", "teacher_forward_kl", "student_entropy_nats", "teacher_entropy_nats",
               "target_entropy_nats", "target_max_probability", "target_mass_error", "plausible_vocabulary_fraction")
 
 
-def ratio_kl_scores(student_logits, teacher_logits, response_ids=None, *, temperature=1.0, plausible_fraction=0.1):
+def ratio_kl_scores(student_logits, teacher_logits, response_ids=None, *, temperature=1.0,
+                    plausible_fraction=0.1, top_k=DEFAULT_KL_TOP_K):
     """Ordinary KL(stopgrad(normalize(p²/q * support)) || p), per token.
 
     The support is p_i >= plausible_fraction * max(p). No CLIP, reward,
@@ -21,6 +23,8 @@ def ratio_kl_scores(student_logits, teacher_logits, response_ids=None, *, temper
         raise ValueError("ratio_temperature must be positive and finite.")
     if not math.isfinite(plausible_fraction) or not 0 < plausible_fraction <= 1:
         raise ValueError("ratio_plausible_fraction must lie in (0, 1].")
+    sampled = None if response_ids is None else sampled_log_prob(student_logits, response_ids, temperature=temperature)
+    student_logits, teacher_logits = student_topk_logits(student_logits, teacher_logits, top_k=top_k)
     dtype = torch.float64 if student_logits.dtype == torch.float64 else torch.float32
     log_p = (student_logits.to(dtype) / temperature).log_softmax(-1)
     with torch.no_grad():
@@ -41,5 +45,5 @@ def ratio_kl_scores(student_logits, teacher_logits, response_ids=None, *, temper
             "plausible_vocabulary_fraction": support.to(dtype).mean(-1),
         }
         if response_ids is not None:
-            metrics["student_sampled_logp_nats"] = log_p.gather(-1, response_ids.unsqueeze(-1)).squeeze(-1)
+            metrics["student_sampled_logp_nats"] = sampled
     return {"ratio_kl_loss": loss, **metrics}

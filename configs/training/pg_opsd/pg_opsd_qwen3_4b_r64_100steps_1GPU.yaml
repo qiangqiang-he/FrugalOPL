@@ -100,7 +100,6 @@ learner:
     master_port: 29573
     timeout_sec: 3600
   execution:
-    forward_chunk_size: 256
     gradient_checkpointing: true
     clip_grad_norm: 1.0
   optimizer:

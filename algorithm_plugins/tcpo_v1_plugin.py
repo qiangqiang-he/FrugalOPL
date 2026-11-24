@@ -49,7 +49,7 @@ class TCPOV1Plugin(TCDOPlugin):
             # These select target scorers, not the actual trajectory label.
             mode = TRUNCATED if state == CORRECT else INCORRECT
             values = self.compute_tcdo(batch, teacher_prompts=batch['teacher_prompts'], state=mode,
-                temperature=self._kl_temperature, plausible_fraction=self.fraction, chunk_size=self._kl_chunk_size)
+                temperature=self._kl_temperature, plausible_fraction=self.fraction)
             loss = masked_token_mean(values['tcdo_kl_loss'], mask) * weight
             metrics = {name: masked_token_mean(value, mask).detach()
                        for name, value in values.items() if name != 'tcdo_kl_loss'}

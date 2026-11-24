@@ -1,4 +1,4 @@
-"""Full-vocabulary OPSD Forward KL with the upstream pointwise upper clip."""
+"""Student-top-k OPSD Forward KL with the pointwise upper clip."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from utils.topk_kl import DEFAULT_KL_TOP_K, student_topk_logits
 
 
 def forward_kl_token_values(
@@ -14,6 +15,7 @@ def forward_kl_token_values(
     *,
     temperature: float = 1.0,
     token_clip: float | None = None,
+    top_k: int = DEFAULT_KL_TOP_K,
 ) -> dict[str, torch.Tensor]:
     """Return response-position values of ``KL(Teacher || Student)``.
 
@@ -22,8 +24,8 @@ def forward_kl_token_values(
     clipped sum can be negative. There is no temperature-squared multiplier.
     Teacher values and logging diagnostics never receive a gradient.
 
-    Normalize in FP32 (FP64 for FP64 inputs). Callers bound memory by invoking
-    this function on response chunks and checkpointing the head/loss block.
+    Normalize only the selected support in FP32 (FP64 for FP64 inputs).
+    Process the whole response, checkpointing the head/loss once.
     """
 
     if not isinstance(student_logits, torch.Tensor) or not isinstance(teacher_logits, torch.Tensor):
@@ -46,12 +48,16 @@ def forward_kl_token_values(
         if not valid:
             raise ValueError(f"Forward KL {name} must be a positive finite number.")
 
+    student_logits, teacher_logits = student_topk_logits(student_logits, teacher_logits, top_k=top_k)
     dtype = torch.float64 if torch.float64 in (student_logits.dtype, teacher_logits.dtype) else torch.float32
     student_log_probs = F.log_softmax(student_logits.to(dtype=dtype) / float(temperature), dim=-1)
     with torch.no_grad():
         teacher_log_probs = F.log_softmax(teacher_logits.detach().to(dtype=dtype) / float(temperature), dim=-1)
     contributions = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
     unclipped = contributions.detach().sum(dim=-1)
+    with torch.no_grad():
+        student_entropy = -(student_log_probs.detach().exp() * student_log_probs.detach()).sum(dim=-1)
+        teacher_entropy = -(teacher_log_probs.exp() * teacher_log_probs).sum(dim=-1)
     if token_clip is None:
         clipped_fraction = torch.zeros_like(unclipped)
     else:
@@ -61,6 +67,8 @@ def forward_kl_token_values(
         "response_forward_kl": contributions.sum(dim=-1),
         "response_forward_kl_unclipped": unclipped,
         "response_forward_kl_clipped_fraction": clipped_fraction.detach(),
+        "response_student_entropy_nats": student_entropy,
+        "response_teacher_entropy_nats": teacher_entropy,
     }
 
 

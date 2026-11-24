@@ -391,7 +391,7 @@ class AlgorithmPlugin:
         token_clip: float | None = None,
         chunk_size: int | None = None,
     ) -> Signals:
-        """Return exact full-vocabulary Teacher-to-Student KL at response positions.
+        """Return Student-top-k Teacher-to-Student KL at response positions.
 
         This capability is available only during a Learner objective for one
         unpadded rollout. Student inputs come from ``batch``; the sole Teacher
@@ -400,13 +400,13 @@ class AlgorithmPlugin:
         eval mode. The default interval (-1) uses the frozen base; Student
         scoring remains differentiable with its own LoRA active.
 
-        Both distributions use ``temperature`` and the complete vocabulary;
-        no sampled-token or top-k approximation and no T-squared multiplier is
-        applied. Optional ``token_clip`` caps each vocabulary contribution
+        Both distributions use ``temperature`` and normalize on the same
+        Student-selected support (algorithm.kl_top_k, default 512). No
+        T-squared multiplier is applied. Optional ``token_clip`` caps each contribution
         ``q * (log(q) - log(p))`` from above before summing vocabulary entries.
-        Negative contributions are retained. ``chunk_size`` bounds the number
-        of response positions materialized at once and defaults to the Worker
-        forward chunk size. Full logits/hidden states never leave the Worker.
+        Negative contributions are retained. The entire response is processed
+        together; ``chunk_size`` is a deprecated, ignored compatibility argument.
+        Full logits/hidden states never leave the Worker.
 
         Results retain shape ``[1, response_length]``:
         ``response_forward_kl`` is differentiable and includes the pointwise
@@ -435,7 +435,7 @@ class AlgorithmPlugin:
     ) -> Signals:
         """Score KL(stopgrad(normalize(p²/q * 1[p>=fraction*pmax])) || p).
 
-        Reuse bounded, checkpointed full-vocabulary paired scoring. Targets
+        Reuse whole-response, checkpointed Student-top-k paired scoring. Targets
         and the privileged Teacher are detached; only Student LoRA learns.
         """
         scope = _ACTIVE_PLUGIN_SCOPE.get()
@@ -451,6 +451,18 @@ class AlgorithmPlugin:
             dict(batch), teacher_prompts=prompts, temperature=temperature,
             plausible_fraction=float(plausible_fraction), chunk_size=chunk_size,
         )
+
+    def collect_rado_scores(self, batch: Signals, *, teacher_prompts: Sequence[str]) -> Signals:
+        scope = _ACTIVE_PLUGIN_SCOPE.get()
+        if scope is None or scope.worker != 'learner' or scope.phase != 'collect':
+            raise RuntimeError('RADO score collection requires a Learner collect scope.')
+        return scope.runtime._plugin_collect_rado(dict(batch), teacher_prompts=teacher_prompts)
+
+    def compute_rado(self, batch: Signals, *, teacher_prompts: Sequence[str], eta: float) -> Signals:
+        scope = _ACTIVE_PLUGIN_SCOPE.get()
+        if scope is None or scope.worker != 'learner' or scope.phase != 'objective':
+            raise RuntimeError('RADO objective requires a Learner objective scope.')
+        return scope.runtime._plugin_compute_rado(dict(batch), teacher_prompts=teacher_prompts, eta=eta)
 
     def compute_tcdo(self, batch: Signals, *, teacher_prompts: Sequence[str], state: int,
                      temperature: float = 1.0, plausible_fraction: float = 0.01,
@@ -472,7 +484,7 @@ class AlgorithmPlugin:
 
         Available only in a one-rollout Learner objective. The runtime uses
         batch.policy_version, identical prompt/response IDs, and a detached
-        old-policy adapter. Vocabulary tensors stay in checkpointed chunks
+        old-policy adapter. Vocabulary tensors stay in one response checkpoint
         on the Worker. Returns token KL, the active-position mask and detached
         diagnostics; plugins own masked reduction and valid_token_count.
         """
@@ -487,7 +499,7 @@ class AlgorithmPlugin:
         )
 
     def compute_ocsd(self, batch: Signals, *, gamma_pos: float, gamma_neg: float, tau: float) -> Signals:
-        """Score full-vocabulary OCSD using the current student at temperature one."""
+        """Score whole-response Student-top-k OCSD at temperature one."""
         scope = _ACTIVE_PLUGIN_SCOPE.get()
         if scope is None or scope.worker != "learner" or scope.phase != "objective":
             raise RuntimeError("compute_ocsd() is only available inside a Learner objective.")

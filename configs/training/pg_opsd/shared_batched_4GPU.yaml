@@ -68,7 +68,6 @@ learner:
   distributed:
     master_port: 29704
   execution:
-    forward_chunk_size: 512
     gradient_checkpointing: true
     clip_grad_norm: 1.0
   optimizer:
