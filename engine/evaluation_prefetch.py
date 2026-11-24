@@ -16,6 +16,7 @@ class EvaluationTrainPrefetch:
         self.issued, self.step = issued, step
         self.envelopes, self.dispatched = {}, set()
         self.round_id = None
+        self.pooled = controller.prefetch_work_stealing
         self.audit = {"evaluation_step": step, "policy_version": controller._last_policy_version,
                       "dispatches": [], "status": "evaluating"}
         self.path = controller.output_dir / "evaluation_prefetch" / f"step_{step:06d}_{uuid.uuid4().hex[:8]}.json"
@@ -27,10 +28,13 @@ class EvaluationTrainPrefetch:
         if self.round_id is None:
             self.issued = self.controller._push_training_group(
                 self.client, self.pending, count=1, issued=self.issued, hold_learner=True,
-                actor_dispatch=lambda gpu, envelope: self.envelopes.__setitem__(gpu, envelope))
+                actor_dispatch=lambda gpu, envelope: self.envelopes.__setitem__(gpu, envelope), actor_pool=self.pooled)
             self.round_id = self.controller._active_round_id
             self.audit.update(round_id=self.round_id, batch_ids=list(self.pending),
                               training_actor_gpu_ids=sorted(self.envelopes))
+            if self.pooled:
+                first = next(iter(self.envelopes.values()))
+                self.audit.update(pool_keys=first["pool_keys"], pool_task_count=first["task_count"])
         self.dispatched.add(gpu_id)
         envelope = self.envelopes.pop(gpu_id, None)
         if envelope is not None:
@@ -54,6 +58,13 @@ class EvaluationTrainPrefetch:
             self.audit["all_training_rollouts_ready_at_evaluation_end"] = all(
                 0 < self.audit["actor_finished_at_evaluation_end"][gpu] <= self.audit["evaluation_returned_monotonic"]
                 for gpu in self.audit["training_actor_gpu_ids"])
+            if self.pooled:
+                from engine.actor_pool import completed_tasks
+                completed = completed_tasks(self.client, self.audit["pool_keys"])
+                self.audit["pool_completed_at_evaluation_end"] = completed
+                self.audit["all_training_rollouts_ready_at_evaluation_end"] = (
+                    len(completed) == self.audit["pool_task_count"]
+                    and all(row["finished_monotonic"] <= self.audit["evaluation_returned_monotonic"] for row in completed))
             self.audit["learner_release_monotonic"] = time.monotonic()
             self.audit["status"] = "released"
             # Commit the trace before opening the process-shared gate.
@@ -61,6 +72,9 @@ class EvaluationTrainPrefetch:
             gate.release_learner(self.round_id)
             finished = [value for value in self.audit["actor_finished_at_evaluation_end"].values()
                         if 0 < value <= self.audit["evaluation_returned_monotonic"]]
+            if self.pooled:
+                finished = [row["finished_monotonic"] for row in completed
+                            if row["finished_monotonic"] <= self.audit["evaluation_returned_monotonic"]]
             self.controller._swanlab.log_components({"evaluation": {"prefetch": {
                 "dispatched_actor_shards": len(self.audit["dispatches"]),
                 "completed_actor_shards": len(finished),

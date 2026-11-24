@@ -191,32 +191,37 @@ def _merge_actor_shards(shards: Sequence[Mapping[str, object]]) -> Signals:
     result.update({key: _join_actor_shard_values([shard[key] for shard in ordered]) for key in field_names})
     result["traj"] = _join_actor_shard_values(trajectories)
     metrics = [dict(_mapping(shard.get("actor_metrics", {}), "actor_metrics")) for shard in ordered]
-    summed_fields = (
-        "batch_rollout_count", "cumulative_rollout_count", "batch_prompt_tokens_total", "batch_response_tokens_total",
-    )
+    by_gpu: dict[object, list[dict[str, object]]] = {}
+    for index, metric in enumerate(metrics):
+        by_gpu.setdefault(metric.get("gpu_id", f"shard-{index}"), []).append(metric)
+    latest = [max(rows, key=lambda row: int(row.get("completed_rollout_batches", 0))) for rows in by_gpu.values()]
+    summed_fields = ("batch_rollout_count", "batch_prompt_tokens_total", "batch_response_tokens_total")
     combined_metrics: dict[str, object] = {
         key: sum(float(metric.get(key, 0.0)) for metric in metrics) for key in summed_fields
     }
-    for key in ("completed_rollout_batches", "batch_rollout_duration_seconds", "avg_batch_rollout_duration_seconds"):
-        combined_metrics[key] = max(float(metric.get(key, 0.0)) for metric in metrics)
+    combined_metrics["cumulative_rollout_count"] = sum(float(metric.get("cumulative_rollout_count", 0.0)) for metric in latest)
+    for key in ("completed_rollout_batches", "avg_batch_rollout_duration_seconds"):
+        combined_metrics[key] = max(float(metric.get(key, 0.0)) for metric in latest)
+    combined_metrics["batch_rollout_duration_seconds"] = max(
+        sum(float(metric.get("batch_rollout_duration_seconds", 0.0)) for metric in rows) for rows in by_gpu.values())
     rollout_count = float(combined_metrics["batch_rollout_count"])
     response_tokens = float(combined_metrics["batch_response_tokens_total"])
     elapsed = float(combined_metrics["batch_rollout_duration_seconds"])
     combined_metrics.update({
-        "gpu_count": count,
+        "gpu_count": len(by_gpu),
         "lora_step": first.get("behavior_version", 0),
         "per_gpu_rollout_counts": {
-            str(metric["gpu_id"]): int(metric["batch_rollout_count"])
-            for metric in metrics if "gpu_id" in metric and "batch_rollout_count" in metric
+            str(gpu): sum(int(metric.get("batch_rollout_count", 0)) for metric in rows)
+            for gpu, rows in by_gpu.items() if isinstance(gpu, int)
         },
         "batch_prompt_tokens_mean": float(combined_metrics["batch_prompt_tokens_total"]) / total_prompts,
         "batch_response_tokens_mean": response_tokens / rollout_count if rollout_count else 0.0,
         "batch_throughput_tokens_per_second": response_tokens / elapsed if elapsed else 0.0,
-        "avg_throughput_tokens_per_second": sum(float(metric.get("avg_throughput_tokens_per_second", 0.0)) for metric in metrics),
+        "avg_throughput_tokens_per_second": sum(float(metric.get("avg_throughput_tokens_per_second", 0.0)) for metric in latest),
     })
     cumulative_rollouts = float(combined_metrics["cumulative_rollout_count"])
     combined_metrics["avg_response_tokens_per_response"] = (
-        sum(float(metric.get("avg_response_tokens_per_response", 0.0)) * float(metric.get("cumulative_rollout_count", 0.0)) for metric in metrics)
+        sum(float(metric.get("avg_response_tokens_per_response", 0.0)) * float(metric.get("cumulative_rollout_count", 0.0)) for metric in latest)
         / cumulative_rollouts if cumulative_rollouts else 0.0
     )
     if any("batch_generation_entropy_sum" in metric for metric in metrics):
@@ -228,13 +233,14 @@ def _merge_actor_shards(shards: Sequence[Mapping[str, object]]) -> Signals:
     if "response_truncated" in result["traj"]:
         flags = _torch().as_tensor(result["traj"]["response_truncated"], dtype=_torch().float32)
         combined_metrics["truncation_rate"] = float(flags.mean().item()) if flags.numel() else 0.0
-    worker_timings = []
-    for shard in ordered:
+    worker_timings: dict[object, list[Mapping[str, object]]] = {}
+    for index, shard in enumerate(ordered):
         timing = _mapping(shard.get("timing", {}), "timing")
         workers = _mapping(timing.get("workers", {}), "timing.workers")
-        worker_timings.append(_mapping(workers.get("actor", {}), "timing.workers.actor"))
+        gpu = metrics[index].get("gpu_id", f"shard-{index}")
+        worker_timings.setdefault(gpu, []).append(_mapping(workers.get("actor", {}), "timing.workers.actor"))
     result["timing"] = {"workers": {"actor": {
-        key: max(float(timing.get(key, 0.0)) for timing in worker_timings)
+        key: max(sum(float(timing.get(key, 0.0)) for timing in rows) for rows in worker_timings.values())
         for key in ("processing_seconds", "gate_wait_seconds")
     }}}
     return result
@@ -2532,7 +2538,11 @@ class Actor:
                     envelope = pickle.loads(raw_payload)
                     if not isinstance(envelope, Mapping):
                         raise TypeError("Actor wave payload must be a mapping.")
-                    self._process_training_wave(client, envelope, stop_event=stop_event)
+                    if envelope.get("kind") == "actor_pool":
+                        from engine.actor_pool import run_actor_pool
+                        run_actor_pool(self, client, envelope, stop_event)
+                    else:
+                        self._process_training_wave(client, envelope, stop_event=stop_event)
                 except Exception as error:
                     self._publish_event(client, f"training wave failed: {error}")
                     if self.round_gate is not None:
@@ -2565,6 +2575,7 @@ class Actor:
         envelope: Mapping[str, object],
         *,
         stop_event: object,
+        pooled: bool = False,
     ) -> None:
         """Generate this GPU's exact question shards in one versioned vLLM call."""
 
@@ -2619,7 +2630,7 @@ class Actor:
             if (
                 not questions or shard_index >= shard_count or shard_count > len(self.actor_cfg["gpu_ids"])
                 or offset + len(questions) > global_count
-                or self.actor_cfg["gpu_ids"][shard_index] != self.gpu_id
+                or (shard.get("assigned_gpu_id") if pooled else self.actor_cfg["gpu_ids"][shard_index]) != self.gpu_id
             ):
                 raise ValueError("Actor wave question shard does not match its directed GPU assignment.")
             prepared_batches.append(self._prepare_training_batch(source))
@@ -2660,18 +2671,18 @@ class Actor:
             completed = True
         finally:
             try:
-                if self.release_engine_after_turn:
+                if self.release_engine_after_turn and not pooled:
                     engine_deactivated = self._release_engine()
                     if not engine_deactivated:
                         raise RuntimeError("Actor wave engine failed to quiesce before the GPU handoff.")
-                elif self.sleep_engine_after_turn:
+                elif self.sleep_engine_after_turn and not pooled:
                     engine_deactivated = self._sleep_engine_after_turn()
                     if not engine_deactivated:
                         raise RuntimeError("Actor wave engine failed to sleep before the GPU handoff.")
             finally:
                 self._wave_policy_version = previous_version
                 self.gpu_gate.release()
-        if completed and self.round_gate is not None:
+        if completed and self.round_gate is not None and not pooled:
             self.round_gate.actor_done(self.gpu_id, round_id)
         self._recycle_after_turn = bool(completed and self.fresh_process_per_turn and engine_deactivated)
         rollout_count = sum(

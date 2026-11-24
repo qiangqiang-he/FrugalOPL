@@ -8,6 +8,7 @@ run:
 controller:
   overlap_actor_learner: true
   prefetch_train_during_evaluation: true
+  prefetch_work_stealing: true
 actor:
   evaluation:
     distribute_replies: true

@@ -7,6 +7,7 @@ controller:
   max_inflight_batches: 1
   overlap_actor_learner: true
   prefetch_train_during_evaluation: true
+  prefetch_work_stealing: true
 actor:
   evaluation:
     distribute_replies: true
@@ -35,6 +36,23 @@ SwanLab `evaluation/prefetch/*` 记录提前派发与完成的分片数、整批
 ```bash
 bash scripts/start_train.sh --tmux tests/configs/evaluation_prefetch/qwen_2gpu.yaml
 ```
+
+## 预生成分片由空闲 Actor 领取
+
+`controller.prefetch_work_stealing: true` 将下一批原有的完整题目分片放入共享队列。完成评测的 Actor 连续领取尚未开始的分片，可以接手仍在评测的卡的训练生成任务。全局题目顺序、每题完整回复组、采样数量及行为策略版本保持原协议，所有回复均保留。正在生成的分片继续由原 Actor 完成。
+
+同一个 Actor 连续处理多个分片时，vLLM 保持唤醒；队列为空后才休眠、交还本卡执行权。所有评测结束前，Learner 仍受共享门控限制。原来的普通训练轮次保持原分片方式，该开关只用于评测期间的下一批预生成。
+
+三份 `*_overlap_8GPU.yaml` 已启用此开关；其他配置默认关闭。它要求开启评测预生成，并使用 `sleep_engine_after_turn: true` 的常驻 Actor 引擎，不能同时开启每轮销毁或重建 Actor 进程。`actor_pool/round_*.json` 记录每个逻辑分片的唯一领取者和完成时间；重复领取、遗漏或策略版本不一致会中止运行。每卡计数按实际处理的分片累加，避免同一卡处理多个分片时被覆盖或重复统计累计量。
+
+双卡 Qwen3-1.7B No thinking 控制长尾短测使用 8 题 × 4 回复、训练 128 token。每个条件有两个“评测开始至下一次更新完成”的计时窗口，排除模型初始化。对照使用相同题目及生成 token 预算，回复内容可以不同；长尾通过一张卡实际生成较长评测回复构造，没有插入 sleep。
+
+| 评测长尾 | 每次运行生成 token | 原分配平均耗时 | 共享队列平均耗时 | 耗时减少 | 双卡采样平均利用率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 512 token | 34,816 | 20.64s | 20.08s | 2.7% | 36.3% → 38.3% |
+| 1024 token | 51,200 | 27.49s | 26.40s | 4.0% | 40.4% → 41.3% |
+
+这些是短测结果，不是 8 卡吞吐或利用率承诺。1024 token 条件下，两个下一批均在评测结束前完整生成，两个 Learner 在放行前始终等待。已通过 146 项 CPU 回归检查及四次双卡两步训练；CUDA Graph 保持开启。[SwanLab 对照记录](https://swanlab.cn/@qhe/TCDO/runs/d655unyk/chart) 保存两组结果和诊断指标。
 
 ## 训练时序
 

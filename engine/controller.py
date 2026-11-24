@@ -207,6 +207,16 @@ class Controller:
         ):
             raise ValueError("Evaluation prefetch requires shared Actor/Learner GPUs, one in-flight batch, "
                              "distribute_replies=true and a Controller -> Actor -> Learner pipeline.")
+        self.prefetch_work_stealing = self.controller_cfg.get("prefetch_work_stealing", False)
+        if not isinstance(self.prefetch_work_stealing, bool):
+            raise ValueError("controller.prefetch_work_stealing must be boolean.")
+        if self.prefetch_work_stealing and (
+            not self.prefetch_train_during_evaluation
+            or not self.actor_cfg.get("engine", {}).get("sleep_engine_after_turn", False)
+            or self.actor_cfg.get("engine", {}).get("release_engine_after_turn", False)
+            or self.actor_cfg.get("engine", {}).get("fresh_process_per_turn", False)
+        ):
+            raise ValueError("Prefetch work stealing requires evaluation prefetch and a persistent sleeping Actor engine.")
         if "interval_steps" in evaluation_cfg:
             raise ValueError("actor.evaluation.interval_steps is unsupported; use top-level eval_interval.")
         self.evaluation_enabled = bool(evaluation_cfg.get("enabled", True))
@@ -731,11 +741,14 @@ class Controller:
         issued: int,
         hold_learner: bool = False,
         actor_dispatch: Callable[[int, dict[str, object]], None] | None = None,
+        actor_pool: bool = False,
     ) -> int:
         """Dispatch one global-batch wave, sharded evenly across all Actors."""
 
         if count < 1:
             return issued
+        if actor_pool and (count != 1 or not hold_learner or actor_dispatch is None):
+            raise ValueError("Actor pools require one deferred, evaluation-held training batch.")
         global_batches: list[dict[str, object]] = []
         new_entries: list[tuple[str, dict[str, object]]] = []
         wave_id = f"wave-{issued + 1:06d}-{issued + count:06d}"
@@ -769,11 +782,13 @@ class Controller:
         round_id = None
         if self.gpu_gates.round_gate is not None:
             manifest = self.gpu_gates.round_gate.begin_round(
-                batch_ids, self._last_policy_version, actor_gpu_ids=[gpu for gpu, _, _ in slices],
+                batch_ids, self._last_policy_version,
+                actor_gpu_ids=self.scheduling.actor_gpu_ids if actor_pool else [gpu for gpu, _, _ in slices],
                 hold_learner=hold_learner,
             )
             round_id = self._active_round_id = manifest.round_id
         queue = client.pipeline() if actor_dispatch is None else None
+        tasks = []
         for shard_index, (gpu_id, start, stop) in enumerate(slices):
             shards = []
             for batch_index, batch in enumerate(global_batches):
@@ -791,13 +806,27 @@ class Controller:
                 "policy_version": self._last_policy_version, "batch_ids": batch_ids,
                 "batches": shards,
             }
-            if actor_dispatch is None:
+            if actor_pool:
+                tasks.append(envelope)
+            elif actor_dispatch is None:
                 queue.lpush(
                     f"{self.queue_keys()['actor_train']}:gpu:{gpu_id}",
                     pickle.dumps(envelope, protocol=pickle.HIGHEST_PROTOCOL),
                 )
             else:
                 actor_dispatch(gpu_id, envelope)
+        if actor_pool:
+            from engine.actor_pool import pool_keys
+            keys = pool_keys(self.queue_keys()["root"], round_id)
+            transaction = client.pipeline()
+            for task in tasks:
+                transaction.lpush(keys["ready"], pickle.dumps(task, protocol=pickle.HIGHEST_PROTOCOL))
+            transaction.execute()
+            for gpu_id in self.scheduling.actor_gpu_ids:
+                actor_dispatch(gpu_id, dict(kind="actor_pool", wave_id=wave_id, round_id=round_id,
+                    policy_version=self._last_policy_version, batch_ids=batch_ids, task_count=len(tasks), pool_keys=keys))
+            for _batch_id, entry in new_entries:
+                entry["actor_pool"] = {"keys": keys, "task_count": len(tasks), "policy_version": self._last_policy_version}
         dispatched_at = time.monotonic()
         if queue is not None:
             queue.execute()
@@ -1724,6 +1753,9 @@ class Controller:
                 if not isinstance(batch_id, str) or batch_id not in pending:
                     raise RuntimeError(f"Controller received an unknown training result: {batch_id!r}.")
                 pending_info = pending.pop(batch_id)
+                if "actor_pool" in pending_info:
+                    from engine.actor_pool import archive_completed_pool
+                    archive_completed_pool(self, client, pending_info)
                 acknowledged.add(pending_info["sequence"])
                 # Multiple Teacher workers may return batches out of order.
                 # Only advance the data cursor across a fully confirmed prefix.
@@ -1905,6 +1937,9 @@ class Controller:
                 for supervisor in supervisors:
                     supervisor.join(timeout=10.0)
                 close = getattr(client, "close", None)
+                if self.prefetch_work_stealing:
+                    from engine.actor_pool import cleanup_actor_pools
+                    cleanup_actor_pools(client, self.queue_keys()["root"])
                 if callable(close):
                     close()
                 self._swanlab.finish(
