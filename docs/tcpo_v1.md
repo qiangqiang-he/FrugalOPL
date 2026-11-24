@@ -2,7 +2,7 @@
 
 四份正式配置均使用 Qwen3 No Thinking，单次同步全局 batch 为 **16 个问题 × 每题 16 个回复 = 256 条轨迹**。所有 Actor 同时生成，生成结束后同卡 Learner 同步优化，再进入下一批。
 
-新增 Qwen3-4B-Instruct-2507 / Olmo 3 7B Instruct 的 8 卡 TCA 使用 **32 题 × 8 回复**，见 [新增配置与启动方式](tca_instruct_8gpu.md)。
+Qwen3-4B-Instruct-2507 / Olmo 3 7B Instruct / Gemma 4 E4B IT / Phi 4 Mini Instruct 的 8 卡 TCA 使用 **32 题 × 8 回复**，见 [配置与启动方式](tca_instruct_8gpu.md)。
 
 | 算法 | 模型 | GPU | Steps | 配置 |
 | --- | --- | --- | --- | --- |

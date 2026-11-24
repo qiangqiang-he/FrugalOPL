@@ -700,15 +700,17 @@ class Learner:
         seed = int(self.run_cfg.get("seed", 42))
         random.seed(seed)
         torch.manual_seed(seed)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        from utils.policy_model import policy_model_factory, policy_trust_remote_code
+        trust_remote_code = policy_trust_remote_code(self.policy_cfg)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
         model_kwargs: dict[str, object] = {
             "torch_dtype": dtype,
-            "trust_remote_code": True,
+            "trust_remote_code": trust_remote_code,
             # Packed answer probes require a model path that accepts custom
             # 4-D masks; FlashAttention2 does not provide that contract.
             "attn_implementation": "sdpa",
         }
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        self.model = policy_model_factory(self.policy_cfg).from_pretrained(model_path, **model_kwargs)
         self.model.config.use_cache = False
         self._force_mask_compatible_attention(self.model)
         if bool(self.execution_cfg.get("gradient_checkpointing", True)):
@@ -741,13 +743,15 @@ class Learner:
 
     @staticmethod
     def _force_mask_compatible_attention(model: torch.nn.Module) -> None:
+        from utils.policy_model import policy_sdpa_implementation
+        implementation = policy_sdpa_implementation(model)
         setter = getattr(model, "set_attn_implementation", None)
         if callable(setter):
-            setter("sdpa")
+            setter(implementation)
             return
         config = getattr(model, "config", None)
         if config is not None and hasattr(config, "_attn_implementation"):
-            setattr(config, "_attn_implementation", "sdpa")
+            setattr(config, "_attn_implementation", implementation)
 
     def _attach_or_restore_lora(self, model: torch.nn.Module) -> torch.nn.Module:
         if not self.lora_enabled:
@@ -774,14 +778,14 @@ class Learner:
                 self._restored_state_path = state_path
                 return restored
         targets = lora_cfg.get("target_modules", [])
-        if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
-            raise TypeError("run.policy.lora.target_modules must be a sequence of module names.")
+        if not isinstance(targets, (str, Sequence)) or isinstance(targets, bytes) or not targets:
+            raise TypeError("run.policy.lora.target_modules must be a nonempty module list or PEFT regex.")
         config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=int(lora_cfg.get("rank", 64)),
             lora_alpha=int(lora_cfg.get("alpha", 128)),
             lora_dropout=float(lora_cfg.get("dropout", 0.0)),
-            target_modules=[str(name) for name in targets],
+            target_modules=targets if isinstance(targets, str) else [str(name) for name in targets],
             inference_mode=False,
         )
         return get_peft_model(model, config)
@@ -1569,23 +1573,8 @@ class Learner:
 
     @staticmethod
     def _lm_head(module: torch.nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
-        base_getter = getattr(module, "get_base_model", None)
-        base = base_getter() if callable(base_getter) else None
-        output_embeddings = getattr(base, "get_output_embeddings", None)
-        head = output_embeddings() if callable(output_embeddings) else None
-        if callable(head):
-            return head
-        head = getattr(base, "lm_head", None)
-        if callable(head):
-            return head
-        output_embeddings = getattr(module, "get_output_embeddings", None)
-        head = output_embeddings() if callable(output_embeddings) else None
-        if callable(head):
-            return head
-        head = getattr(module, "lm_head", None)
-        if callable(head):
-            return head
-        raise RuntimeError("Learner model must expose an lm_head.")
+        from utils.policy_model import model_output_head
+        return model_output_head(module, worker="Learner")
 
     def _plugin_collect_logits(
         self,

@@ -1009,7 +1009,8 @@ class Actor:
             from transformers import AutoTokenizer
         except ImportError as error:  # pragma: no cover - runtime setup failure.
             raise RuntimeError("transformers is required to initialize an Actor plugin tokenizer.") from error
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        from utils.policy_model import policy_trust_remote_code
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=policy_trust_remote_code(self.policy_cfg))
         self._plugin_tokenizer = tokenizer
         # There is no live EngineCore yet, but keeping ``tokenizer`` populated
         # maintains the normal Actor startup invariant and gives diagnostics a
@@ -1072,6 +1073,7 @@ class Actor:
             from vllm import LLM, SamplingParams
 
             self._sampling_params_factory = SamplingParams
+            from utils.policy_model import policy_trust_remote_code
             llm_kwargs = {
                 "model": model_path,
                 "seed": int(self.run_cfg.get("seed", 42)),
@@ -1082,7 +1084,7 @@ class Actor:
                 "gpu_memory_utilization": self._resolved_gpu_memory_utilization,
                 "max_model_len": int(self.engine_cfg.get("max_model_len", 20480)),
                 "dtype": str(self.policy_cfg.get("dtype", "bfloat16")),
-                "trust_remote_code": True,
+                "trust_remote_code": policy_trust_remote_code(self.policy_cfg),
                 "enforce_eager": bool(self.engine_cfg.get("enforce_eager", False)),
             }
             if self.sleep_engine_after_turn:
@@ -1103,6 +1105,9 @@ class Actor:
             # a Controller logical batch may still contain more rollouts and
             # is queued by vLLM in successive graph-backed scheduler turns.
             llm_kwargs.update(self._bounded_vllm_resource_kwargs())
+            if "hf_overrides" in self.engine_cfg:
+                overrides = _mapping(self.engine_cfg["hf_overrides"], "actor.engine.hf_overrides")
+                llm_kwargs["hf_overrides"] = copy.deepcopy(dict(overrides))
             try:
                 self.llm = LLM(**llm_kwargs)
             except Exception as error:
@@ -1128,7 +1133,8 @@ class Actor:
             except Exception:
                 from transformers import AutoTokenizer
 
-                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_path, trust_remote_code=policy_trust_remote_code(self.policy_cfg))
             # Preserve the first tokenizer for the plugin before an opt-in
             # per-turn release clears the engine-owned ``self.tokenizer``.
             # Qwen's tokenizer is CPU-side and remains usable independently
@@ -1172,7 +1178,7 @@ class Actor:
         """
 
         result: dict[str, object] = {}
-        for key in ("max_num_seqs", "max_num_batched_tokens"):
+        for key in ("max_num_seqs", "max_num_batched_tokens", "kv_cache_memory_bytes"):
             if key not in self.engine_cfg:
                 continue
             value = self.engine_cfg[key]

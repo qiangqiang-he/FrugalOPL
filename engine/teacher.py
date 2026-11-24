@@ -198,12 +198,16 @@ class Teacher:
             raise RuntimeError("transformers is required to initialize the Teacher.") from error
 
         dtype = _torch_dtype(self.teacher_cfg.get("dtype", self.policy_cfg.get("dtype", "bfloat16")))
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        from utils.policy_model import policy_model_factory, policy_trust_remote_code
+        model_policy = {**self.policy_cfg, **{key: self.teacher_cfg[key]
+                        for key in ("model_loader", "trust_remote_code") if key in self.teacher_cfg}}
+        trust_remote_code = policy_trust_remote_code(model_policy)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
         self._validate_tokenizer_compatibility(AutoTokenizer, model_path)
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = policy_model_factory(model_policy).from_pretrained(
             model_path,
             torch_dtype=dtype,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             attn_implementation="sdpa",
         )
         self.model.config.use_cache = False
@@ -280,7 +284,8 @@ class Teacher:
         factory = getattr(tokenizer_factory, "from_pretrained", None)
         if not callable(factory):  # pragma: no cover - AutoTokenizer invariant.
             raise RuntimeError("Teacher tokenizer factory does not provide from_pretrained().")
-        student_tokenizer = factory(student_path, trust_remote_code=True)
+        from utils.policy_model import policy_trust_remote_code
+        student_tokenizer = factory(student_path, trust_remote_code=policy_trust_remote_code(self.policy_cfg))
         teacher_vocab = getattr(self.tokenizer, "get_vocab", None)
         student_vocab = getattr(student_tokenizer, "get_vocab", None)
         if not callable(teacher_vocab) or not callable(student_vocab):
@@ -293,13 +298,15 @@ class Teacher:
 
     @staticmethod
     def _force_mask_compatible_attention(model: torch.nn.Module) -> None:
+        from utils.policy_model import policy_sdpa_implementation
+        implementation = policy_sdpa_implementation(model)
         setter = getattr(model, "set_attn_implementation", None)
         if callable(setter):
-            setter("sdpa")
+            setter(implementation)
             return
         config = getattr(model, "config", None)
         if config is not None and hasattr(config, "_attn_implementation"):
-            setattr(config, "_attn_implementation", "sdpa")
+            setattr(config, "_attn_implementation", implementation)
 
     def _validate_memory_before_load(self) -> None:
         if self.device.type != "cuda":
@@ -493,23 +500,8 @@ class Teacher:
 
     @staticmethod
     def _lm_head(module: torch.nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
-        base_getter = getattr(module, "get_base_model", None)
-        base = base_getter() if callable(base_getter) else None
-        output_embeddings = getattr(base, "get_output_embeddings", None)
-        head = output_embeddings() if callable(output_embeddings) else None
-        if callable(head):
-            return head
-        head = getattr(base, "lm_head", None)
-        if callable(head):
-            return head
-        output_embeddings = getattr(module, "get_output_embeddings", None)
-        head = output_embeddings() if callable(output_embeddings) else None
-        if callable(head):
-            return head
-        head = getattr(module, "lm_head", None)
-        if callable(head):
-            return head
-        raise RuntimeError("Teacher model must expose an lm_head.")
+        from utils.policy_model import model_output_head
+        return model_output_head(module, worker="Teacher")
 
     def _forward_hidden(
         self,

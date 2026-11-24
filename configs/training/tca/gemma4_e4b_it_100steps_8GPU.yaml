@@ -1,0 +1,32 @@
+extends: ../../common/tca_8GPU.yaml
+run:
+  name: tca_gemma4_e4b_it_100steps_8gpu_b32n8_topk512
+  group: tca-gemma4-e4b-it-8gpu
+  redis:
+    key_prefix: tca_gemma4_e4b_it_8gpu
+  policy:
+    model_name_or_path: google/gemma-4-E4B-it
+    model_loader: multimodal_lm
+    trust_remote_code: false
+    lora:
+      # Text decoder only; vision/audio projections stay frozen. Shared-KV
+      # layers have no K/V matrices, and must not receive fictitious adapters.
+      target_modules: 'model\.language_model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|mlp\.(gate_proj|up_proj|down_proj))'
+actor:
+  engine:
+    gpu_memory_utilization: 0.65
+    max_num_seqs: 8
+    # Bound the hybrid cache explicitly; its automatic profile can misestimate
+    # Gemma's shared/sliding KV layout. 24 GiB is a cache budget on each 80 GB GPU.
+    kv_cache_memory_bytes: 25769803776
+    # Native vLLM text path supports LoRA and directly reads the same full
+    # checkpoint, skipping multimodal weights and mapping the HF LoRA prefix.
+    hf_overrides:
+      architectures: [Gemma4ForCausalLM]
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8]
+learner:
+  distributed:
+    master_port: 29691
+algorithm:
+  enable_thinking: false

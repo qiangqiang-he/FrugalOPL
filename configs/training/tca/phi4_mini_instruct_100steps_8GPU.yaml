@@ -1,0 +1,20 @@
+extends: ../../common/tca_8GPU.yaml
+run:
+  name: tca_phi4_mini_instruct_100steps_8gpu_b32n8_topk512
+  group: tca-phi4-mini-instruct-8gpu
+  redis:
+    key_prefix: tca_phi4_mini_instruct_8gpu
+  policy:
+    model_name_or_path: microsoft/Phi-4-mini-instruct
+    # Use Transformers' native Phi3 implementation, not the old Hub auto_map.
+    trust_remote_code: false
+    lora:
+      target_modules: [qkv_proj, o_proj, gate_up_proj, down_proj]
+actor:
+  engine:
+    gpu_memory_utilization: 0.75
+learner:
+  distributed:
+    master_port: 29689
+algorithm:
+  enable_thinking: false
