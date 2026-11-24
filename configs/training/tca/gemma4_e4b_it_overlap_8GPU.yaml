@@ -7,6 +7,7 @@ run:
     key_prefix: tca_gemma4_e4b_it_overlap_8gpu
 controller:
   overlap_actor_learner: true
+  prefetch_train_during_evaluation: true
 actor:
   evaluation:
     distribute_replies: true

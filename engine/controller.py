@@ -197,6 +197,16 @@ class Controller:
         evaluation_cfg = _mapping(self.actor_cfg.get("evaluation", {}), "actor.evaluation")
         if not isinstance(evaluation_cfg.get("distribute_replies", False), bool):
             raise ValueError("actor.evaluation.distribute_replies must be boolean.")
+        self.prefetch_train_during_evaluation = self.controller_cfg.get("prefetch_train_during_evaluation", False)
+        if not isinstance(self.prefetch_train_during_evaluation, bool):
+            raise ValueError("controller.prefetch_train_during_evaluation must be boolean.")
+        if self.prefetch_train_during_evaluation and (
+            not self.scheduling.shared or self.max_inflight_batches != 1
+            or not evaluation_cfg.get("distribute_replies", False)
+            or [node.worker_class for node in self.pipeline.nodes] != ["Controller", "Actor", "Learner"]
+        ):
+            raise ValueError("Evaluation prefetch requires shared Actor/Learner GPUs, one in-flight batch, "
+                             "distribute_replies=true and a Controller -> Actor -> Learner pipeline.")
         if "interval_steps" in evaluation_cfg:
             raise ValueError("actor.evaluation.interval_steps is unsupported; use top-level eval_interval.")
         self.evaluation_enabled = bool(evaluation_cfg.get("enabled", True))
@@ -719,6 +729,8 @@ class Controller:
         *,
         count: int,
         issued: int,
+        hold_learner: bool = False,
+        actor_dispatch: Callable[[int, dict[str, object]], None] | None = None,
     ) -> int:
         """Dispatch one global-batch wave, sharded evenly across all Actors."""
 
@@ -758,9 +770,10 @@ class Controller:
         if self.gpu_gates.round_gate is not None:
             manifest = self.gpu_gates.round_gate.begin_round(
                 batch_ids, self._last_policy_version, actor_gpu_ids=[gpu for gpu, _, _ in slices],
+                hold_learner=hold_learner,
             )
             round_id = self._active_round_id = manifest.round_id
-        queue = client.pipeline()
+        queue = client.pipeline() if actor_dispatch is None else None
         for shard_index, (gpu_id, start, stop) in enumerate(slices):
             shards = []
             for batch_index, batch in enumerate(global_batches):
@@ -778,12 +791,16 @@ class Controller:
                 "policy_version": self._last_policy_version, "batch_ids": batch_ids,
                 "batches": shards,
             }
-            queue.lpush(
-                f"{self.queue_keys()['actor_train']}:gpu:{gpu_id}",
-                pickle.dumps(envelope, protocol=pickle.HIGHEST_PROTOCOL),
-            )
+            if actor_dispatch is None:
+                queue.lpush(
+                    f"{self.queue_keys()['actor_train']}:gpu:{gpu_id}",
+                    pickle.dumps(envelope, protocol=pickle.HIGHEST_PROTOCOL),
+                )
+            else:
+                actor_dispatch(gpu_id, envelope)
         dispatched_at = time.monotonic()
-        queue.execute()
+        if queue is not None:
+            queue.execute()
         for _batch_id, entry in new_entries:
             entry["dispatch_monotonic"] = dispatched_at
             entry["round_id"] = round_id
@@ -955,6 +972,7 @@ class Controller:
         learner_manager: LearnerManager,
         teacher_manager: TeacherManager | Mapping[str, TeacherManager] | None = None,
         adapter_snapshot: Path | None = None,
+        on_actor_idle: Callable[[int], None] | None = None,
     ) -> dict[str, object]:
         """Run one full Actor-only evaluation after a drained training boundary."""
 
@@ -1013,7 +1031,8 @@ class Controller:
                 partial_stop = run_distributed_reply_evaluation(
                     self, client, records=dataset_records, evaluation_id=evaluation_id, cache=cache,
                     question_results=question_results, stop_from_partial=stop_from_partial,
-                    actor_manager=actor_manager, learner_manager=learner_manager, teacher_manager=teacher_manager)
+                    actor_manager=actor_manager, learner_manager=learner_manager, teacher_manager=teacher_manager,
+                    on_actor_idle=on_actor_idle if dataset_name == list(self.eval_datasets)[-1] else None)
                 if partial_stop:
                     return partial_stop
                 requests_by_gpu = {gpu: None for gpu in self.scheduling.actor_gpu_ids}
@@ -1549,6 +1568,29 @@ class Controller:
         pending: dict[str, dict[str, object]] = {}
         acknowledged: set[int] = set()
         run_error: BaseException | None = None
+
+        def evaluate_boundary(**kwargs):
+            nonlocal issued_batches, training_started
+            prefetch = None
+            if self.prefetch_train_during_evaluation and kwargs["completed_steps"] < self.max_steps:
+                from engine.evaluation_prefetch import EvaluationTrainPrefetch
+                prefetch = EvaluationTrainPrefetch(self, client, pending, issued_batches, kwargs["completed_steps"])
+            try:
+                result = self._run_evaluation(client, **kwargs,
+                    on_actor_idle=prefetch.actor_idle if prefetch is not None else None)
+            except BaseException:
+                if prefetch is not None:
+                    prefetch.finish(release=False)
+                raise
+            if prefetch is not None:
+                issued_batches = prefetch.issued
+                prefetch.finish(release=not self._evaluation_stop_reason)
+                if pending and not self._evaluation_stop_reason:
+                    # Evaluation owns its wall clock, including overlapping
+                    # rollout work. Resume the training clock at the handoff.
+                    training_started = time.monotonic()
+            return result
+
         try:
             # Learner first means an Actor can hand off its initial trajectory
             # as soon as vLLM becomes ready instead of filling an orphan queue.
@@ -1600,8 +1642,7 @@ class Controller:
                 and completed_steps == 0
                 and not self._has_completed_evaluation(0)
             ):
-                self._run_evaluation(
-                    client,
+                evaluate_boundary(
                     completed_steps=0,
                     actor_manager=actor_manager,
                     learner_manager=learner_manager,
@@ -1618,8 +1659,7 @@ class Controller:
                 adapter_snapshot = self._snapshot_evaluation_adapter(
                     completed_steps=completed_steps, history_item=self.train_history[-1]
                 )
-                self._run_evaluation(
-                    client,
+                evaluate_boundary(
                     completed_steps=completed_steps,
                     actor_manager=actor_manager,
                     learner_manager=learner_manager,
@@ -1827,8 +1867,7 @@ class Controller:
                             completed_steps=completed_steps,
                             history_item=history_item,
                         )
-                        self._run_evaluation(
-                            client,
+                        evaluate_boundary(
                             completed_steps=completed_steps,
                             actor_manager=actor_manager,
                             learner_manager=learner_manager,

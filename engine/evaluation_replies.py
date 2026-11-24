@@ -5,6 +5,7 @@ import copy
 import hashlib
 import pickle
 import multiprocessing as mp
+from collections import deque
 
 
 def reply_shards(question_count, replies, gpu_ids):
@@ -50,7 +51,7 @@ def merge_reply_trajectories(parts, question_count, replies):
 
 def run_distributed_reply_evaluation(controller, client, *, records, evaluation_id, cache,
                                      question_results, stop_from_partial, actor_manager,
-                                     learner_manager, teacher_manager):
+                                     learner_manager, teacher_manager, on_actor_idle=None):
     from utils.eval import build_question_results
     replies = controller.eval_rollouts_per_prompt
     gpu_ids = tuple(controller.scheduling.actor_gpu_ids)
@@ -69,42 +70,61 @@ def run_distributed_reply_evaluation(controller, client, *, records, evaluation_
     if stop:
         return stop
     keys = controller.queue_keys()
+    waves, requests, pending = {}, {gpu: deque() for gpu in gpu_ids}, {}
     for offset in range(0, len(remaining), wave_size):
         wave = remaining[offset:offset + wave_size]
         wave_records = [record for _, record in wave]
-        pending = {}
-        for gpu, pairs in reply_shards(len(wave), replies, gpu_ids):
-            questions, answers = controller._records_to_signals(wave_records)
-            message = dict(evaluation_id=evaluation_id, evaluation_batch_index=offset,
+        assignments = reply_shards(len(wave), replies, gpu_ids)
+        waves[offset] = {"records": wave_records, "original": wave, "parts": [], "remaining": len(assignments)}
+        for gpu, pairs in assignments:
+            requests[gpu].append((offset, pairs))
+
+    def dispatch_next(gpu):
+        if not requests[gpu]:
+            if on_actor_idle is not None:
+                on_actor_idle(gpu)
+            return
+        offset, pairs = requests[gpu].popleft()
+        wave = waves[offset]
+        questions, answers = controller._records_to_signals(wave["records"])
+        message = dict(evaluation_id=evaluation_id, evaluation_batch_index=offset,
                            evaluation_gpu_id=gpu, policy_version=controller._last_policy_version,
-                           questions=questions, answers=answers, records=copy.deepcopy(wave_records),
+                           questions=questions, answers=answers, records=copy.deepcopy(wave["records"]),
                            evaluation_reply_plan={"pairs": pairs, "replies": replies,
-                               "record_indices": [index for index, _ in wave],
+                               "record_indices": [index for index, _ in wave["original"]],
                                "identity": evaluation_id.rsplit("-", 1)[0]})
-            client.lpush(f"{keys['actor_eval']}:gpu:{gpu}", pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL))
-            pending[gpu] = pairs
-        parts = []
-        while pending:
-            result = controller._pop_message(client, result_key=keys["eval_results"],
+        client.lpush(f"{keys['actor_eval']}:gpu:{gpu}", pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL))
+        pending[gpu] = (offset, pairs)
+
+    for gpu in gpu_ids:
+        dispatch_next(gpu)
+    while pending:
+        result = controller._pop_message(client, result_key=keys["eval_results"],
                 actor_manager=actor_manager, learner_manager=learner_manager, teacher_manager=teacher_manager)
-            gpu = result.get("evaluation_gpu_id")
-            if (isinstance(gpu, bool) or gpu not in pending or result.get("evaluation_id") != evaluation_id
-                    or result.get("evaluation_batch_index") != offset
-                    or result.get("actor_metrics", {}).get("lora_step") != controller._last_policy_version
-                    or result.get("evaluation_reply_plan", {}).get("pairs") != pending[gpu]):
-                raise RuntimeError("Evaluation reply result has the wrong GPU, policy, wave or candidate IDs.")
-            parts.append((result["traj"], pending.pop(gpu)))
-        trajectory = merge_reply_trajectories(parts, len(wave), replies)
-        results = build_question_results(wave_records, trajectory, rollouts_per_prompt=replies,
+        gpu = result.get("evaluation_gpu_id")
+        if (isinstance(gpu, bool) or gpu not in pending or result.get("evaluation_id") != evaluation_id
+                or result.get("evaluation_batch_index") != pending[gpu][0]
+                or result.get("actor_metrics", {}).get("lora_step") != controller._last_policy_version
+                or result.get("evaluation_reply_plan", {}).get("pairs") != pending[gpu][1]):
+            raise RuntimeError("Evaluation reply result has the wrong GPU, policy, wave or candidate IDs.")
+        offset, pairs = pending.pop(gpu)
+        wave = waves[offset]
+        wave["parts"].append((result["traj"], pairs))
+        wave["remaining"] -= 1
+        if not wave["remaining"]:
+            trajectory = merge_reply_trajectories(wave["parts"], len(wave["records"]), replies)
+            results = build_question_results(wave["records"], trajectory, rollouts_per_prompt=replies,
                                          save_rollouts=controller.save_eval_rollouts)
-        for (original_index, _), question in zip(wave, results, strict=True):
-            question["record_index"] = original_index
-            cache.save(original_index, original_index, [question])
-            question_results.append(question)
-        print(f"[Controller] Distributed evaluation replies: {len(question_results)*replies}/{len(records)*replies}.", flush=True)
-        stop = stop_from_partial()
-        if stop:
-            return stop
+            for (original_index, _), question in zip(wave["original"], results, strict=True):
+                question["record_index"] = original_index
+                cache.save(original_index, original_index, [question])
+                question_results.append(question)
+            del waves[offset]
+            print(f"[Controller] Distributed evaluation replies: {len(question_results)*replies}/{len(records)*replies}.", flush=True)
+            stop = stop_from_partial()
+            if stop:
+                return stop
+        dispatch_next(gpu)
     return None
 
 

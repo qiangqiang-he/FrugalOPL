@@ -6,12 +6,35 @@
 controller:
   max_inflight_batches: 1
   overlap_actor_learner: true
+  prefetch_train_during_evaluation: true
 actor:
   evaluation:
     distribute_replies: true
 ```
 
-两个开关独立。`overlap_actor_learner` 默认关闭，启用后使用按卡交接；`distribute_replies` 默认关闭，启用后训练中的周期评测及 `start_eval.sh` 独立评测均把同题的 8/16 条回复分散到多卡。所有要求的回复都会保留，没有额外采样或按完成速度筛选。
+`overlap_actor_learner` 默认关闭，启用后使用按卡交接；`distribute_replies` 默认关闭，启用后训练中的周期评测及 `start_eval.sh` 独立评测均把同题的 8/16 条回复分散到多卡。所有要求的回复都会保留，没有额外采样或按完成速度筛选。
+
+## 评测期间提前生成下一批
+
+`controller.prefetch_train_during_evaluation: true` 允许完成全部本卡评测请求的 Actor，提前生成下一批训练中分配给本卡的题目分片。三份 `*_overlap_8GPU.yaml` 配置已开启；其他配置默认关闭。它要求 Actor/Learner 使用相同 GPU 集合、单个在途 batch、标准 Controller → Actor → Learner 流程，并开启 `actor.evaluation.distribute_replies`；训练的按卡提前学习开关可独立选择。
+
+同一数据集内，各卡独立推进自己的回复分片队列，无需等其他卡完成当前分片。AMC23 全部收齐后才开始 AIME24；只在最后一个数据集的本卡任务全部结束后生成训练 rollout。每个 Actor 调用仍不超过 64 条回复，完整保留所有评测回复。
+
+下一批最多提前生成一个全局 batch，使用刚完成更新、正在评测的同一版本策略。共享进程门控在整个评测期间禁止所有 Learner 进入，包括前向、反向和优化器更新；即使下一批 rollout 已经全部完成，也只能排队。所有数据集的评测、结果保存及停止条件检查结束后，Controller 才打开门控。此时可继续原有按卡提前学习，其他卡尚未生成完训练分片时仍能重叠计算。
+
+最后一个训练 step 的评测不再生成后续数据。评测触发停止条件或出现异常时，预生成结果不会进入学习。预生成只推进暂存的数据游标，训练结果确认后才推进持久化游标，重启会从已确认的 batch 恢复。
+
+运行目录 `evaluation_prefetch/step_*.json` 记录各卡训练生成的发出时间、评测结束时的生成完成状态和 Learner 放行时间，可验证评测长尾期间已有训练生成、同时 Learner 始终等待。
+
+SwanLab `evaluation/prefetch/*` 记录提前派发与完成的分片数、整批是否已提前生成、最大提前完成秒数和 Learner 是否放行。训练计时从评测放行后恢复；评测期间的生成耗时包含在评测阶段和整次运行墙钟中。吞吐对比应使用整次运行墙钟及相同的生成工作量。
+
+双卡验证包含 2 题 × 4 回复的两次更新、1 题 × 4 回复整批提前完成的两次更新，以及关闭训练阶段计算交叠的一次更新。测试人为让一张卡的最后数据集评测延迟 12 秒；整批 rollout 提前约 7.8 秒完成时，两个 Learner 仍全部等待，随后才开始前向与反向。初始、周期及最终评测均覆盖 AMC23/AIME24 Avg@16，使用 64 token 上限检查链路；不用于基准准确率或吞吐对比。137 项 CPU 测试还覆盖了缓存恢复、停止条件、异常门控和未确认数据游标的重放。
+
+双卡可通过下面的 tmux 入口复查预生成流程（短测配置仅保留在本地）：
+
+```bash
+bash scripts/start_train.sh --tmux tests/configs/evaluation_prefetch/qwen_2gpu.yaml
+```
 
 ## 训练时序
 

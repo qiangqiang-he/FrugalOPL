@@ -64,6 +64,12 @@ class SharedRoundGate:
         self._actor_finished_at = context.Array("d", len(actor_gpu_ids), lock=False)
         self._learner_ready = context.Array("b", learner_ranks, lock=False)
         self._learner_done = context.Array("b", learner_ranks, lock=False)
+        self._learner_blocked = context.Value("b", False, lock=False)
+
+    @property
+    def learner_blocked(self) -> bool:
+        with self._condition:
+            return bool(self._learner_blocked.value)
 
     @property
     def phase(self) -> str:
@@ -83,7 +89,9 @@ class SharedRoundGate:
         value = json.loads(self._manifest.value.decode("utf-8"))
         return RoundManifest(value["round_id"], tuple(value["batch_ids"]), value["policy_version"])
 
-    def begin_round(self, batch_ids, policy_version: int, actor_gpu_ids=None) -> RoundManifest:
+    def begin_round(self, batch_ids, policy_version: int, actor_gpu_ids=None, *, hold_learner=False) -> RoundManifest:
+        if not isinstance(hold_learner, bool):
+            raise ValueError("hold_learner must be boolean.")
         ids = tuple(batch_ids)
         if not ids or len(ids) > self.max_batches or len(set(ids)) != len(ids):
             raise ValueError("Round batch IDs must be non-empty, unique and within the in-flight limit.")
@@ -104,6 +112,7 @@ class SharedRoundGate:
                 raise ValueError("Round manifest exceeds the shared control buffer.")
             self._manifest.value = data
             self._round.value = manifest.round_id
+            self._learner_blocked.value = hold_learner
             for index, gpu_id in enumerate(self.actor_gpu_ids):
                 self._actor_done[index] = int(gpu_id not in active)
                 self._actor_finished_at[index] = 0.0
@@ -112,6 +121,15 @@ class SharedRoundGate:
             self._phase.value = 1
             self._condition.notify_all()
             return manifest
+
+    def release_learner(self, round_id: int) -> None:
+        """Release an evaluation boundary only after every dataset is complete."""
+        with self._condition:
+            self._check()
+            if self._round.value != round_id or self._phase.value not in (1, 2) or not self._learner_blocked.value:
+                raise RuntimeError("Learner release does not match a held generation round.")
+            self._learner_blocked.value = False
+            self._condition.notify_all()
 
     def wait_actor(self, gpu_id: int, round_id: int, stop_event=None) -> bool:
         if gpu_id not in self.actor_gpu_ids:
@@ -150,7 +168,8 @@ class SharedRoundGate:
                 self._check()
                 if self._stopped(stop_event):
                     return None
-                if self._phase.value in (1, 2) and self._round.value > after_round and self._actor_done[index]:
+                if (not self._learner_blocked.value and self._phase.value in (1, 2)
+                        and self._round.value > after_round and self._actor_done[index]):
                     return self._read_manifest()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -171,7 +190,7 @@ class SharedRoundGate:
                 self._check()
                 if self._stopped(stop_event):
                     return None
-                if self._phase.value == 2 and self._round.value > after_round:
+                if not self._learner_blocked.value and self._phase.value == 2 and self._round.value > after_round:
                     return self._read_manifest()
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
@@ -188,7 +207,7 @@ class SharedRoundGate:
                     return False
                 self._condition.wait(0.1)
                 self._check()
-            if self._round.value != round_id or self._phase.value != 2:
+            if self._round.value != round_id or self._phase.value != 2 or self._learner_blocked.value:
                 raise RuntimeError("Learner readiness does not match the active round.")
             if self._learner_ready[rank]:
                 raise RuntimeError("Duplicate Learner readiness acknowledgement.")
