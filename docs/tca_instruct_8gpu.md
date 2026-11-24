@@ -68,6 +68,8 @@ Gemma Learner 使用等价的显式 K/V 头展开，再调用 SDPA。其 512 维
 
 Gemma 的 80 GB 配置显式设置每个 Actor 的 KV cache 为 24 GiB，避免共享/滑动 KV 的自动预算误差。双卡短测试使用 2 GiB cache、4096 上下文；正式配置仍使用 32768 评测生成长度。
 
+Actor 唤醒前按上一次 sleep 实际释放的显存核算增量，避免把常驻 CUDA Graph 再计入新分配预算。新引擎仍做完整预检，本地 3 GiB 安全线仍在唤醒前后检查；服务器沿用配置的 0 固定保留。
+
 使用本地模型目录时，两组实验各自设置正确的 `FRUGALOPL_MODEL_PATH`，它会覆盖 YAML 中的模型 ID。数据文件沿用 `data/openthoughts_math30k.json`、`data/AMC-2023.json`、`data/AIME-2024.json`。
 
 ## 双卡验证：使用 tmux
@@ -87,7 +89,7 @@ Qwen 和 Phi 的双卡验证使用两卡共享 Actor/Learner。OLMo 7B 与 Gemma
 
 OLMo 3 的 Transformers 支持要求至少 4.57.0。验证环境为 PyTorch `2.10.0+cu129`、Transformers `5.9.0`、vLLM `0.19.1`、PEFT `0.21.0`。
 
-本次通过 **103 项 CPU 检查**，包括 OLMo 3 混合注意力、Gemma 共享 KV / logits softcap、Phi 融合投影上的真实 LoRA / TCA 反向传播，以及显式 GQA 的前向和梯度等价性。512 维 GQA 另通过禁用 math 后端的 CUDA 前向/反向检查。四种完整模型均通过上述两步 GPU 训练及每步 AMC→AIME 评测：
+本次通过 **109 项 CPU 检查**，包括 OLMo 3 混合注意力、Gemma 共享 KV / logits softcap、Phi 融合投影上的真实 LoRA / TCA 反向传播、显式 GQA 的前向和梯度等价性，以及唤醒增量预算和本地安全线检查。512 维 GQA 另通过禁用 math 后端的 CUDA 前向/反向检查。四种完整模型均通过上述两步 GPU 训练及每步 AMC→AIME 评测：
 
 | 模型 | 实际更新次数 | LoRA 检查 | SwanLab |
 | --- | --- | --- | --- |

@@ -838,6 +838,7 @@ class Actor:
         self._recycle_after_turn = False
         self.sleep_engine_level = sleep_level
         self._engine_is_sleeping = False
+        self._sleep_released_bytes: int | None = None
         self.lora_cfg = _mapping(self.actor_cfg.get("lora", {}), "actor.lora")
         # Training configurations own chat-template thinking mode in their
         # algorithm runtime.  Resolve that framework-owned contract once so
@@ -1307,6 +1308,30 @@ class Actor:
                 f"{self.gpu_id}; the configured free-memory reserve is {minimum:.2f} GB."
             )
 
+    def _validate_memory_before_engine_wake(self) -> None:
+        """Check the allocations sleep released, excluding resident graphs.
+
+        Reapplying the entire creation reservation double-counts memory that
+        the sleeping engine still owns. The shared GPU gate keeps the sleep
+        measurement separate from Learner allocations. Fresh engines retain
+        the normal creation check, and local wakeups retain their 3 GB floor.
+        """
+        released = getattr(self, "_sleep_released_bytes", None)
+        if released is None:
+            self._validate_memory_before_engine_creation()
+            return
+        free_bytes, _total_bytes = _gpu_memory_info(self.gpu_id)
+        minimum = self._minimum_free_gpu_memory_gb()
+        required = released + int(minimum * 1024**3)
+        if free_bytes < required:
+            raise MemoryError(
+                f"Refusing to wake Actor on GPU {self.gpu_id}: {free_bytes / 1024**3:.2f} GB is free, "
+                f"but restoring its sleeping allocations needs {released / 1024**3:.2f} GB "
+                f"plus the configured {minimum:.2f} GB reserve."
+            )
+        print(f"[Actor GPU {self.gpu_id}] Wake preflight: restore={released / 1024**3:.2f} GB, "
+              f"free={free_bytes / 1024**3:.2f} GB, reserve={minimum:.2f} GB.", flush=True)
+
     def _validate_memory_after_engine_sleep(self) -> None:
         """Enforce the configured device-wide reserve after vLLM sleep."""
 
@@ -1378,9 +1403,9 @@ class Actor:
     def _wake_engine_for_turn(self) -> None:
         """Wake a level-1-sleeping vLLM EngineCore before generation.
 
-        This method is called only under the physical GPU gate.  Rechecking
-        the normal Actor reservation before wake prevents a residual Learner
-        allocation from silently colliding with the returning vLLM weights.
+        This method is called only under the physical GPU gate. Rechecking
+        the measured restore allocation avoids counting resident CUDA Graphs
+        twice while protecting the configured device-wide reserve.
         """
 
         if not self._engine_is_sleeping:
@@ -1393,7 +1418,7 @@ class Actor:
             raise RuntimeError(
                 "Actor sleep_engine_after_turn requires a vLLM runtime exposing LLM.wake_up()."
             )
-        self._validate_memory_before_engine_creation()
+        self._validate_memory_before_engine_wake()
         print(f"[Actor GPU {self.gpu_id}] Waking vLLM engine for this turn.", flush=True)
         wake_up()
         self._engine_is_sleeping = False
@@ -1430,7 +1455,10 @@ class Actor:
         # All futures from this turn have completed before this method is
         # reached.  wait preserves that contract if a future vLLM version
         # still has a final EngineCore request draining asynchronously.
+        free_before, _total = _gpu_memory_info(self.gpu_id)
         sleep(level=self.sleep_engine_level, mode="wait")
+        free_after, _total = _gpu_memory_info(self.gpu_id)
+        self._sleep_released_bytes = max(0, int(free_after) - int(free_before))
         self._clear_lora_request()
         self._engine_is_sleeping = True
         # This is a device-wide, post-action check.  It is deliberately not
@@ -2905,6 +2933,7 @@ class Actor:
         # avoids a transient wake-up allocation during coordinated shutdown.
         # The physical GPU gate is still held by every Worker close path.
         self._engine_is_sleeping = False
+        self._sleep_released_bytes = None
         self.tokenizer = None
         llm = self.llm
         if llm is not None:
