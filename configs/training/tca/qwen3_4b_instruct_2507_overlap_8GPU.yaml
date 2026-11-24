@@ -1,0 +1,12 @@
+# Keep the same 32 x 8 global batch and all replies. Handoff is per card.
+extends: qwen3_4b_instruct_2507_100steps_8GPU.yaml
+run:
+  name: tca_qwen3_4b_instruct_2507_overlap_8gpu_b32n8
+  group: tca-overlap-8gpu
+  redis:
+    key_prefix: tca_qwen3_4b_instruct_2507_overlap_8gpu
+controller:
+  overlap_actor_learner: true
+actor:
+  evaluation:
+    distribute_replies: true

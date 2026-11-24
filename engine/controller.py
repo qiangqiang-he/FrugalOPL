@@ -195,6 +195,8 @@ class Controller:
         self.actor_max_batches_per_turn = self.scheduling.actor_batches_per_wave
         self._active_round_id = 0
         evaluation_cfg = _mapping(self.actor_cfg.get("evaluation", {}), "actor.evaluation")
+        if not isinstance(evaluation_cfg.get("distribute_replies", False), bool):
+            raise ValueError("actor.evaluation.distribute_replies must be boolean.")
         if "interval_steps" in evaluation_cfg:
             raise ValueError("actor.evaluation.interval_steps is unsupported; use top-level eval_interval.")
         self.evaluation_enabled = bool(evaluation_cfg.get("enabled", True))
@@ -973,6 +975,7 @@ class Controller:
         from utils.evaluation_stop import partial_evaluation_stop_reason
         caches = []
         evaluation_attempt = uuid.uuid4().hex
+        distribute_replies = evaluation_cfg.get("distribute_replies", False)
 
         for dataset_name, dataset_records in self.eval_datasets.items():
             evaluation_id = f"eval-step-{completed_steps:06d}-{dataset_name}-{evaluation_attempt}"
@@ -980,13 +983,16 @@ class Controller:
             adapter_hash = None
             if adapter_snapshot is not None:
                 adapter_hash = hashlib.sha256((adapter_snapshot/'adapter_model.safetensors').read_bytes()).hexdigest()
-            cache = EvaluationBatchCache(self.output_dir,completed_steps,dataset_name,{
+            cache_metadata = {
                 'policy_version':self._last_policy_version,'adapter_sha256':adapter_hash,
                 'records':dataset_records,'generation':getattr(self,'actor_cfg',{}).get('evaluation',{}).get('generation',{}),
                 'prompts':self.run_cfg.get('prompts',{}),'policy':self.run_cfg.get('policy',{}),
                 'thinking':self.config.get('algorithm',{}).get('enable_thinking'),
                 'rollouts_per_prompt':self.eval_rollouts_per_prompt,'prompts_per_batch':self.eval_prompts_per_batch,
-                'actor_gpu_ids':list(self.scheduling.actor_gpu_ids),'save_rollouts':self.save_eval_rollouts})
+                'actor_gpu_ids':list(self.scheduling.actor_gpu_ids),'save_rollouts':self.save_eval_rollouts}
+            if distribute_replies:
+                cache_metadata['reply_layout'] = 'striped_replies_v1'
+            cache = EvaluationBatchCache(self.output_dir,completed_steps,dataset_name,cache_metadata)
             caches.append(cache)
             expected_responses=len(dataset_records)*self.eval_rollouts_per_prompt
             def stop_from_partial():
@@ -1002,135 +1008,145 @@ class Controller:
                     print(f'[Controller] Confirmed partial truncation lower bound: {reason}',flush=True)
                     return {'step':completed_steps,'complete':False,'stop_reason':reason}
                 return None
-            # Preserve the original shard/batch identities for deterministic
-            # journals, but optionally let an idle Actor take a queued batch
-            # from a slower peer. Each GPU still has at most one request.
-            work_stealing=getattr(self,'actor_cfg',{}).get('evaluation',{}).get('work_stealing',False)
-            if not isinstance(work_stealing,bool):
-                raise ValueError('actor.evaluation.work_stealing must be boolean')
-            requests_by_gpu = {}
-            batch_index = 0
-            for gpu_id, first, stop in question_shards(len(dataset_records), self.scheduling.actor_gpu_ids):
-                requests = deque()
-                for start in range(first, stop, self.eval_prompts_per_batch):
-                    records = dataset_records[start : min(stop, start + self.eval_prompts_per_batch)]
-                    cached=cache.load(batch_index,start,len(records),self.eval_rollouts_per_prompt)
-                    if cached is not None:
-                        question_results.extend(cached)
-                    else:
-                        requests.append((batch_index, start, records))
-                    batch_index += 1
-                requests_by_gpu[gpu_id] = requests
-            prioritized_requests=None
-            # A few long AIME questions can keep the final GPU busy after
-            # its peer has emptied its queue. Start previously expensive
-            # batches first, preserving every batch/sample identity and seed.
-            if work_stealing:
-                previous=[row['step'] for row in self.evaluation_history
-                          if row['step']<completed_steps and dataset_name in row['datasets']]
-                if previous:
-                    prior_path=self.output_dir/'evaluations'/f'step_{max(previous):06d}_details.json'
-                    if prior_path.is_file():
-                        try:
-                            prior=json.loads(prior_path.read_text())['datasets'][dataset_name]['questions']
-                            costs={int(q['record_index']):sum(int(r['response_token_length']) for r in q['rollouts']) for q in prior}
-                        except (OSError,ValueError,KeyError,TypeError):
-                            costs={}
-                        jobs=[job for queue in requests_by_gpu.values() for job in queue]
-                        if all(i in costs for _,start,records in jobs for i in range(start,start+len(records))):
-                            prioritized_requests=deque(sorted(jobs,key=lambda job:(
-                                -sum(costs[i] for i in range(job[1],job[1]+len(job[2]))),job[0])))
-                            for queue in requests_by_gpu.values():
-                                queue.clear()
-                            print(f'[Controller] Evaluation batches ordered by step {max(previous)} response lengths: '
-                                  f'{[job[0] for job in prioritized_requests]}',flush=True)
-            pending = {}
-            if question_results:
-                print(f'[Controller] Reused {len(question_results)*self.eval_rollouts_per_prompt} saved evaluation replies.',flush=True)
-            partial_stop=stop_from_partial()
-            if partial_stop:
-                return partial_stop
-            lpush = getattr(client, "lpush", None)
-            if not callable(lpush):
-                raise TypeError("Controller Redis client must provide lpush().")
-
-            def dispatch_next(gpu_id):
-                if prioritized_requests is not None:
-                    if not prioritized_requests:
-                        return
-                    index,start,records=prioritized_requests.popleft()
-                else:
-                    owner=gpu_id
-                    if not requests_by_gpu[owner] and work_stealing:
-                        owner=max(requests_by_gpu,key=lambda key:len(requests_by_gpu[key]))
-                    if not requests_by_gpu[owner]:
-                        return
-                    index, start, records = requests_by_gpu[owner].popleft()
-                    if owner!=gpu_id:
-                        print(f'[Controller] Idle Actor GPU {gpu_id} took queued evaluation batch {index} from GPU {owner}.',flush=True)
-                questions, answers = self._records_to_signals(records)
-                signals: dict[str, object] = {
-                    "evaluation_id": evaluation_id,
-                    "evaluation_batch_index": index,
-                    "evaluation_gpu_id": gpu_id,
-                    "policy_version": self._last_policy_version,
-                    "questions": questions,
-                    "answers": answers,
-                    "records": copy.deepcopy(records),
-                }
-                if scheduled_count:
-                    signals['evaluation_rollouts_per_prompt'] = self.eval_rollouts_per_prompt
-                pending[index] = (gpu_id, start, records)
-                lpush(f"{keys['actor_eval']}:gpu:{gpu_id}", pickle.dumps(signals, protocol=pickle.HIGHEST_PROTOCOL))
-
-            for gpu_id in requests_by_gpu:
-                dispatch_next(gpu_id)
-            print(
-                f"[Controller] Evaluation step={completed_steps}, dataset={dataset_name}: "
-                f"parallel Actor GPUs={list(requests_by_gpu)}, "
-                f"at most {self.eval_prompts_per_batch * self.eval_rollouts_per_prompt} rollouts per Actor call.",
-                flush=True,
-            )
-            while pending:
-                result = self._pop_message(
-                    client,
-                    result_key=keys["eval_results"],
-                    actor_manager=actor_manager,
-                    learner_manager=learner_manager,
-                    teacher_manager=teacher_manager,
-                )
-                if result.get("evaluation_id") != evaluation_id:
-                    raise RuntimeError(
-                        f"Expected evaluation result {evaluation_id!r}, got {result.get('evaluation_id')!r}."
-                    )
-                index = result.get("evaluation_batch_index")
-                if isinstance(index, bool) or not isinstance(index, int) or index not in pending:
-                    raise RuntimeError("Controller received an unknown or duplicate evaluation batch index.")
-                gpu_id, start, records = pending[index]
-                result_gpu = result.get("evaluation_gpu_id")
-                if isinstance(result_gpu, bool) or not isinstance(result_gpu, int) or result_gpu != gpu_id:
-                    raise RuntimeError("Controller received an evaluation result from the wrong GPU.")
-                actor_metrics = result.get("actor_metrics")
-                actual_version = actor_metrics.get("lora_step") if isinstance(actor_metrics, Mapping) else None
-                if isinstance(actual_version, bool) or not isinstance(actual_version, int) or actual_version != self._last_policy_version:
-                    raise RuntimeError("Actor evaluation executed the wrong LoRA policy version.")
-                trajectory = result.get("traj")
-                if not isinstance(trajectory, Mapping):
-                    raise RuntimeError("Actor evaluation result does not contain a trajectory mapping.")
-                completed_questions=build_question_results(
-                        records,
-                        trajectory,
-                        rollouts_per_prompt=self.eval_rollouts_per_prompt,
-                        save_rollouts=self.save_eval_rollouts,
-                        start_index=start,
-                    )
-                cache.save(index,start,completed_questions)
-                question_results.extend(completed_questions)
-                del pending[index]
+            if distribute_replies:
+                from engine.evaluation_replies import run_distributed_reply_evaluation
+                partial_stop = run_distributed_reply_evaluation(
+                    self, client, records=dataset_records, evaluation_id=evaluation_id, cache=cache,
+                    question_results=question_results, stop_from_partial=stop_from_partial,
+                    actor_manager=actor_manager, learner_manager=learner_manager, teacher_manager=teacher_manager)
+                if partial_stop:
+                    return partial_stop
+                requests_by_gpu = {gpu: None for gpu in self.scheduling.actor_gpu_ids}
+            else:
+                # Preserve the original shard/batch identities for deterministic
+                # journals, but optionally let an idle Actor take a queued batch
+                # from a slower peer. Each GPU still has at most one request.
+                work_stealing=getattr(self,'actor_cfg',{}).get('evaluation',{}).get('work_stealing',False)
+                if not isinstance(work_stealing,bool):
+                    raise ValueError('actor.evaluation.work_stealing must be boolean')
+                requests_by_gpu = {}
+                batch_index = 0
+                for gpu_id, first, stop in question_shards(len(dataset_records), self.scheduling.actor_gpu_ids):
+                    requests = deque()
+                    for start in range(first, stop, self.eval_prompts_per_batch):
+                        records = dataset_records[start : min(stop, start + self.eval_prompts_per_batch)]
+                        cached=cache.load(batch_index,start,len(records),self.eval_rollouts_per_prompt)
+                        if cached is not None:
+                            question_results.extend(cached)
+                        else:
+                            requests.append((batch_index, start, records))
+                        batch_index += 1
+                    requests_by_gpu[gpu_id] = requests
+                prioritized_requests=None
+                # A few long AIME questions can keep the final GPU busy after
+                # its peer has emptied its queue. Start previously expensive
+                # batches first, preserving every batch/sample identity and seed.
+                if work_stealing:
+                    previous=[row['step'] for row in self.evaluation_history
+                              if row['step']<completed_steps and dataset_name in row['datasets']]
+                    if previous:
+                        prior_path=self.output_dir/'evaluations'/f'step_{max(previous):06d}_details.json'
+                        if prior_path.is_file():
+                            try:
+                                prior=json.loads(prior_path.read_text())['datasets'][dataset_name]['questions']
+                                costs={int(q['record_index']):sum(int(r['response_token_length']) for r in q['rollouts']) for q in prior}
+                            except (OSError,ValueError,KeyError,TypeError):
+                                costs={}
+                            jobs=[job for queue in requests_by_gpu.values() for job in queue]
+                            if all(i in costs for _,start,records in jobs for i in range(start,start+len(records))):
+                                prioritized_requests=deque(sorted(jobs,key=lambda job:(
+                                    -sum(costs[i] for i in range(job[1],job[1]+len(job[2]))),job[0])))
+                                for queue in requests_by_gpu.values():
+                                    queue.clear()
+                                print(f'[Controller] Evaluation batches ordered by step {max(previous)} response lengths: '
+                                      f'{[job[0] for job in prioritized_requests]}',flush=True)
+                pending = {}
+                if question_results:
+                    print(f'[Controller] Reused {len(question_results)*self.eval_rollouts_per_prompt} saved evaluation replies.',flush=True)
                 partial_stop=stop_from_partial()
                 if partial_stop:
                     return partial_stop
-                dispatch_next(gpu_id)
+                lpush = getattr(client, "lpush", None)
+                if not callable(lpush):
+                    raise TypeError("Controller Redis client must provide lpush().")
+
+                def dispatch_next(gpu_id):
+                    if prioritized_requests is not None:
+                        if not prioritized_requests:
+                            return
+                        index,start,records=prioritized_requests.popleft()
+                    else:
+                        owner=gpu_id
+                        if not requests_by_gpu[owner] and work_stealing:
+                            owner=max(requests_by_gpu,key=lambda key:len(requests_by_gpu[key]))
+                        if not requests_by_gpu[owner]:
+                            return
+                        index, start, records = requests_by_gpu[owner].popleft()
+                        if owner!=gpu_id:
+                            print(f'[Controller] Idle Actor GPU {gpu_id} took queued evaluation batch {index} from GPU {owner}.',flush=True)
+                    questions, answers = self._records_to_signals(records)
+                    signals: dict[str, object] = {
+                        "evaluation_id": evaluation_id,
+                        "evaluation_batch_index": index,
+                        "evaluation_gpu_id": gpu_id,
+                        "policy_version": self._last_policy_version,
+                        "questions": questions,
+                        "answers": answers,
+                        "records": copy.deepcopy(records),
+                    }
+                    if scheduled_count:
+                        signals['evaluation_rollouts_per_prompt'] = self.eval_rollouts_per_prompt
+                    pending[index] = (gpu_id, start, records)
+                    lpush(f"{keys['actor_eval']}:gpu:{gpu_id}", pickle.dumps(signals, protocol=pickle.HIGHEST_PROTOCOL))
+
+                for gpu_id in requests_by_gpu:
+                    dispatch_next(gpu_id)
+                print(
+                    f"[Controller] Evaluation step={completed_steps}, dataset={dataset_name}: "
+                    f"parallel Actor GPUs={list(requests_by_gpu)}, "
+                    f"at most {self.eval_prompts_per_batch * self.eval_rollouts_per_prompt} rollouts per Actor call.",
+                    flush=True,
+                )
+                while pending:
+                    result = self._pop_message(
+                        client,
+                        result_key=keys["eval_results"],
+                        actor_manager=actor_manager,
+                        learner_manager=learner_manager,
+                        teacher_manager=teacher_manager,
+                    )
+                    if result.get("evaluation_id") != evaluation_id:
+                        raise RuntimeError(
+                            f"Expected evaluation result {evaluation_id!r}, got {result.get('evaluation_id')!r}."
+                        )
+                    index = result.get("evaluation_batch_index")
+                    if isinstance(index, bool) or not isinstance(index, int) or index not in pending:
+                        raise RuntimeError("Controller received an unknown or duplicate evaluation batch index.")
+                    gpu_id, start, records = pending[index]
+                    result_gpu = result.get("evaluation_gpu_id")
+                    if isinstance(result_gpu, bool) or not isinstance(result_gpu, int) or result_gpu != gpu_id:
+                        raise RuntimeError("Controller received an evaluation result from the wrong GPU.")
+                    actor_metrics = result.get("actor_metrics")
+                    actual_version = actor_metrics.get("lora_step") if isinstance(actor_metrics, Mapping) else None
+                    if isinstance(actual_version, bool) or not isinstance(actual_version, int) or actual_version != self._last_policy_version:
+                        raise RuntimeError("Actor evaluation executed the wrong LoRA policy version.")
+                    trajectory = result.get("traj")
+                    if not isinstance(trajectory, Mapping):
+                        raise RuntimeError("Actor evaluation result does not contain a trajectory mapping.")
+                    completed_questions=build_question_results(
+                            records,
+                            trajectory,
+                            rollouts_per_prompt=self.eval_rollouts_per_prompt,
+                            save_rollouts=self.save_eval_rollouts,
+                            start_index=start,
+                        )
+                    cache.save(index,start,completed_questions)
+                    question_results.extend(completed_questions)
+                    del pending[index]
+                    partial_stop=stop_from_partial()
+                    if partial_stop:
+                        return partial_stop
+                    dispatch_next(gpu_id)
 
             question_results.sort(key=lambda item: int(item["record_index"]))
             raw_metrics = compute_metrics(question_results, rollouts_per_prompt=self.eval_rollouts_per_prompt)
@@ -1150,6 +1166,8 @@ class Controller:
                 "incorrect_response_count": raw_metrics["incorrect_response_count"],
             }
             dataset_summaries[dataset_name] = {"metrics": metrics}
+            if distribute_replies:
+                dataset_summaries[dataset_name]["reply_layout"] = "striped_replies_v1"
             detail_datasets[dataset_name] = {"questions": question_results}
 
         result: dict[str, object] = {

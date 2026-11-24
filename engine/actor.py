@@ -1700,13 +1700,18 @@ class Actor:
                 or not isinstance(requested_count, int) or not 1 <= requested_count <= 64):
             raise ValueError('evaluation_rollouts_per_prompt must be an integer from 1 to 64.')
         rollouts_per_prompt = requested_count if requested_count is not None else int(evaluation.get("rollouts_per_prompt", 8))
-        if len(records) * rollouts_per_prompt > 64:
+        reply_plan = source.get("evaluation_reply_plan")
+        request_count = len(reply_plan["pairs"]) if reply_plan is not None else len(records) * rollouts_per_prompt
+        if request_count > 64:
             raise ValueError("A Redis Actor evaluation request may not exceed 64 rollouts.")
         previous_version = self._wave_policy_version
         self._wave_policy_version = version
         try:
-            generated = (self.generate_evaluation_rollouts(records, rollouts_per_prompt=requested_count)
-                         if requested_count is not None else self.generate_evaluation_rollouts(records))
+            if reply_plan is not None:
+                generated = self.generate_evaluation_rollouts(records, reply_plan=reply_plan)
+            else:
+                generated = (self.generate_evaluation_rollouts(records, rollouts_per_prompt=requested_count)
+                             if requested_count is not None else self.generate_evaluation_rollouts(records))
             actual_version = self.current_lora_step
             if actual_version == -1:
                 actual_version = 0
@@ -1737,6 +1742,7 @@ class Actor:
         *,
         prompt_alias: str | None = None,
         rollouts_per_prompt: int | None = None,
+        reply_plan: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Generate evaluation trajectories from complete dataset records.
 
@@ -1767,7 +1773,8 @@ class Actor:
             raise ValueError(
                 "actor.evaluation.rollouts_per_batch may not exceed the local evaluation limit of 128."
             )
-        if len(source) * rollouts_per_prompt > rollouts_per_batch:
+        request_count = len(reply_plan["pairs"]) if reply_plan is not None else len(source) * rollouts_per_prompt
+        if request_count > (min(64, rollouts_per_batch) if reply_plan is not None else rollouts_per_batch):
             raise ValueError(
                 "An Actor evaluation batch may not exceed actor.evaluation.rollouts_per_batch "
                 f"({rollouts_per_batch} rollouts)."
@@ -1784,7 +1791,21 @@ class Actor:
         ]
         sampling = copy.deepcopy(generation)
         sampling["n"] = rollouts_per_prompt
+        if reply_plan is not None:
+            from engine.evaluation_replies import reply_seed
+            pairs = reply_plan["pairs"]
+            if (len(set(map(tuple, pairs))) != len(pairs)
+                    or len(reply_plan["record_indices"]) != len(source)
+                    or any(not (0 <= q < len(source) and 0 <= s < reply_plan["replies"]) for q, s in pairs)):
+                raise ValueError("Invalid evaluation reply assignment.")
+            sampling = [{**generation, "n": 1, "seed": reply_seed(generation.get("seed", self.run_cfg.get("seed", 42)),
+                reply_plan["identity"], reply_plan["record_indices"][q], s)} for q, s in pairs]
+            prompts = [prompts[q] for q, _ in pairs]
         trajectory = self.generate_rollouts(prompts, sampling, EVALUATION_RETURN_SIGNALS)
+        if reply_plan is not None:
+            if len(trajectory["prompt_indices"]) != len(pairs):
+                raise RuntimeError("Actor returned the wrong number of distributed evaluation replies.")
+            trajectory["prompt_indices"] = _torch().tensor([pairs[int(i)][0] for i in trajectory["prompt_indices"]], dtype=_torch().int32)
         result: dict[str, object] = {"records": source, "traj": trajectory}
         metadata = self.pop_rollout_metadata()
         if metadata:
@@ -3126,6 +3147,14 @@ class ActorManager:
                 if not isinstance(envelope, Mapping):
                     raise TypeError("Actor shard result must be a signal mapping.")
                 batches = self._wave_collector.add(envelope)
+                if resolve_scheduling(self.config).overlap:
+                    # Each shard contains complete question groups. Publish
+                    # immediately; local GPU gates protect the later handoff.
+                    incoming = client.pipeline()
+                    for shard in envelope["batches"]:
+                        incoming.lpush(f"{root}:overlap:{envelope['round_id']}:groups",
+                                       pickle.dumps(shard, protocol=pickle.HIGHEST_PROTOCOL))
+                    incoming.execute()
                 if batches is None:
                     continue
                 # One transaction exposes an entire wave in its declared

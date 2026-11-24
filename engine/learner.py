@@ -1371,7 +1371,7 @@ class Learner:
                 continue
 
         local_results: list[tuple[int, float, float]] = []
-        local_indices = _balanced_indices(len(to_probe), self.world_size, self.rank)
+        local_indices = self._signal_indices(len(to_probe))
         # A dual-probe mask grows quadratically with sequence length.  It is
         # deliberately one rollout wide, matching the fixed training shape
         # and eliminating any ragged cross-rollout padding.
@@ -1381,7 +1381,7 @@ class Learner:
                 local_results.append(result)
 
         gathered: list[list[tuple[int, float, float]] | None]
-        if _distributed_active():
+        if _distributed_active() and not getattr(self, "_local_signal_collection", False):
             gathered = [None for _ in range(self.world_size)]
             dist.all_gather_object(gathered, local_results)
         else:
@@ -1607,7 +1607,7 @@ class Learner:
 
         local: list[tuple[int, dict[str, torch.Tensor]]] = []
         with self._bounded_sdpa_context():
-            for index in _balanced_indices(total, self.world_size, self.rank):
+            for index in self._signal_indices(total):
                 micro_batch = self._build_rollout_micro_batch(logical, index)
                 computed = self._plugin_compute_logits(
                     micro_batch,
@@ -1622,7 +1622,7 @@ class Learner:
                 }))
 
         gathered: list[object | None]
-        if _distributed_active():
+        if _distributed_active() and not getattr(self, "_local_signal_collection", False):
             gathered = [None for _ in range(self.world_size)]
             dist.all_gather_object(gathered, local)
         else:
@@ -1639,6 +1639,11 @@ class Learner:
         if any(set(signals) != set(keys) for signals in ordered):
             raise RuntimeError("Learner signal collection returned inconsistent fields across rollouts.")
         return {key: [signals[key] for signals in ordered] for key in keys}
+
+    def _signal_indices(self, total):
+        if getattr(self, "_local_signal_collection", False):
+            return range(total)
+        return _balanced_indices(total, self.world_size, self.rank)
 
     def _plugin_compute_logits(
         self,
@@ -3310,6 +3315,9 @@ class Learner:
             self.initialize_engine()
         if self.scheduling_plan.shared and self.round_gate is None:
             raise RuntimeError("Shared-GPU Learner execution requires the Controller's round gate.")
+        if self.scheduling_plan.overlap:
+            from engine.overlap import run_overlapped_learner
+            return run_overlapped_learner(self, stop_event)
         client = self._redis_client() if self.rank == 0 else None
         last_round = 0
         if self.rank == 0:

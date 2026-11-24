@@ -477,6 +477,7 @@ def _call_actor_evaluation_api(
     actor: object,
     records: list[dict[str, object]],
     prompt_alias: str | None,
+    reply_plan: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Call the public offline Actor API with a clear compatibility error."""
 
@@ -488,7 +489,10 @@ def _call_actor_evaluation_api(
         method = getattr(actor, method_name, None)
         if not callable(method):
             continue
-        result = method(records, prompt_alias=prompt_alias)
+        kwargs = {"prompt_alias": prompt_alias}
+        if reply_plan is not None:
+            kwargs["reply_plan"] = reply_plan
+        result = method(records, **kwargs)
         if not isinstance(result, Mapping):
             raise TypeError(f"Actor.{method_name}() must return a mapping.")
         if "traj" not in result:
@@ -540,6 +544,7 @@ def _evaluation_worker(
                     actor,
                     [dict(record) for record in records],
                     prompt_alias,
+                    **({"reply_plan": task["reply_plan"]} if "reply_plan" in task else {}),
                 )
                 # Explicit checkpoint evaluations must never silently turn
                 # into base-model evaluations if Actor quarantines an adapter.
@@ -639,6 +644,9 @@ def execute_actor_tasks(
 
     if not tasks:
         return {}
+    if config.get("actor", {}).get("evaluation", {}).get("distribute_replies", False):
+        from engine.evaluation_replies import run_offline_reply_pool
+        return run_offline_reply_pool(config, tasks)
     actor_cfg = _as_mapping(config.get("actor"), "actor")
     raw_gpu_ids = actor_cfg.get("gpu_ids")
     if not isinstance(raw_gpu_ids, list) or not raw_gpu_ids:

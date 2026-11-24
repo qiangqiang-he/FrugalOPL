@@ -22,6 +22,7 @@ class SchedulingPlan:
     learner_gpu_ids: tuple[int, ...]
     max_inflight_batches: int
     shared: bool
+    overlap: bool = False
 
     @property
     def actor_batches_per_wave(self) -> int:
@@ -33,6 +34,8 @@ class SchedulingPlan:
 
     @property
     def mode(self) -> str:
+        if self.overlap:
+            return "shared_overlap"
         if not self.shared:
             return "async"
         return "shared_serial" if self.max_inflight_batches == 1 else "shared_batched"
@@ -66,7 +69,26 @@ def resolve_scheduling(config: Mapping[str, object]) -> SchedulingPlan:
             raise ValueError(
                 f"{worker}.{name}.max_batches_per_turn is removed; use controller.max_inflight_batches."
             )
-    return SchedulingPlan(actor_ids, learner_ids, inflight, bool(overlap))
+    streaming = controller.get("overlap_actor_learner", False)
+    if not isinstance(streaming, bool):
+        raise ValueError("controller.overlap_actor_learner must be boolean.")
+    if streaming and (not overlap or inflight != 1):
+        raise ValueError("Actor/Learner overlap requires identical GPU sets and max_inflight_batches=1.")
+    if streaming:
+        nodes = config.get("pipeline", [])
+        if [node.get("class") for node in nodes] != ["Controller", "Actor", "Learner"]:
+            raise ValueError("Actor/Learner overlap requires a Controller -> Actor -> Learner pipeline.")
+        plugin = config.get("algorithm", {}).get("plugin")
+        supported = {"KLOPSDPlugin", "SelfShotOPSDPlugin", "RatioOPSDPlugin", "TCAPlugin",
+                     "TCPOV1Plugin", "TCDOPlugin", "RewardGuidedOPSDPlugin", "GRPOPlugin"}
+        if plugin not in supported:
+            raise ValueError(f"Actor/Learner overlap has no group-streaming contract for {plugin!r}.")
+        ds_config = learner.get("deepspeed", {})
+        if (ds_config.get("zero_optimization", {}).get("stage", 0) != 0
+                or not ds_config.get("managed_gradient_accumulation", True)
+                or ds_config.get("gradient_accumulation_steps", 1) != 1):
+            raise ValueError("Actor/Learner overlap requires ZeRO stage 0, managed accumulation and GAS=1.")
+    return SchedulingPlan(actor_ids, learner_ids, inflight, bool(overlap), streaming)
 
 
 def question_shards(question_count: int, gpu_ids: tuple[int, ...]) -> list[tuple[int, int, int]]:

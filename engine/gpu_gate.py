@@ -61,6 +61,7 @@ class SharedRoundGate:
         self._manifest = context.Array("c", max(16384, max_batches * 256), lock=False)
         self._error = context.Array("c", 4096, lock=False)
         self._actor_done = context.Array("b", len(actor_gpu_ids), lock=False)
+        self._actor_finished_at = context.Array("d", len(actor_gpu_ids), lock=False)
         self._learner_ready = context.Array("b", learner_ranks, lock=False)
         self._learner_done = context.Array("b", learner_ranks, lock=False)
 
@@ -105,6 +106,7 @@ class SharedRoundGate:
             self._round.value = manifest.round_id
             for index, gpu_id in enumerate(self.actor_gpu_ids):
                 self._actor_done[index] = int(gpu_id not in active)
+                self._actor_finished_at[index] = 0.0
             for index in range(self.learner_ranks):
                 self._learner_ready[index] = self._learner_done[index] = 0
             self._phase.value = 1
@@ -134,9 +136,33 @@ class SharedRoundGate:
             if self._actor_done[index]:
                 raise RuntimeError("Duplicate Actor round acknowledgement.")
             self._actor_done[index] = 1
+            self._actor_finished_at[index] = time.monotonic()
             if all(self._actor_done):
                 self._phase.value = 2
             self._condition.notify_all()
+
+    def wait_local_learner(self, gpu_id, after_round=0, stop_event=None, *, timeout=1.0):
+        """Admit a Learner as soon as its own Actor has released the card."""
+        index = self.actor_gpu_ids.index(gpu_id)
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                self._check()
+                if self._stopped(stop_event):
+                    return None
+                if self._phase.value in (1, 2) and self._round.value > after_round and self._actor_done[index]:
+                    return self._read_manifest()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(min(0.1, remaining))
+
+    def actor_finish_times(self, round_id):
+        with self._condition:
+            self._check()
+            if self._round.value != round_id:
+                raise RuntimeError("Actor timing requested for a different round.")
+            return dict(zip(self.actor_gpu_ids, self._actor_finished_at[:]))
 
     def wait_learner(self, after_round: int = 0, stop_event=None, *, timeout: float | None = None) -> RoundManifest | None:
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
@@ -152,11 +178,16 @@ class SharedRoundGate:
                     return None
                 self._condition.wait(0.1 if remaining is None else min(0.1, remaining))
 
-    def learner_ready(self, rank: int, round_id: int, stop_event=None) -> bool:
+    def learner_ready(self, rank: int, round_id: int, stop_event=None, *, wait_for_actors=False) -> bool:
         if rank not in range(self.learner_ranks):
             raise ValueError("Unknown Learner rank.")
         with self._condition:
             self._check()
+            while wait_for_actors and self._round.value == round_id and self._phase.value == 1:
+                if self._stopped(stop_event):
+                    return False
+                self._condition.wait(0.1)
+                self._check()
             if self._round.value != round_id or self._phase.value != 2:
                 raise RuntimeError("Learner readiness does not match the active round.")
             if self._learner_ready[rank]:

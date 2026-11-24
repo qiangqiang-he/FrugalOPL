@@ -1,0 +1,12 @@
+# Keep complete n=16 groups for TCPO weights; distribute individual work later.
+extends: qwen3_1p7b_200steps_8GPU.yaml
+run:
+  name: tcpo_v1_qwen3_1p7b_overlap_8gpu_b16n16
+  group: tcpo-v1-overlap-8gpu
+  redis:
+    key_prefix: tcpo_v1_qwen3_1p7b_overlap_8gpu
+controller:
+  overlap_actor_learner: true
+actor:
+  evaluation:
+    distribute_replies: true

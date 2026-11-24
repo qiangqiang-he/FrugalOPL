@@ -36,12 +36,18 @@ GPU lists must be disjoint or identical. With an in-flight limit of `K`,
 disjoint Workers overlap generation and learning and generate
 `max(1, K // 2)` global batches per Actor wave. Identical lists generate `K`
 global batches, then consume each batch exactly once before handing the GPUs
-back to the Actors; a window of one is strictly serial. The final wave uses
+back to the Actors; a window of one is serial by default. The final wave uses
 only the remaining batches (for example, ten steps with `K=4` use `4+4+2`
 in shared mode). A global batch is sharded by question across Actor GPUs,
 keeping all rollouts for each question together. Partial
 overlap is rejected. Actor and Learner no longer accept separate
 `max_batches_per_turn` settings: change only `controller.max_inflight_batches`.
+For same-card execution with one in-flight batch,
+`controller.overlap_actor_learner: true` enables per-card handoff and a shared
+one-rollout Learner queue, followed by one synchronized optimizer update.
+`actor.evaluation.distribute_replies: true` spreads each question's replies
+across Actors in both periodic and standalone evaluation. See
+[Actor/Learner overlap](docs/actor_learner_overlap.md) for configuration and validation.
 Teacher forwarding retains its existing independent budget. Strictly serial
 validation uses an explicit window of one in the validation entry point.
 
