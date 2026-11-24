@@ -1,0 +1,19 @@
+# TCA on 8 x 80 GB: one synchronous 32-question x 8-reply batch.
+# Every GPU hosts an Actor and a Learner; all Actors roll out before learning.
+extends: tca_4GPU.yaml
+run:
+  name: tca_8gpu_override_model_name
+  group: tca-8gpu
+controller:
+  train_prompt_batch_size: 32
+actor:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  engine:
+    gpu_memory_utilization: 0.75
+learner:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  distributed:
+    master_port: 29685
+algorithm:
+  training_sampling:
+    n: 8

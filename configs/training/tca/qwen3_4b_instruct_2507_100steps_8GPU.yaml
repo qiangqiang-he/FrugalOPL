@@ -1,0 +1,14 @@
+extends: ../../common/tca_8GPU.yaml
+run:
+  name: tca_qwen3_4b_instruct_2507_100steps_8gpu_b32n8_topk512
+  group: tca-qwen3-4b-instruct-2507-8gpu
+  redis:
+    key_prefix: tca_qwen3_4b_instruct_2507_8gpu
+  policy:
+    model_name_or_path: Qwen/Qwen3-4B-Instruct-2507
+actor:
+  engine:
+    gpu_memory_utilization: 0.80
+algorithm:
+  # This Instruct checkpoint has only non-thinking mode.
+  enable_thinking: false

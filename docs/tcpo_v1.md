@@ -2,6 +2,8 @@
 
 四份正式配置均使用 Qwen3 No Thinking，单次同步全局 batch 为 **16 个问题 × 每题 16 个回复 = 256 条轨迹**。所有 Actor 同时生成，生成结束后同卡 Learner 同步优化，再进入下一批。
 
+新增 Qwen3-4B-Instruct-2507 / Olmo 3 7B Instruct 的 8 卡 TCA 使用 **32 题 × 8 回复**，见 [新增配置与启动方式](tca_instruct_8gpu.md)。
+
 | 算法 | 模型 | GPU | Steps | 配置 |
 | --- | --- | --- | --- | --- |
 | TCPO_v1 | Qwen3-1.7B | 8 × 80 GB | 200 | `configs/training/tcpo_v1/qwen3_1p7b_200steps_8GPU.yaml` |
@@ -13,14 +15,14 @@
 
 ## 目标分布
 
-Student 为 p，冻结的特权 Teacher 为 q。Teacher 使用同题标准解答构造 conversation self-shot 上下文，LoRA 禁用，基础参数冻结，不随 Student 更新。支持集和 TCA 目标为：
+Teacher 使用同题标准解答构造 conversation self-shot 上下文，LoRA 禁用，基础参数冻结，不随 Student 更新。每个位置先选 Student 的 Top-k（默认 512），Student 和 Teacher 均在这些 token 上归一化，记为 p、q。支持集和 TCA 目标为：
 
 ```text
 S = {i: p_i >= 0.01 * max(p)}
 r_i = normalize((p_i^2 / q_i) * 1[i in S])
 ```
 
-实现使用 log 空间计算，在全词表上归一化；目标分布停止梯度。所有损失均为 Forward KL，没有额外 RL Loss。
+实现使用 log 空间计算，在上述 Top-k 内归一化；目标分布停止梯度。整段回复一次计算，不按 token 分块。所有损失均为 Forward KL，没有额外 RL Loss。
 
 **TCA（Teacher-Contrastive Amplification，教师对比放大）**：全部轨迹、全部有效回复 token 均优化 `KL(stopgrad(r) || p)`。答案正确性和截断状态不改变该目标。
 

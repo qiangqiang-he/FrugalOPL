@@ -3,6 +3,8 @@ A lightweight framework for efficient on-policy learning in LLMs.
 
 TCPO_v1 与 TCA 的 Qwen3-1.7B / 4B 四份服务器配置、16×16 batch、组内加权目标、32K AMC23 / AIME24 Avg@16 评测和启动命令见 [训练说明](docs/tcpo_v1.md)。
 
+Qwen3-4B-Instruct-2507 与 Olmo 3 7B Instruct 的新增 **8 卡 TCA** 配置使用 **32 题 × 8 回复**，100 steps，Top-k 512，训练 8192 / 评测 32768；启动命令见 [8 卡 Instruct TCA](docs/tca_instruct_8gpu.md)。
+
 `GRPOPlugin` is the shared binary-reward RL baseline for both training and
 Controller/Actor/Learner integration checks. It renders prompts, obtains verified
 rewards (with answer probing for truncated responses), computes group-relative

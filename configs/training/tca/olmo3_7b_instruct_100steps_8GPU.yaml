@@ -1,0 +1,21 @@
+extends: ../../common/tca_8GPU.yaml
+run:
+  name: tca_olmo3_7b_instruct_100steps_8gpu_b32n8_topk512
+  group: tca-olmo3-7b-instruct-8gpu
+  redis:
+    key_prefix: tca_olmo3_7b_instruct_8gpu
+  policy:
+    model_name_or_path: allenai/Olmo-3-7B-Instruct
+actor:
+  engine:
+    # The 7B model has MHA and mixed sliding/full attention. Budget the Actor
+    # alongside the resident Learner and use fewer concurrent long sequences.
+    gpu_memory_utilization: 0.70
+    max_num_seqs: 8
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8]
+learner:
+  distributed:
+    master_port: 29687
+algorithm:
+  enable_thinking: false
