@@ -1,0 +1,10 @@
+extends:
+  - ../../common/clip_opsd_4GPU.yaml
+  - ../../models/qwen3_1p7b.yaml
+run:
+  name: Clip-OPSD_Qwen3-1.7B_100steps_4gpus
+  redis:
+    key_prefix: clip_opsd_qwen3_1p7b_100steps_4gpu
+learner:
+  distributed:
+    master_port: 29901

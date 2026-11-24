@@ -1,0 +1,10 @@
+extends: teacher_alignment.yaml
+actor:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+learner:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+algorithm:
+  plugin: TRAPlugin
+  algo_name: TRA
+  kl_token_clip: null
+  tra_plausible_fraction: 0.01

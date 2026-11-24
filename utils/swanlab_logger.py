@@ -157,6 +157,9 @@ class SwanLabLogger:
         )
         self.workspace = _optional_text(swanlab_cfg.get("workspace", "qhe"), "run.swanlab.workspace")
         self.mode = _optional_text(swanlab_cfg.get("mode", "online"), "run.swanlab.mode")
+        self.public = swanlab_cfg.get("public")
+        if self.public is not None and not isinstance(self.public, bool):
+            raise ValueError("run.swanlab.public must be a boolean when configured.")
         if self.mode not in {"online", "local", "offline", "disabled"}:
             raise ValueError("run.swanlab.mode must be online, local, offline, or disabled.")
 
@@ -315,8 +318,10 @@ class SwanLabLogger:
         local_dir = self._local_log_dir()
         local_dir.mkdir(parents=True, exist_ok=True)
         resume_options = {}
+        if self.public is not None:
+            resume_options['public'] = self.public
         if self.mode == "online":
-            resume_options = {"resume": "never", "parallel": "none"}
+            resume_options.update(resume="never", parallel="none")
             if saved_run_id is not None:
                 resume_options.update(id=saved_run_id, resume="must")
         run = swanlab.init(

@@ -1,0 +1,10 @@
+extends:
+  - ../../common/tra_8GPU.yaml
+  - ../../models/qwen3_4b.yaml
+run:
+  name: TRA_Qwen3-4B_100steps_8gpus
+  redis:
+    key_prefix: tra_qwen3_4b_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29905

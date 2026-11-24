@@ -1,0 +1,10 @@
+extends:
+  - ../../common/clip_opsd_4GPU.yaml
+  - ../../models/deepseek_7b.yaml
+run:
+  name: Clip-OPSD_deepseek-7b_100steps_4gpus
+  redis:
+    key_prefix: clip_opsd_deepseek_7b_100steps_4gpu
+learner:
+  distributed:
+    master_port: 29922

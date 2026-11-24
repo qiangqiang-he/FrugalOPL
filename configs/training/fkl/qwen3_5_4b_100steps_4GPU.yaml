@@ -1,0 +1,10 @@
+extends:
+  - ../../common/fkl_4GPU.yaml
+  - ../../models/qwen3_5_4b.yaml
+run:
+  name: FKL_Qwen3.5-4B_100steps_4gpus
+  redis:
+    key_prefix: fkl_qwen3_5_4b_100steps_4gpu
+learner:
+  distributed:
+    master_port: 29906

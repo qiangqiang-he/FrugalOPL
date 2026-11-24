@@ -20,6 +20,9 @@ from .ratio_opsd_plugin import RatioOPSDPlugin
 from .tcdo_plugin import TCDOPlugin
 from .tcpo_v1_plugin import TCPOV1Plugin
 from .tca_plugin import TCAPlugin
+from .fkl_plugin import FKLPlugin
+from .clip_opsd_plugin import ClipOPSDPlugin
+from .tra_plugin import TRAPlugin
 from .tail_sup_plugin import TailSupPlugin
 from .rado_plugin import RADOPlugin
 
@@ -41,6 +44,9 @@ __all__ = [
     "TCDOPlugin",
     "TCPOV1Plugin",
     "TCAPlugin",
+    "FKLPlugin",
+    "ClipOPSDPlugin",
+    "TRAPlugin",
     "TailSupPlugin",
     "RADOPlugin",
     "plugin_class_from_name",

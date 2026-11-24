@@ -1,0 +1,10 @@
+extends:
+  - ../../common/tra_8GPU.yaml
+  - ../../models/deepseek_7b.yaml
+run:
+  name: TRA_deepseek-7b_100steps_8gpus
+  redis:
+    key_prefix: tra_deepseek_7b_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29923

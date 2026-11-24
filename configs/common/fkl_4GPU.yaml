@@ -1,0 +1,9 @@
+extends: teacher_alignment.yaml
+actor:
+  gpu_ids: [0, 1, 2, 3]
+learner:
+  gpu_ids: [0, 1, 2, 3]
+algorithm:
+  plugin: FKLPlugin
+  algo_name: FKL
+  kl_token_clip: null

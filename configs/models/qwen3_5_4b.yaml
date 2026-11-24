@@ -1,0 +1,15 @@
+run:
+  group: Qwen3.5-4B
+  policy:
+    model_name_or_path: Qwen/Qwen3.5-4B
+    model_loader: multimodal_lm
+    lora:
+      target_modules: 'model\.language_model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\.(in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj)|mlp\.(gate_proj|up_proj|down_proj))'
+actor:
+  engine:
+    max_num_seqs: 8
+    kv_cache_memory_bytes: 17179869184
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8]
+algorithm:
+  enable_thinking: false

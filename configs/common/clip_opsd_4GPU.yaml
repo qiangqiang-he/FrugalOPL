@@ -1,0 +1,5 @@
+extends: fkl_4GPU.yaml
+algorithm:
+  plugin: ClipOPSDPlugin
+  algo_name: Clip-OPSD
+  kl_token_clip: 1.0e-7
