@@ -327,7 +327,7 @@ def run_overlapped_learner(learner, stop_event):
                 raise
             finally:
                 try:
-                    if learner.cpu_offload:
+                    if learner.cpu_offload or learner.offload_frozen_base_between_turns:
                         learner._offload_model()
                     else:
                         learner._release_shared_gpu_turn_memory(suppress_errors=not success)

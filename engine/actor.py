@@ -1198,12 +1198,12 @@ class Actor:
             return result
         if not isinstance(raw_compilation, Mapping):
             raise ValueError("actor.engine.compilation_config must be a mapping.")
-        allowed = {"cudagraph_capture_sizes", "cudagraph_specialize_lora"}
+        allowed = {"cudagraph_capture_sizes", "cudagraph_specialize_lora", "inductor_compile_config"}
         unexpected = sorted(str(key) for key in raw_compilation if key not in allowed)
         if unexpected:
             raise ValueError(
                 "actor.engine.compilation_config only supports "
-                "cudagraph_capture_sizes and cudagraph_specialize_lora; got "
+                "cudagraph_capture_sizes, cudagraph_specialize_lora and inductor_compile_config; got "
                 f"{', '.join(unexpected)}."
             )
 
@@ -1228,6 +1228,15 @@ class Actor:
             if not isinstance(specialize_lora, bool):
                 raise ValueError("actor.engine.compilation_config.cudagraph_specialize_lora must be a boolean.")
             compilation["cudagraph_specialize_lora"] = specialize_lora
+        if "inductor_compile_config" in raw_compilation:
+            tuning = raw_compilation["inductor_compile_config"]
+            tuning_keys = {"combo_kernels", "benchmark_combo_kernel", "triton.autotune_at_compile_time"}
+            if not isinstance(tuning, Mapping) or any(key not in tuning_keys for key in tuning):
+                raise ValueError("actor.engine.compilation_config.inductor_compile_config only supports "
+                                 "combo_kernels, benchmark_combo_kernel and triton.autotune_at_compile_time.")
+            if any(not isinstance(value, bool) for value in tuning.values()):
+                raise ValueError("Inductor tuning settings must be booleans.")
+            compilation["inductor_compile_config"] = dict(tuning)
         result["compilation_config"] = compilation
         return result
 

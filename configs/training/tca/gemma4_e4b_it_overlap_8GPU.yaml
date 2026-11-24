@@ -1,0 +1,12 @@
+# 80 GB GPUs keep the BF16 base resident. Per-card handoff, same 32 x 8 batch.
+extends: gemma4_e4b_it_100steps_8GPU.yaml
+run:
+  name: tca_gemma4_e4b_it_overlap_8gpu_b32n8_topk512
+  group: tca-gemma4-overlap-8gpu
+  redis:
+    key_prefix: tca_gemma4_e4b_it_overlap_8gpu
+controller:
+  overlap_actor_learner: true
+actor:
+  evaluation:
+    distribute_replies: true

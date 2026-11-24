@@ -36,6 +36,7 @@ actor:
 已提供 8 卡配置：
 
 - `configs/training/tca/qwen3_4b_instruct_2507_overlap_8GPU.yaml`：32 题 × 8 回复，100 steps。
+- `configs/training/tca/gemma4_e4b_it_overlap_8GPU.yaml`：Gemma 4 E4B No thinking，32 题 × 8 回复，100 steps。
 - `configs/training/tcpo_v1/qwen3_1p7b_overlap_8GPU.yaml`：16 题 × 16 回复，200 steps。
 
 模型、LoRA、学习率和评测间隔继承原配置；训练上限 8192，评测上限 32768，Avg@16。其他模型配置也可添加上述两个开关。
@@ -58,6 +59,43 @@ bash scripts/start_eval.sh --tmux tests/configs/overlap/eval_2gpu.yaml
 ```
 
 双卡测试使用 Qwen3-1.7B No thinking、LoRA r=64/alpha=128，训练上限 1024、评测上限 128，用于验证计算、交接和回传。测试评测的准确率不作为正式 benchmark 成绩。双卡验证不代表已在 8 卡上实测。
+
+## Gemma 4 的双卡显存配置
+
+Gemma 4 E4B 的完整 BF16 Learner 与 vLLM 文本 Actor 权重合计约 28.9 GiB，尚未包括 LoRA、优化器、KV 和 CUDA Graph。24 GB 卡上需要在 Actor/Learner 交接时转移冻结的基础权重：
+
+```yaml
+learner:
+  execution:
+    offload_frozen_base_between_turns: true
+actor:
+  engine:
+    compilation_config:
+      inductor_compile_config:
+        combo_kernels: false
+        benchmark_combo_kernel: false
+        triton.autotune_at_compile_time: false
+```
+
+冻结基础权重按原精度转移到 CPU；可训练 LoRA、DeepSpeed BF16 梯度缓冲及优化器状态保留在 GPU，支持多 rank、ZeRO stage 0。这个开关默认关闭，要求启用 LoRA，且 `pipeline` 中 Learner 节点的 `cpu_offload: false`。80 GB 配置保持默认常驻，避免 CPU 转移开销。
+
+关闭 combo-kernel 调优，并把 Triton 自动调优留到首次真实输入的预热阶段，避免编译时为 Gemma 大型 PLE 表创建额外的 5.25 GiB 测试输入。仍保留 torch.compile 和 CUDA Graph；`enforce_eager` 始终为 `false`。双卡测试使用小 KV 预算及较短上下文。
+
+8 卡启动示例（无 tmux）：
+
+```bash
+export FRUGALOPL_MODEL_PATH=/models/gemma-4-E4B-it
+bash scripts/start_train.sh --no-tmux configs/training/tca/gemma4_e4b_it_overlap_8GPU.yaml
+```
+
+双卡验证命令（有 tmux；测试配置只保留在本地）：
+
+```bash
+export FRUGALOPL_MODEL_PATH=/models/gemma-4-E4B-it
+bash scripts/start_train.sh --tmux tests/configs/overlap/gemma4_2gpu_r5.yaml
+```
+
+Gemma 4 E4B 的双卡短测已通过：每批 2 题 × 4 回复，完成两次 TCA 更新及每步 AMC23/AIME24 Avg@16 分卡评测。训练上限 1024、评测上限 128，用于链路检查。258 个文本 LoRA 模块（516 个 A/B 张量）的形状均匹配基础权重，所有模块都有非零更新，优化器状态有限；No thinking、CUDA Graph 及两次热加载均已核验。两批 Learner 分工分别为 4/4 和 5/3，采样显存峰值均为 21315 MiB；125 项 CPU 回归测试通过。此短测没有测得计算交叠，CPU 权重搬运也有额外开销，不用于推断正式训练吞吐或基准准确率。
 
 SwanLab 的 `learner/actor_learner_overlap_seconds` 记录单个 batch 中 Learner 计算区间与其他 Actor 活动时间的重叠，`learner/per_rank_rollout_counts/*` 记录动态分工。运行目录 `overlap/step_*.json` 保存逐样本领取归属、策略版本和各卡时间区间，便于核对无重复、无遗漏以及真实交叠。
 

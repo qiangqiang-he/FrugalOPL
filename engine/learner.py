@@ -555,6 +555,11 @@ class Learner:
         self.optimizer: object | None = None
         self.lr_scheduler: object | None = None
         self.lora_enabled = bool(_mapping(self.policy_cfg.get("lora", {}), "run.policy.lora").get("enabled", False))
+        self.offload_frozen_base_between_turns = self.execution_cfg.get("offload_frozen_base_between_turns", False)
+        if not isinstance(self.offload_frozen_base_between_turns, bool):
+            raise ValueError("learner.execution.offload_frozen_base_between_turns must be boolean.")
+        if self.offload_frozen_base_between_turns and (not self.lora_enabled or self.cpu_offload):
+            raise ValueError("Frozen-base offload requires LoRA and cpu_offload=false; optimizer buffers stay on GPU.")
         if self.teacher_sync_interval >= 0 and not self.lora_enabled:
             raise ValueError("Teacher synchronization requires run.policy.lora.enabled=true.")
         if self.save_ckpt_interval and not self.lora_enabled:
@@ -599,6 +604,8 @@ class Learner:
             zero = self.deepspeed_config().get("zero_optimization", {})
             if not isinstance(zero, Mapping) or int(zero.get("stage", 0)) != 0:
                 raise ValueError("Learner cpu_offload currently requires DeepSpeed ZeRO stage 0.")
+        if self.offload_frozen_base_between_turns and int(self.deepspeed_config().get("zero_optimization", {}).get("stage", 0)) != 0:
+            raise ValueError("Frozen-base offload currently requires DeepSpeed ZeRO stage 0.")
 
     def _default_device(self) -> torch.device:
         if torch.cuda.is_available():
@@ -737,7 +744,7 @@ class Learner:
         self._restore_training_state()
         if not self.pause_on_cuda_oom_only:
             self._validate_runtime_memory_after_load()
-        if self.cpu_offload:
+        if self.cpu_offload or self.offload_frozen_base_between_turns:
             self._offload_model()
         self._initialized = True
 
@@ -1161,6 +1168,8 @@ class Learner:
         self._optimizer_offload_count += 1
 
     def _activate_model(self) -> float:
+        if getattr(self, "offload_frozen_base_between_turns", False):
+            return self._transfer_frozen_base(self.device)
         if not self.cpu_offload or self.device.type != "cuda" or not torch.cuda.is_available():
             return 0.0
         if self._model_on_gpu and self._optimizer_on_gpu:
@@ -1186,6 +1195,9 @@ class Learner:
         return time.perf_counter() - started
 
     def _offload_model(self) -> float:
+        if getattr(self, "offload_frozen_base_between_turns", False):
+            self._zero_grad()
+            return self._transfer_frozen_base(torch.device("cpu"))
         if not self.cpu_offload or self.device.type != "cuda" or not torch.cuda.is_available():
             return 0.0
         if not self._model_on_gpu and not self._optimizer_on_gpu:
@@ -1211,7 +1223,52 @@ class Learner:
         self._model_offload_count += 1
         return time.perf_counter() - started
 
-    def _validate_model_load_headroom(self) -> None:
+    def _frozen_base_parameters(self):
+        """Optimizer-owned LoRA storages never move, including BF16 flat views."""
+        optimizer = self._optimizer_for_residency()
+        owned = set()
+        for name in ("bf16_groups", "fp16_groups"):
+            for group in getattr(optimizer, name, ()):
+                owned.update(id(parameter) for parameter in group)
+        for group in getattr(optimizer, "param_groups", ()):
+            owned.update(id(parameter) for parameter in group["params"])
+        return tuple(parameter for parameter in self._module().parameters()
+                     if not parameter.requires_grad and id(parameter) not in owned)
+
+    def _transfer_frozen_base(self, target):
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return 0.0
+        target = torch.device(target)
+        parameters = [parameter for parameter in self._frozen_base_parameters() if parameter.device != target]
+        if not parameters:
+            return 0.0
+        if target.type == "cuda" and not self.pause_on_cuda_oom_only:
+            self._validate_model_load_headroom(frozen_only=True)
+        self._synchronize_cuda()
+        started = time.perf_counter()
+        # Mark before copying so cleanup also handles a partially completed
+        # allocation. Frozen buffers are tiny and remain on their GPU.
+        self._model_on_gpu = target.type == "cuda"
+        with torch.no_grad():
+            for parameter in parameters:
+                if parameter.grad is not None:
+                    raise RuntimeError("A frozen base parameter unexpectedly owns a gradient.")
+                self._move_tensor_storage(parameter, target)
+        self._synchronize_cuda()
+        if target.type == "cpu":
+            torch.cuda.empty_cache()
+            self._model_offload_count += 1
+        else:
+            self._model_load_count += 1
+            if not self.pause_on_cuda_oom_only:
+                self._validate_runtime_memory_after_load()
+        elapsed = time.perf_counter() - started
+        moved_bytes = sum(parameter.numel() * parameter.element_size() for parameter in parameters)
+        print(f"[Learner GPU {self.gpu_id}] Frozen base -> {target}: {moved_bytes/1024**3:.2f} GiB, "
+              f"{elapsed:.2f}s; trainable LoRA and optimizer remain on GPU.", flush=True)
+        return elapsed
+
+    def _validate_model_load_headroom(self, *, frozen_only: bool = False) -> None:
         """Honor the configured free-memory target before a model moves in."""
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -1225,7 +1282,10 @@ class Learner:
         # must return alongside the model.  Count them before any GPU copy so
         # the configured device-wide free-memory target remains intact.
         optimizer_bytes = self._optimizer_residency_bytes() if self.cpu_offload and not self._optimizer_on_gpu else 0
-        required = int(minimum_gb * 1024**3) + self._model_size_bytes() + optimizer_bytes
+        model_bytes = self._model_size_bytes()
+        if frozen_only:
+            model_bytes = sum(p.numel() * p.element_size() for p in self._frozen_base_parameters() if p.device != self.device)
+        required = int(minimum_gb * 1024**3) + model_bytes + optimizer_bytes
         if free < required:
             raise MemoryError(
                 f"Learner model load needs {required / 1024**3:.2f} GB free, "
@@ -3408,7 +3468,7 @@ class Learner:
                 raise
             finally:
                 try:
-                    if self.cpu_offload:
+                    if self.cpu_offload or self.offload_frozen_base_between_turns:
                         model_offload_seconds += self._offload_model()
                     else:
                         # A non-offloaded Learner intentionally keeps its
