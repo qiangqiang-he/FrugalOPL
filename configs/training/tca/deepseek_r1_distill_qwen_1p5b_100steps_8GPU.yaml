@@ -1,0 +1,12 @@
+extends: ../../common/tca_8GPU.yaml
+run:
+  name: tca_deepseek_r1_distill_qwen_1p5b_100steps_8gpu_b32n8_topk512
+  group: tca-deepseek-distill-qwen-1p5b-8gpu
+  redis:
+    key_prefix: tca_deepseek_distill_qwen_1p5b_8gpu
+  policy:
+    model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    trust_remote_code: false
+algorithm:
+  # Keep the Distill model's native reasoning template.
+  enable_thinking: true

@@ -1,0 +1,11 @@
+extends: ../../common/tca_8GPU.yaml
+run:
+  name: tca_qwen3_4b_100steps_8gpu_b32n8_topk512
+  group: tca-qwen3-4b-8gpu
+  redis:
+    key_prefix: tca_qwen3_4b_8gpu
+  policy:
+    model_name_or_path: Qwen/Qwen3-4B
+    trust_remote_code: false
+algorithm:
+  enable_thinking: false

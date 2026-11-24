@@ -1,0 +1,23 @@
+extends: ../../common/tca_8GPU.yaml
+run:
+  name: tca_qwen3_5_4b_100steps_8gpu_b32n8_topk512
+  group: tca-qwen3-5-4b-8gpu
+  redis:
+    key_prefix: tca_qwen3_5_4b_8gpu
+  policy:
+    model_name_or_path: Qwen/Qwen3.5-4B
+    model_loader: multimodal_lm
+    trust_remote_code: false
+    lora:
+      # Text decoder only: include GatedDeltaNet projections in linear layers.
+      target_modules: 'model\.language_model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\.(in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj)|mlp\.(gate_proj|up_proj|down_proj))'
+actor:
+  engine:
+    # Preserve the native Qwen3_5ForConditionalGeneration architecture: its
+    # vLLM LoRA mapper handles both language_model and hybrid projections.
+    max_num_seqs: 8
+    kv_cache_memory_bytes: 17179869184
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8]
+algorithm:
+  enable_thinking: false
