@@ -1,0 +1,19 @@
+extends: qwen3_1p7b_100steps_8GPU.yaml
+run:
+  name: tra_mismatch_answer_Qwen3-1.7B_no-thinking_100steps_4gpus
+  redis:
+    key_prefix: tra_mismatch_answer_qwen3_1p7b_100steps_4gpu
+controller:
+  train_prompt_batch_size: 16
+actor:
+  gpu_ids: [0, 1, 2, 3]
+  evaluation:
+    generation:
+      max_response_length: 20480
+learner:
+  gpu_ids: [0, 1, 2, 3]
+  distributed:
+    master_port: 29941
+algorithm:
+  training_sampling:
+    n: 8

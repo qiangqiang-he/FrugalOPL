@@ -80,7 +80,8 @@ def resolve_scheduling(config: Mapping[str, object]) -> SchedulingPlan:
             raise ValueError("Actor/Learner overlap requires a Controller -> Actor -> Learner pipeline.")
         plugin = config.get("algorithm", {}).get("plugin")
         supported = {"KLOPSDPlugin", "SelfShotOPSDPlugin", "RatioOPSDPlugin", "TCAPlugin",
-                     "FKLPlugin", "FKLTrueAnswerPlugin", "FKLMismatchedAnswerPlugin", "ClipOPSDPlugin", "TRAPlugin",
+                     "FKLPlugin", "FKLTrueAnswerPlugin", "FKLMismatchedAnswerPlugin", "FKLMatchedAnswerPlugin",
+                     "ClipOPSDPlugin", "TRAPlugin",
                      "TRASelfShotPlugin", "TRARandomShotPlugin", "TRATrueAnswerPlugin", "TRAMismatchedAnswerPlugin",
                      "TRAMatchedAnswerPlugin",
                      "TCPOV1Plugin", "TCDOPlugin", "RewardGuidedOPSDPlugin", "GRPOPlugin"}

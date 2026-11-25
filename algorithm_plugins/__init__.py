@@ -23,6 +23,7 @@ from .tca_plugin import TCAPlugin
 from .fkl_plugin import FKLPlugin
 from .fkl_true_answer_plugin import FKLTrueAnswerPlugin
 from .fkl_mismatched_answer_plugin import FKLMismatchedAnswerPlugin
+from .fkl_matched_answer_plugin import FKLMatchedAnswerPlugin
 from .clip_opsd_plugin import ClipOPSDPlugin
 from .tra_plugin import TRAPlugin
 from .tra_privilege_plugins import TRASelfShotPlugin, TRARandomShotPlugin, TRATrueAnswerPlugin
@@ -52,6 +53,7 @@ __all__ = [
     "FKLPlugin",
     "FKLTrueAnswerPlugin",
     "FKLMismatchedAnswerPlugin",
+    "FKLMatchedAnswerPlugin",
     "ClipOPSDPlugin",
     "TRAPlugin",
     "TRASelfShotPlugin",
