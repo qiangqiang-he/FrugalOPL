@@ -63,6 +63,7 @@ controller:
     train:
       name: openthoughts_math30k
       path: data/openthoughts_math30k.json
+      drop_missing_answer: true
     eval:
       - name: amc23
         path: data/AMC-2023.json

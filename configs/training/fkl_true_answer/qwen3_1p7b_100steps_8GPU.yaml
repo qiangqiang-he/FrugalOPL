@@ -1,0 +1,18 @@
+extends:
+  - ../../common/teacher_alignment.yaml
+  - ../../models/qwen3_1p7b.yaml
+run:
+  name: FKL_true_answer_Qwen3-1.7B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: fkl_true_answer_qwen3_1p7b_100steps_8gpu
+actor:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+learner:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  distributed:
+    master_port: 29926
+algorithm:
+  plugin: FKLTrueAnswerPlugin
+  algo_name: FKL_true_answer
+  kl_token_clip: null
+  self_shot_format: conversation

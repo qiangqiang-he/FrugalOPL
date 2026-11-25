@@ -8,9 +8,10 @@ import torch
 
 from utils.algorithm_runtime import apply_generation_chat_template, controller_questions_and_answers
 from utils.eval import load_dataset_records
-from utils.prompts import TRA_TRUE_ANSWER_PROMPT, render_prompt_from_record
+from utils.prompts import render_prompt_from_record
 from .plugin_registry import register_plugin_class
 from .tra_plugin import TRAPlugin
+from .true_answer_context import TrueAnswerTeacherMixin
 
 
 def _question_records(signals):
@@ -122,30 +123,8 @@ class TRARandomShotPlugin(TRAPlugin):
 
 
 @register_plugin_class
-class TRATrueAnswerPlugin(TRAPlugin):
+class TRATrueAnswerPlugin(TrueAnswerTeacherMixin, TRAPlugin):
     """A single current-question user turn containing only its correct answer."""
-
-    @staticmethod
-    def _training_records(signals):
-        records = _question_records(signals)
-        if not all(record.get('answer') is not None and str(record['answer']).strip() for record in records):
-            raise ValueError('tra_true_answer requires a non-empty correct answer in every record.')
-        return records
-
-    def _render_teacher_record(self, record):
-        if record.get('answer') is None or not str(record['answer']).strip():
-            raise ValueError('tra_true_answer requires the current question correct answer.')
-        prompt = render_prompt_from_record(TRA_TRUE_ANSWER_PROMPT,
-            {'student_prompt': render_prompt_from_record(self._train_template, record),
-             'answer': str(record['answer'])})
-        return apply_generation_chat_template(self._tokenizer, [{'role': 'user', 'content': prompt}],
-                                              enable_thinking=self._enable_thinking)
-
-    def _render_privileged_prompt(self, record):
-        prompt = self._render_teacher_record(record)
-        # Never silently shorten the current question or its known answer.
-        self._assert_prompt_within_limit(prompt, kind='true-answer Teacher')
-        return prompt
 
     def training_state_dict(self):
         state = super().training_state_dict()

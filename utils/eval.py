@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import math
 import multiprocessing as mp
 import os
@@ -164,7 +165,11 @@ def load_dataset_records(
     config_path: str | Path | None = None,
     default_max_examples: object = None,
 ) -> list[dict[str, object]]:
-    """Load records while preserving every dataset field for Actor rendering."""
+    """Load records, optionally dropping unanswered training rows before sampling.
+
+    Evaluation remains strict unless ``drop_missing_answer`` is explicitly set.
+    A numeric zero is a valid answer; missing, null and blank answers are not.
+    """
 
     cfg = _as_mapping(dataset_config, "evaluation dataset")
     resolved_config = Path(config_path).expanduser().resolve() if config_path is not None else None
@@ -173,6 +178,19 @@ def load_dataset_records(
         raise FileNotFoundError(f"Evaluation dataset does not exist: {dataset_path}")
 
     raw_records = _extract_record_list(_read_json_records(dataset_path), dataset_path)
+    drop_missing_answer = cfg.get("drop_missing_answer", False)
+    if not isinstance(drop_missing_answer, bool):
+        raise ValueError("dataset drop_missing_answer must be boolean.")
+    if drop_missing_answer:
+        original_count = len(raw_records)
+        raw_records = [record for record in raw_records if not isinstance(record, Mapping)
+                       or (record.get("answer") is not None and str(record["answer"]).strip())]
+        removed = original_count - len(raw_records)
+        if removed:
+            logging.getLogger(__name__).info(
+                "Removed %d training records with missing or empty answers; retained %d.",
+                removed, len(raw_records),
+            )
     max_examples = cfg.get("max_examples", default_max_examples)
     if max_examples is not None:
         if isinstance(max_examples, bool):
