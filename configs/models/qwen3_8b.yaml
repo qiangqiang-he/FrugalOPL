@@ -1,0 +1,6 @@
+run:
+  group: Qwen3-8B
+  policy:
+    model_name_or_path: Qwen/Qwen3-8B
+algorithm:
+  enable_thinking: false

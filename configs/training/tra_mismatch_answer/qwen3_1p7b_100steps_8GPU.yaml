@@ -1,0 +1,12 @@
+extends: ../tra_true_answer/qwen3_1p7b_100steps_8GPU.yaml
+run:
+  name: tra_mismatch_answer_Qwen3-1.7B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: tra_mismatch_answer_qwen3_1p7b_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29931
+algorithm:
+  plugin: TRAMismatchedAnswerPlugin
+  algo_name: tra_mismatch_answer
+  answer_context: single_turn

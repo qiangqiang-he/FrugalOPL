@@ -12,6 +12,15 @@
 
 缺失、null、空白标准答案仍在训练集加载时剔除，数值 0 保留。输入记录中的标准答案不被修改，评测仍使用真实标准答案。
 
+## 反向对照：TCA_mismatch_answer
+
+新增 Qwen3-1.7B 八卡配置 `configs/training/tra_mismatch_answer/qwen3_1p7b_100steps_8GPU.yaml`。它与本实验共用 `MismatchedAnswerTeacherMixin` 的逐 rollout 答案选择、单轮 Teacher 提示及回退规则，区别在于拟合 `r ∝ p × (p/q)^n`，默认 `n=1`、支持集阈值 `0.01`。仓库入口仍使用 TRA 名称，对应本轮清单中的 TCA。FKL 原有检查点字段与答案选择版本保持兼容。
+
+```bash
+export FRUGALOPL_MODEL_PATH="/path/to/models/Qwen3-1.7B"
+bash scripts/start_train.sh --no-tmux configs/training/tra_mismatch_answer/qwen3_1p7b_100steps_8GPU.yaml
+```
+
 ## 八卡正式启动，无 tmux
 
 激活训练环境，在项目根目录执行，并替换实际路径：
