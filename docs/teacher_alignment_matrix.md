@@ -2,7 +2,9 @@
 
 三种算法正式命名为 **FKL**、**Clip-OPSD** 和 **Teacher reverse align（TRA）**。新配置、插件、训练状态和 SwanLab 指标使用这些名称；旧 TCA 入口继续兼容已有运行和检查点。
 
-所有新实验记录到公开项目 [qhe/TCPO](https://swanlab.cn/@qhe/TCPO)。`run.group` 使用模型名；`run.name` 仅包含算法、模型、训练步数和 GPU 数。DeepSeek 的 run name 分别使用 `deepseek-1p5b`、`deepseek-7b`，group 保留完整模型名。
+所有新实验记录到公开项目 [qhe/TCPO](https://swanlab.cn/@qhe/TCPO)。`run.group` 使用模型名；`run.name` 包含算法、模型、thinking 模式、训练步数和 GPU 数。DeepSeek 的 run name 分别使用 `deepseek-1p5b`、`deepseek-7b`，省略模式标签，group 保留完整模型名。
+
+[全部 24 条启动命令、SwanLab 隐私边界及 TRA 指数参数](teacher_alignment_launch_commands.md)。
 
 三组共用同一冻结基础 Teacher：关闭 Teacher 的 LoRA，并将该题解答作为已完成的 assistant 示例，再重复 Student 的问题。Student 提示和特权 Teacher 上下文在三种算法间一致。
 
@@ -10,9 +12,9 @@
 | --- | ---: | --- |
 | FKL | 4 | 最小化普通 Forward KL：`KL(q || p)`，无 CLIP |
 | Clip-OPSD | 4 | 对每个词表项的 `q_i log(q_i / p_i)` 做上界截断，epsilon=`1e-7` |
-| TRA | 8 | 拟合停止梯度的 `r ∝ p²/q × 1[p ≥ 0.01 p_max]` |
+| TRA | 8 | 拟合停止梯度的 `r ∝ p × (p/q)^n × 1[p ≥ 0.01 p_max]`，默认 `n=1` |
 
-三者默认在 Student 每个位置选择的 top-512 上，将 Student/Teacher 分布分别归一化后构造损失，按原有 token 方式归约。训练记录的 Student/Teacher 熵也在该支持集上计算。TRA 参数名为 `tra_plausible_fraction`，默认 `0.01`。
+三者默认在 Student 每个位置选择的 top-512 上，将 Student/Teacher 分布分别归一化后构造损失，按原有 token 方式归约。训练记录的 Student/Teacher 熵也在该支持集上计算。TRA 的 `tra_plausible_fraction` 默认 `0.01`，`tra_ratio_power` 对应指数 `n`、默认 `1.0`。
 
 | 设置 | 默认值 |
 | --- | --- |
@@ -45,7 +47,7 @@ Qwen3、Qwen3.5、Gemma4 使用 No thinking；DeepSeek Distill 使用其原生�
 | DeepSeek-R1-Distill-Qwen-1.5B | [配置](../configs/training/fkl/deepseek_1p5b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/deepseek_1p5b_100steps_4GPU.yaml) | [配置](../configs/training/tra/deepseek_1p5b_100steps_8GPU.yaml) |
 | DeepSeek-R1-Distill-Qwen-7B | [配置](../configs/training/fkl/deepseek_7b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/deepseek_7b_100steps_4GPU.yaml) | [配置](../configs/training/tra/deepseek_7b_100steps_8GPU.yaml) |
 
-例如：`FKL_deepseek-1p5b_100steps_4gpus`、`Clip-OPSD_Qwen3.5-4B_100steps_4gpus`、`TRA_Gemma4-E4B-it_100steps_8gpus`。
+例如：`FKL_deepseek-1p5b_100steps_4gpus`、`Clip-OPSD_Qwen3.5-4B_no-thinking_100steps_4gpus`、`TRA_Gemma4-E4B-it_no-thinking_100steps_8gpus`。
 
 ## 正式服务器启动：无 tmux
 
@@ -80,7 +82,7 @@ bash scripts/start_train.sh --tmux tests/configs/teacher_alignment/tra_qwen3_1p7
 
 双卡大模型验证使用冻结基座 CPU/GPU 交接，正式 80GB 配置保留基座常驻。测试配置、代码、日志和结果仅保留在本地 `tests/`，不提交 GitHub。每组验证完毕清理临时适配器和检查点，基础模型保留。
 
-## 验证结果（2026-11-25）
+## 基础矩阵验证（2026-11-25，提交 b1033d7）
 
 CPU 检查 **114 项通过**，覆盖全部配置、算法注册、Controller 启动、三种目标的独立梯度核对、原生模型 LoRA 结构及聊天模板。远程双 RTX 4090 上 **24/24 组通过**：每组使用完整 BF16 基础权重，执行 2 次实际优化更新，单批 2 题 × 4 回复。
 
@@ -110,3 +112,5 @@ Qwen3-1.7B、DeepSeek-1.5B 的测试基座常驻显存，其余模型使用冻�
 GPU 验证环境：PyTorch `2.10.0+cu129`、Transformers `5.9.0`、PEFT `0.21.0`、vLLM `0.19.1`、DeepSpeed `0.19.7`、SwanLab `0.10.4`。
 
 完整证据保留在本地 `tests/outputs/teacher_alignment_matrix_20261125/`：`gpu_validation_summary.json`、`throughput.csv`、各组 LoRA/梯度检查、云端分组核验及日志。测试结束后已清理临时 LoRA、检查点和优化器状态，八个基础模型保留，双卡显存已释放。
+
+该轮 24 条旧云端测试记录已按用户要求删除，本地指标和报告保留。隐私修复后的验证另存于 `tests/outputs/swanlab_privacy_20261125/`。

@@ -25,6 +25,7 @@ import yaml
 
 from utils.prompts import MATH_PROMPT
 from utils.sampled_head_tail import METRICS, QUANTILES, StreamingStats, atomic_json
+from utils.swanlab_privacy import init_public_run
 
 
 def log(message):
@@ -261,8 +262,8 @@ def swanlab_run(config):
         return None
     try:
         import swanlab
-        swanlab.init(project=config["swanlab"]["project"], workspace=config["swanlab"]["workspace"],
-                     experiment_name=config["run_name"], config=config,
+        init_public_run(swanlab, project=config["swanlab"]["project"], workspace=config["swanlab"]["workspace"],
+                     name=config["run_name"], config=config,
                      logdir=str(Path(config["output"]) / "swanlog"), mode="cloud")
         return swanlab
     except Exception as exc:

@@ -1915,13 +1915,13 @@ class Learner:
 
     def _plugin_compute_ratio_kl(
         self, batch: Signals, *, teacher_prompts: Sequence[str], temperature: float,
-        plausible_fraction: float, chunk_size: int | None,
+        plausible_fraction: float, chunk_size: int | None, ratio_power: float = 1.0,
     ) -> Signals:
         from utils.ratio_kl import RATIO_KEYS, ratio_kl_scores
 
         def scorer(student, teacher, *, temperature, token_clip, top_k):
             return ratio_kl_scores(student, teacher, temperature=temperature,
-                                   plausible_fraction=plausible_fraction, top_k=top_k)
+                                   plausible_fraction=plausible_fraction, top_k=top_k, ratio_power=ratio_power)
 
         return self._plugin_compute_forward_kl(
             batch, teacher_prompts=teacher_prompts, temperature=temperature,

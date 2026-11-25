@@ -2,7 +2,7 @@ extends:
   - ../../common/tra_8GPU.yaml
   - ../../models/qwen3_5_4b.yaml
 run:
-  name: TRA_Qwen3.5-4B_100steps_8gpus
+  name: TRA_Qwen3.5-4B_no-thinking_100steps_8gpus
   redis:
     key_prefix: tra_qwen3_5_4b_100steps_8gpu
 learner:

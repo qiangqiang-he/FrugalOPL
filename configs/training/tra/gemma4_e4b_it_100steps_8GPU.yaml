@@ -2,7 +2,7 @@ extends:
   - ../../common/tra_8GPU.yaml
   - ../../models/gemma4_e4b_it.yaml
 run:
-  name: TRA_Gemma4-E4B-it_100steps_8gpus
+  name: TRA_Gemma4-E4B-it_no-thinking_100steps_8gpus
   redis:
     key_prefix: tra_gemma4_e4b_it_100steps_8gpu
 learner:

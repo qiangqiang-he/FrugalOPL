@@ -140,7 +140,7 @@ class _PluginRuntime(Protocol):
 
     def _plugin_compute_ratio_kl(
         self, batch: Signals, *, teacher_prompts: Sequence[str], temperature: float,
-        plausible_fraction: float, chunk_size: int | None,
+        plausible_fraction: float, chunk_size: int | None, ratio_power: float = 1.0,
     ) -> Signals: ...
 
     def _plugin_compute_tcdo(self, batch: Signals, *, teacher_prompts: Sequence[str], state: int,
@@ -431,9 +431,9 @@ class AlgorithmPlugin:
     def compute_ratio_kl(
         self, batch: Signals, *, teacher_prompts: Sequence[str],
         temperature: float = 1.0, plausible_fraction: float = 0.1,
-        chunk_size: int | None = None,
+        chunk_size: int | None = None, ratio_power: float = 1.0,
     ) -> Signals:
-        """Score KL(stopgrad(normalize(p²/q * 1[p>=fraction*pmax])) || p).
+        """Score detached p*(p/q)^ratio_power targets on plausible support.
 
         Reuse whole-response, checkpointed Student-top-k paired scoring. Targets
         and the privileged Teacher are detached; only Student LoRA learns.
@@ -447,9 +447,11 @@ class AlgorithmPlugin:
         if (isinstance(plausible_fraction, bool) or not isinstance(plausible_fraction, (int, float))
                 or not math.isfinite(plausible_fraction) or not 0 < plausible_fraction <= 1):
             raise ValueError("plausible_fraction must lie in (0, 1].")
+        if isinstance(ratio_power, bool) or not isinstance(ratio_power, (int, float)) or not math.isfinite(ratio_power):
+            raise ValueError('ratio_power must be a finite real number.')
         return scope.runtime._plugin_compute_ratio_kl(
             dict(batch), teacher_prompts=prompts, temperature=temperature,
-            plausible_fraction=float(plausible_fraction), chunk_size=chunk_size,
+            plausible_fraction=float(plausible_fraction), chunk_size=chunk_size, ratio_power=float(ratio_power),
         )
 
     def collect_rado_scores(self, batch: Signals, *, teacher_prompts: Sequence[str]) -> Signals:

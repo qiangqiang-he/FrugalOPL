@@ -2,7 +2,7 @@ extends:
   - ../../common/fkl_4GPU.yaml
   - ../../models/qwen3_1p7b.yaml
 run:
-  name: FKL_Qwen3-1.7B_100steps_4gpus
+  name: FKL_Qwen3-1.7B_no-thinking_100steps_4gpus
   redis:
     key_prefix: fkl_qwen3_1p7b_100steps_4gpu
 learner:

@@ -8,3 +8,4 @@ algorithm:
   algo_name: TRA
   kl_token_clip: null
   tra_plausible_fraction: 0.01
+  tra_ratio_power: 1.0

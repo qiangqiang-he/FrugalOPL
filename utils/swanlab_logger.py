@@ -25,6 +25,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from utils.swanlab_privacy import init_public_run, private_error, public_metric_key
+
 if TYPE_CHECKING:
     from engine.pipeline import TrainingPipeline
 
@@ -51,7 +53,7 @@ def _pipeline_node_namespaces(pipeline: "TrainingPipeline") -> frozenset[str]:
     """Return the exact Worker namespaces declared by the resolved pipeline."""
 
     namespaces = frozenset(node.node_id for node in pipeline.nodes)
-    if not namespaces or any("/" in namespace for namespace in namespaces):
+    if not namespaces or any("/" in namespace or not public_metric_key(namespace) for namespace in namespaces):
         raise ValueError("Pipeline node IDs used for SwanLab metrics must be non-empty and contain no '/'.")
     if namespaces & _FRAMEWORK_NAMESPACES:
         raise ValueError("Pipeline node IDs must not conflict with SwanLab framework namespaces.")
@@ -65,7 +67,7 @@ def _algorithm_namespace(config: Mapping[str, object], *, reserved_namespaces: f
     algo_name = _optional_text(algorithm_cfg.get("algo_name"), "algorithm.algo_name")
     if algo_name is None:
         raise ValueError("algorithm.algo_name must be a non-empty string.")
-    if "/" in algo_name:
+    if "/" in algo_name or not public_metric_key(algo_name):
         raise ValueError("algorithm.algo_name must not contain '/'.")
     if algo_name in reserved_namespaces:
         raise ValueError(
@@ -106,7 +108,10 @@ def _flatten_numeric_metrics(metrics: Mapping[str, object], *, prefix: str = "")
 
     flattened: dict[str, float | int] = {}
     for raw_key, value in metrics.items():
-        key = str(raw_key).strip().strip("/")
+        raw_text = str(raw_key).strip()
+        if not public_metric_key(raw_text):
+            continue
+        key = raw_text.strip("/")
         if not key:
             continue
         full_key = f"{prefix}/{key}" if prefix else key
@@ -324,7 +329,8 @@ class SwanLabLogger:
             resume_options.update(resume="never", parallel="none")
             if saved_run_id is not None:
                 resume_options.update(id=saved_run_id, resume="must")
-        run = swanlab.init(
+        run = init_public_run(
+            swanlab,
             project=self.project,
             workspace=self.workspace,
             name=self.run_name,
@@ -410,7 +416,7 @@ class SwanLabLogger:
         run, self._run = self._run, None
         if run is None:
             return
-        detail = None if error is None else str(error)
+        detail = private_error(error)
         try:
             run.finish(state=state, error=detail)
         except Exception as finish_error:  # Never hide a Worker cleanup path behind telemetry.

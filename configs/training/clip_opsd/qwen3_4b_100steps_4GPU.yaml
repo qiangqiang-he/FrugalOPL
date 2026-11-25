@@ -2,7 +2,7 @@ extends:
   - ../../common/clip_opsd_4GPU.yaml
   - ../../models/qwen3_4b.yaml
 run:
-  name: Clip-OPSD_Qwen3-4B_100steps_4gpus
+  name: Clip-OPSD_Qwen3-4B_no-thinking_100steps_4gpus
   redis:
     key_prefix: clip_opsd_qwen3_4b_100steps_4gpu
 learner:
