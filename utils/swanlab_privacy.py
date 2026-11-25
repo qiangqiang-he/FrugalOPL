@@ -26,11 +26,11 @@ _FIELDS = {
     ('learner', 'execution'): 'gradient_checkpointing clip_grad_norm offload_frozen_base_between_turns',
     ('learner', 'optimizer'): 'type lr betas eps weight_decay',
     ('learner', 'scheduler'): 'type',
-    ('algorithm',): 'plugin algo_name kl_top_k loss_aggregation enable_thinking self_shot_format teacher_sync_interval kl_temperature kl_token_clip tra_plausible_fraction tra_ratio_power ratio_plausible_fraction tca_plausible_fraction tcdo_plausible_fraction tcdo_incorrect_weight tcdo_truncated_weight tcpo_objective_version tcpo_plausible_fraction tcpo_alpha_plus tcpo_alpha_minus tcpo_alpha_tru',
+    ('algorithm',): 'plugin algo_name answer_context kl_top_k loss_aggregation enable_thinking self_shot_format teacher_sync_interval kl_temperature kl_token_clip tra_plausible_fraction tra_ratio_power ratio_plausible_fraction tca_plausible_fraction tcdo_plausible_fraction tcdo_incorrect_weight tcdo_truncated_weight tcpo_objective_version tcpo_plausible_fraction tcpo_alpha_plus tcpo_alpha_minus tcpo_alpha_tru',
     ('algorithm', 'training_sampling'): 'temperature top_p top_k max_tokens n seed',
 }
 _ENUMS = frozenset({'bfloat16', 'float16', 'float32', 'bf16', 'fp16', 'fp32',
-                   'token', 'sequence', 'conversation', 'prompt', 'adam', 'adamw',
+                   'token', 'sequence', 'conversation', 'prompt', 'single_turn', 'adam', 'adamw',
                    'constant', 'linear', 'cosine'})
 _LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.+ -]{0,159}\Z')
 _PRIVATE_KEY = re.compile(r'(?:^|[_./-])(?:path|dir|directory|hostname|username|password|secret|credential|api_key|apikey|access_token|auth_token|url|uri|address|host|ip)(?:$|[_./-])', re.I)
@@ -78,7 +78,7 @@ def thinking_mode(config: Mapping) -> str:
 def public_run_name(config: Mapping, name: str) -> str:
     """Keep mode labels consistent when a matrix configuration is toggled."""
     title = _get(config, ('algorithm',)).get('algo_name')
-    if title in {'FKL', 'FKL_true_answer', 'Clip-OPSD', 'TRA', 'tra_self_shot', 'tra_random_shot', 'tra_true_answer'}:
+    if title in {'FKL', 'FKL_true_answer', 'FKL_mismatched_answer', 'Clip-OPSD', 'TRA', 'tra_self_shot', 'tra_random_shot', 'tra_true_answer'}:
         name = re.sub(r'_(?:no-thinking|thinking)(?=_|$)', '', name)
         mode = thinking_mode(config)
         if mode != 'native':
@@ -102,6 +102,8 @@ def public_config(config: Mapping) -> dict:
     run['model_name'] = public_label(_get(config, ('run',)).get('group'))
     run['thinking_mode'] = thinking_mode(config)
     algorithm = result.setdefault('algorithm', {})
+    if _get(config, ('algorithm',)).get('answer_context') == 'single_turn':
+        algorithm.pop('self_shot_format', None)
     for key in ('plugin', 'algo_name'):
         raw = _get(config, ('algorithm',)).get(key)
         if raw is not None:

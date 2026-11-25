@@ -15,4 +15,4 @@ algorithm:
   plugin: FKLTrueAnswerPlugin
   algo_name: FKL_true_answer
   kl_token_clip: null
-  self_shot_format: conversation
+  answer_context: single_turn
