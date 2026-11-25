@@ -23,6 +23,7 @@ from .tca_plugin import TCAPlugin
 from .fkl_plugin import FKLPlugin
 from .clip_opsd_plugin import ClipOPSDPlugin
 from .tra_plugin import TRAPlugin
+from .tra_privilege_plugins import TRASelfShotPlugin, TRARandomShotPlugin, TRATrueAnswerPlugin
 from .tail_sup_plugin import TailSupPlugin
 from .rado_plugin import RADOPlugin
 
@@ -47,6 +48,9 @@ __all__ = [
     "FKLPlugin",
     "ClipOPSDPlugin",
     "TRAPlugin",
+    "TRASelfShotPlugin",
+    "TRARandomShotPlugin",
+    "TRATrueAnswerPlugin",
     "TailSupPlugin",
     "RADOPlugin",
     "plugin_class_from_name",

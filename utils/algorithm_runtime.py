@@ -67,6 +67,8 @@ class AlgorithmRuntimeConfig:
             is ``None`` when the Controller does not set a cap.  Plugins that
             construct privileged prompts can use it without depending on the
             full Controller configuration.
+        training_dataset: Private training-data loader settings for algorithms
+            that sample demonstrations from the complete configured train set.
 
     The snapshots are intentionally independent of the source merged config:
     later config mutation cannot silently change a Worker-local plugin.
@@ -80,6 +82,7 @@ class AlgorithmRuntimeConfig:
     seed: int = 0
     train_prompt_batch_size: int | None = None
     save_question_accuracy: bool = False
+    training_dataset: Mapping[str, object] | None = None
 
 
 def resolve_algorithm_runtime_config(config: Mapping[str, object]) -> AlgorithmRuntimeConfig:
@@ -183,6 +186,8 @@ def resolve_algorithm_runtime_config(config: Mapping[str, object]) -> AlgorithmR
         seed=int(run.get("seed", 0)) if isinstance(run, Mapping) else 0,
         train_prompt_batch_size=controller.get("train_prompt_batch_size") if controller is not None else None,
         save_question_accuracy=config.get("save_question_accuracy", False),
+        training_dataset=copy.deepcopy(dict(controller_data['train']))
+            if isinstance(controller, Mapping) and isinstance(controller_data.get('train'), Mapping) else None,
     )
 
 

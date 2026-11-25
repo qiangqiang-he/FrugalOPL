@@ -4,7 +4,7 @@
 
 所有新实验记录到公开项目 [qhe/TCPO](https://swanlab.cn/@qhe/TCPO)。`run.group` 使用模型名；`run.name` 包含算法、模型、thinking 模式、训练步数和 GPU 数。DeepSeek 的 run name 分别使用 `deepseek-1p5b`、`deepseek-7b`，省略模式标签，group 保留完整模型名。
 
-[全部 24 条启动命令、SwanLab 隐私边界及 TRA 指数参数](teacher_alignment_launch_commands.md)。
+[全部 26 条启动命令、SwanLab 隐私边界及 TRA 指数参数](teacher_alignment_launch_commands.md)。
 
 三组共用同一冻结基础 Teacher：关闭 Teacher 的 LoRA，并将该题解答作为已完成的 assistant 示例，再重复 Student 的问题。Student 提示和特权 Teacher 上下文在三种算法间一致。
 
@@ -48,6 +48,8 @@ Qwen3、Qwen3.5、Gemma4 使用 No thinking；DeepSeek Distill 使用其原生�
 | DeepSeek-R1-Distill-Qwen-7B | [配置](../configs/training/fkl/deepseek_7b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/deepseek_7b_100steps_4GPU.yaml) | [配置](../configs/training/tra/deepseek_7b_100steps_8GPU.yaml) |
 
 例如：`FKL_deepseek-1p5b_100steps_4gpus`、`Clip-OPSD_Qwen3.5-4B_no-thinking_100steps_4gpus`、`TRA_Gemma4-E4B-it_no-thinking_100steps_8gpus`。
+
+Qwen3-1.7B 的基础 TRA 现明确命名为 `tra_self_shot`，现有配置路径保留。另有两份八卡特权对照：[tra_random_shot](../configs/training/tra_random_shot/qwen3_1p7b_100steps_8GPU.yaml)、[tra_true_answer](../configs/training/tra_true_answer/qwen3_1p7b_100steps_8GPU.yaml)。三者优化相同目标，只改变冻结 Teacher 的特权上下文。
 
 ## 正式服务器启动：无 tmux
 

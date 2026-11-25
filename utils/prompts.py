@@ -63,6 +63,13 @@ KL_OPSD_TEACHER_PROMPT = (
     r"Please reason step by step, and put your final answer within \boxed{{}}."
 )
 
+TRA_TRUE_ANSWER_PROMPT = (
+    '{student_prompt}\n\n'
+    'The correct answer to this problem is: {answer}.\n'
+    'Use this known correct answer to guide your reasoning on the problem above. '
+    'Explain the steps that lead to this answer.'
+)
+
 
 # The previous question and solution are represented as actual conversation
 # history.  In particular, no model-visible text labels either turn as an
@@ -124,6 +131,7 @@ __all__ = [
     "MATH_PROMPT",
     "MATH_ONESHOT_MESSAGES",
     "OPSD_TEACHER_PROMPT",
+    "TRA_TRUE_ANSWER_PROMPT",
     "render_prompt",
     "render_prompt_from_record",
 ]

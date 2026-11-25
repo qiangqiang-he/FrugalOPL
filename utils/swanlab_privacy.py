@@ -78,7 +78,7 @@ def thinking_mode(config: Mapping) -> str:
 def public_run_name(config: Mapping, name: str) -> str:
     """Keep mode labels consistent when a matrix configuration is toggled."""
     title = _get(config, ('algorithm',)).get('algo_name')
-    if title in {'FKL', 'Clip-OPSD', 'TRA'}:
+    if title in {'FKL', 'Clip-OPSD', 'TRA', 'tra_self_shot', 'tra_random_shot', 'tra_true_answer'}:
         name = re.sub(r'_(?:no-thinking|thinking)(?=_|$)', '', name)
         mode = thinking_mode(config)
         if mode != 'native':
