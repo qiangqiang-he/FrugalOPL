@@ -1,0 +1,16 @@
+extends: qwen3_1p7b_100steps_8GPU.yaml
+run:
+  name: FKL_mismatched_answer_Qwen3-1.7B_no-thinking_100steps_2gpus
+  redis:
+    key_prefix: fkl_mismatched_answer_qwen3_1p7b_100steps_2gpu
+actor:
+  gpu_ids: [0, 1]
+  engine:
+    gpu_memory_utilization: 0.68
+learner:
+  gpu_ids: [0, 1]
+  distributed:
+    master_port: 29937
+algorithm:
+  training_sampling:
+    n: 4
