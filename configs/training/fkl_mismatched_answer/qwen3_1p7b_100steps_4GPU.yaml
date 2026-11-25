@@ -3,6 +3,8 @@ run:
   name: FKL_mismatched_answer_Qwen3-1.7B_no-thinking_100steps_4gpus
   redis:
     key_prefix: fkl_mismatched_answer_qwen3_1p7b_100steps_4gpu
+controller:
+  train_prompt_batch_size: 16
 actor:
   gpu_ids: [0, 1, 2, 3]
   evaluation:
@@ -12,3 +14,6 @@ learner:
   gpu_ids: [0, 1, 2, 3]
   distributed:
     master_port: 29938
+algorithm:
+  training_sampling:
+    n: 8

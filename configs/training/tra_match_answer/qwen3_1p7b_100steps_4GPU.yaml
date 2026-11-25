@@ -3,6 +3,8 @@ run:
   name: tra_match_answer_Qwen3-1.7B_no-thinking_100steps_4gpus
   redis:
     key_prefix: tra_match_answer_qwen3_1p7b_100steps_4gpu
+controller:
+  train_prompt_batch_size: 16
 actor:
   gpu_ids: [0, 1, 2, 3]
   evaluation:
@@ -16,3 +18,5 @@ algorithm:
   plugin: TRAMatchedAnswerPlugin
   algo_name: tra_match_answer
   answer_context: single_turn
+  training_sampling:
+    n: 8
