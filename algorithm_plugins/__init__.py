@@ -27,6 +27,7 @@ from .clip_opsd_plugin import ClipOPSDPlugin
 from .tra_plugin import TRAPlugin
 from .tra_privilege_plugins import TRASelfShotPlugin, TRARandomShotPlugin, TRATrueAnswerPlugin
 from .tra_mismatched_answer_plugin import TRAMismatchedAnswerPlugin
+from .tra_matched_answer_plugin import TRAMatchedAnswerPlugin
 from .tail_sup_plugin import TailSupPlugin
 from .rado_plugin import RADOPlugin
 
@@ -57,6 +58,7 @@ __all__ = [
     "TRARandomShotPlugin",
     "TRATrueAnswerPlugin",
     "TRAMismatchedAnswerPlugin",
+    "TRAMatchedAnswerPlugin",
     "TailSupPlugin",
     "RADOPlugin",
     "plugin_class_from_name",
