@@ -1,0 +1,6 @@
+extends: clip_opsd_8GPU.yaml
+algorithm:
+  plugin: StandardOPSDPlugin
+  algo_name: standard_OPSD
+  self_shot_format: null
+  kl_token_clip: 1.0e-7

@@ -2,7 +2,7 @@
 
 当前启动优先级以 [实验优先级与启动清单](实验优先级与启动清单.md) 为准：第一阶段仅运行 Qwen3-1.7B、Qwen3-4B、Qwen3-8B 的九组主实验，新增的 8B 和答案不匹配配置也在该清单中。以下仅列出这三个模型的启动配置。
 
-分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**；基础 Teacher reverse align（TRA）使用 **8 卡**。Qwen3-1.7B 的 n=0.2 指数对照使用 **4 卡**，新增 n=0.1／0.3 使用 **8 卡**。正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照、5 个指数对照（n=0.1／0.2／0.3）及 2 个四卡空答案对照，分别在相应卡数的服务器上选择运行。
+分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**；基础 Teacher reverse align（TRA）使用 **8 卡**。Qwen3-1.7B 的 n=0.2 指数对照使用 **4 卡**，新增 n=0.1／0.3 使用 **8 卡**。正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照、5 个指数对照（n=0.1／0.2／0.3）、2 个四卡空答案对照及 3 个八卡 standard_OPSD 实验，分别在相应卡数的服务器上选择运行。
 
 所有配置默认训练 100 次更新，全局 batch 为 32 题 × 每题 8 个回复，训练生成上限 8192；初始及每 10 步依次评测 AMC23、AIME24，Avg@16，生成上限 32768。LoRA r=64、alpha=128，分布损失使用 Student top-512。
 
@@ -168,6 +168,28 @@ bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_1p7b_n0p1_100st
 export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
 # 编号 23：n=0.3
 bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_1p7b_n0p3_100steps_8GPU.yaml
+```
+
+## standard_OPSD：单轮 solution 特权＋CLIP，八卡（24–26）
+
+Teacher 采用官方 OPSD `reason_first=False` 的单轮拼接方式，当前题目只出现一次，额外特权为 solution。保留 CLIP epsilon=1e-7、Student top-512；三组均为八卡、No thinking、100 steps、batch 32×8、训练 8192／评测 32768、AMC23 和 AIME24 Avg@16。详见 [实现与验证说明](standard_opsd.md)。
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
+# 编号 24
+bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_1p7b_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-4B"
+# 编号 25
+bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_4b_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-8B"
+# 编号 26
+bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_8b_100steps_8GPU.yaml
 ```
 
 ## 双卡验证命令：必须有 tmux

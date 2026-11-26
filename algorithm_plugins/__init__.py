@@ -25,6 +25,7 @@ from .fkl_true_answer_plugin import FKLTrueAnswerPlugin
 from .fkl_mismatched_answer_plugin import FKLMismatchedAnswerPlugin
 from .fkl_matched_answer_plugin import FKLMatchedAnswerPlugin
 from .clip_opsd_plugin import ClipOPSDPlugin
+from .standard_opsd_plugin import StandardOPSDPlugin
 from .tra_plugin import TRAPlugin
 from .tra_privilege_plugins import TRASelfShotPlugin, TRARandomShotPlugin, TRATrueAnswerPlugin
 from .tra_mismatched_solution_plugin import TRAMismatchedSolutionPlugin
@@ -56,6 +57,7 @@ __all__ = [
     "FKLMismatchedAnswerPlugin",
     "FKLMatchedAnswerPlugin",
     "ClipOPSDPlugin",
+    "StandardOPSDPlugin",
     "TRAPlugin",
     "TRASelfShotPlugin",
     "TRARandomShotPlugin",

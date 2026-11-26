@@ -1,0 +1,73 @@
+# standard_OPSD：单轮 reference solution 特权与 CLIP
+
+`standard_OPSD` 使用官方 OPSD `reason_first=False` 的提示构造方式，复用仓库已有的 `KL_OPSD_TEACHER_PROMPT`。参考：[官方 data_collator.py](https://github.com/siyan-zhao/OPSD/blob/main/data_collator.py)。本实验保留项目当前的冻结 base Teacher、Student top-512 和 CLIP 设置。
+
+Student 只读取当前题目及解题指令。Teacher 使用**一个 user turn**，内容依次为：
+
+1. 当前题目，只拼接一次。
+2. `Reference Solution Begin/End` 标记包围的当前题目 solution。
+3. 官方 transition 指令：理解参考解法后独立推理，给出相同最终答案，并使用 boxed 格式。
+
+随后应用同一模型的 chat template 和 No thinking 设置，并对 Student 已生成的回复进行 Teacher 前向评分。特权部分只增加 solution；没有额外的示例 question，也不构造 user／assistant／user 三轮 one-shot。过长的 Teacher prompt 只缩短 solution，保留完整题目、transition 和 assistant generation suffix。
+
+算法为逐词表项上界截断的 Forward KL。在 Student top-512 上分别归一化 p、q，使用：
+
+\[
+L=\operatorname{mean}_{\text{有效回复 token}}
+  \sum_{i\in\operatorname{Top512}(p)}\min\left(q_i\log\frac{q_i}{p_i},10^{-7}\right).
+\]
+
+Teacher 使用冻结基座、关闭 LoRA 和梯度；Student 使用 LoRA 接受更新。没有奖励项。`StandardOPSDPlugin` 直接复用已有 KL 评分与优化链路，仅选择单轮上下文并强制启用 CLIP。检查点记录 `algorithm: standard_OPSD` 和 `teacher_context: single_turn_reference_solution`，防止与旧 one-shot 目标混用。
+
+三组正式配置均为八卡、No thinking、100 次优化更新、batch 32 题 × 每题 8 回复。训练生成上限 8192；初始及每 10 步依次评测 AMC23、AIME24，Avg@16、温度 0.6、top-p 0.95、生成上限 32768，并保存 LoRA。学习率 5e-6，LoRA r=64、alpha=128。沿用 Actor/Learner 共卡调度、评测回复跨卡分配、评测期间 rollout 预取及 Learner 释放屏障。
+
+SwanLab 使用公开的 `TCPO` Project，group 为模型名；继续过滤本地路径、提示正文和其他个人信息。记录 `standard_opsd_loss`、`standard_opsd_unclipped_kl`、`standard_opsd_clip_fraction`、熵、训练生成长度，以及各评测数据集的截断率。
+
+## 八卡启动命令：无 tmux
+
+先激活训练环境并进入项目根目录，设置仓库外的凭据文件和模型根目录。
+
+```bash
+export FRUGALOPL_PYTHON="$(command -v python)"
+export FRUGALOPL_MODELS_ROOT="/path/to/models"
+export FRUGALOPL_SWANLAB_ENV_FILE="/path/outside/repo/swanlab.env"
+```
+
+每份配置在对应的八卡服务器上独立启动：
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
+bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_1p7b_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-4B"
+bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_4b_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-8B"
+bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_8b_100steps_8GPU.yaml
+```
+
+## 双卡验证：有 tmux
+
+测试配置仅保留在本地 `tests/`，不上传 GitHub。每组使用 2 题 × 4 回复、2 次实际优化更新；训练生成上限 256、评测上限 128，使用短算术 fixture 验证 AMC23／AIME24 命名的评测链路。正式 32K 配置由 CPU 继承检查核对，短测试的正确率不用于评价算法性能。
+
+```bash
+bash scripts/start_train.sh --tmux tests/configs/standard_opsd/qwen3_1p7b.yaml
+bash scripts/start_train.sh --tmux tests/configs/standard_opsd/qwen3_4b.yaml
+bash scripts/start_train.sh --tmux tests/configs/standard_opsd/qwen3_8b.yaml
+```
+
+2026-11-26：WSL CPU 检查 **117 项通过**。以下三组均已按顺序完成真实双卡验证：
+
+| 模型 | 实际 GPU 数 | 实际更新数 | 完整覆盖并更新的 LoRA 目标层 |
+| --- | ---: | ---: | ---: |
+| Qwen3-1.7B | 2 | 2 | 196 |
+| Qwen3-4B | 2 | 2 | 252 |
+| Qwen3-8B | 2 | 2 | 252 |
+
+每组审计 16 条 rollout 的真实 Teacher prompt：一个 user turn、题目一次、完整 solution 及 transition。CLIP 实际生效，梯度与优化器状态均有限；所有 LoRA 目标层覆盖、尺寸和非零更新通过检查。三组 CUDA Graph、LoRA 热加载、两轮双数据集评测链路、逐数据集截断率、跨卡回复分配及评测预取屏障均通过。360 个交付源码／配置文件与双卡验证版本一致。
+
+测试使用离线 SwanLab，未新增云端测试 run。临时 checkpoint、LoRA 与评测 adapter 已清理，双卡已释放；测试脚本和完整证据只保留在本地 `tests/`，不上传 GitHub。正式八卡配置未在八卡服务器上实测。

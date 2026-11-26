@@ -1,0 +1,10 @@
+extends:
+  - ../../common/standard_opsd_8GPU.yaml
+  - ../../models/qwen3_8b.yaml
+run:
+  name: standard_OPSD_Qwen3-8B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: standard_opsd_qwen3_8b_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29953
