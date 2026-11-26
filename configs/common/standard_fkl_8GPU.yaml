@@ -1,0 +1,5 @@
+extends: standard_opsd_8GPU.yaml
+algorithm:
+  plugin: StandardFKLPlugin
+  algo_name: standard_FKL
+  kl_token_clip: null

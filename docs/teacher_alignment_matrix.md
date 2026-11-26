@@ -1,4 +1,4 @@
-# FKL、Clip-OPSD、TRA、standard_OPSD：当前三模型训练配置
+# FKL、Clip-OPSD、TRA、standard_OPSD、standard_FKL：当前三模型训练配置
 
 三种算法正式命名为 **FKL**、**Clip-OPSD** 和 **Teacher reverse align（TRA）**。新配置、插件、训练状态和 SwanLab 指标使用这些名称；旧 TCA 入口继续兼容已有运行和检查点。
 
@@ -14,6 +14,7 @@ FKL、Clip-OPSD 和 TRA 的基础配置共用同一冻结基础 Teacher：关闭
 | Clip-OPSD | Qwen3-4B / 8B：8；其余：4 | 对每个词表项的 `q_i log(q_i / p_i)` 做上界截断，epsilon=`1e-7` |
 | TRA | 8 | 拟合停止梯度的 `r ∝ p × (p/q)^n × 1[p ≥ 0.01 p_max]`，默认 `n=1` |
 | standard_OPSD | 8 | 单轮 reference solution 上下文；逐词表项截断 Forward KL，epsilon=`1e-7` |
+| standard_FKL | 8 | 与 standard_OPSD 相同的单轮 reference solution 上下文；普通 Forward KL，无 CLIP |
 
 上述算法默认在 Student 每个位置选择的 top-512 上，将 Student/Teacher 分布分别归一化后构造损失，按原有 token 方式归约。训练记录的 Student/Teacher 熵也在该支持集上计算。TRA 的 `tra_plausible_fraction` 默认 `0.01`，`tra_ratio_power` 对应指数 `n`、默认 `1.0`。
 
@@ -78,6 +79,14 @@ Qwen3-1.7B 另增加 n=0.1、n=0.3 两份八卡同题 solution one-shot 配置�
 | Qwen3-1.7B | [8 卡配置](../configs/training/standard_opsd/qwen3_1p7b_100steps_8GPU.yaml) | 24／待运行 |
 | Qwen3-4B | [8 卡配置](../configs/training/standard_opsd/qwen3_4b_100steps_8GPU.yaml) | 25／待运行 |
 | Qwen3-8B | [8 卡配置](../configs/training/standard_opsd/qwen3_8b_100steps_8GPU.yaml) | 26／待运行 |
+
+新增 `standard_FKL` 与 standard_OPSD 使用完全相同的单轮 solution 特权，关闭 CLIP；三组均为八卡，其他训练／评测设置相同。详见 [实现、编号与启动命令](standard_fkl.md)。
+
+| 模型 | standard_FKL 配置 | 清单编号／状态 |
+| --- | --- | --- |
+| Qwen3-1.7B | [8 卡配置](../configs/training/standard_fkl/qwen3_1p7b_100steps_8GPU.yaml) | 27／待运行 |
+| Qwen3-4B | [8 卡配置](../configs/training/standard_fkl/qwen3_4b_100steps_8GPU.yaml) | 28／待运行 |
+| Qwen3-8B | [8 卡配置](../configs/training/standard_fkl/qwen3_8b_100steps_8GPU.yaml) | 29／待运行 |
 
 ## 正式服务器启动：无 tmux
 

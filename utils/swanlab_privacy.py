@@ -78,7 +78,7 @@ def thinking_mode(config: Mapping) -> str:
 def public_run_name(config: Mapping, name: str) -> str:
     """Keep mode labels consistent when a matrix configuration is toggled."""
     title = _get(config, ('algorithm',)).get('algo_name')
-    if title in {'FKL', 'FKL_true_answer', 'FKL_mismatched_answer', 'FKL_match_answer', 'Clip-OPSD', 'standard_OPSD', 'TRA', 'tra_self_shot', 'tra_random_shot', 'tra_mismatch_solution', 'tra_true_answer', 'tra_mismatch_answer', 'tra_match_answer'}:
+    if title in {'FKL', 'FKL_true_answer', 'FKL_mismatched_answer', 'FKL_match_answer', 'Clip-OPSD', 'standard_OPSD', 'standard_FKL', 'TRA', 'tra_self_shot', 'tra_random_shot', 'tra_mismatch_solution', 'tra_true_answer', 'tra_mismatch_answer', 'tra_match_answer'}:
         name = re.sub(r'_(?:no-thinking|thinking)(?=_|$)', '', name)
         mode = thinking_mode(config)
         if mode != 'native':
@@ -103,7 +103,7 @@ def public_config(config: Mapping) -> dict:
     run['thinking_mode'] = thinking_mode(config)
     algorithm = result.setdefault('algorithm', {})
     if (_get(config, ('algorithm',)).get('answer_context') == 'single_turn'
-            or _get(config, ('algorithm',)).get('algo_name') == 'standard_OPSD'):
+            or _get(config, ('algorithm',)).get('algo_name') in {'standard_OPSD', 'standard_FKL'}):
         algorithm.pop('self_shot_format', None)
     for key in ('plugin', 'algo_name'):
         raw = _get(config, ('algorithm',)).get(key)
