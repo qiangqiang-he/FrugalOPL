@@ -1,0 +1,10 @@
+extends: qwen3_1p7b_100steps_8GPU.yaml
+run:
+  name: tra_self_shot_n0p5_Qwen3-1.7B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: tra_qwen3_1p7b_n0p5_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29944
+algorithm:
+  tra_ratio_power: 0.5

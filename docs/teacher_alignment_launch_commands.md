@@ -2,7 +2,7 @@
 
 当前启动优先级以 [实验优先级与启动清单](实验优先级与启动清单.md) 为准：第一阶段仅运行 Qwen3-1.7B、Qwen3-4B、Qwen3-8B 的九组主实验，新增的 8B 和答案不匹配配置也在该清单中。以下仅列出这三个模型的启动配置。
 
-分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、其他模型使用 **4 卡**，Teacher reverse align（TRA）使用 **8 卡**；正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验和 4 个 TRA 特权对照，分别在相应卡数的服务器上选择运行。
+分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**，Teacher reverse align（TRA）使用 **8 卡**；正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照和 3 个 n=0.5 指数对照，分别在相应卡数的服务器上选择运行。
 
 所有配置默认训练 100 次更新，全局 batch 为 32 题 × 每题 8 个回复，训练生成上限 8192；初始及每 10 步依次评测 AMC23、AIME24，Avg@16，生成上限 32768。LoRA r=64、alpha=128，分布损失使用 Student top-512。
 
@@ -118,6 +118,25 @@ bash scripts/start_train.sh --no-tmux configs/training/tra_mismatch_solution/qwe
 ```
 
 与既有 `tra_random_shot` 区别：新配置严格排除同题，使用 `TRAMismatchedSolutionPlugin`；原随机示例配置保留既有抽样行为。远程双卡暂不可用，本次使用 CPU 检查配置、上下文和优化链路，未作 GPU 实测。
+
+## 三个模型：同题 solution TRA，n=0.5
+
+三组仅将 TRA 指数改为 `algorithm.tra_ratio_power: 0.5`，特权仍为同题 solution one-shot，其他设置与原 n=1 配置相同。全部八卡、100 steps、batch 32×8，训练 8192／评测 32768、Avg@16；SwanLab run name 用 `n0p5` 区分。
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_1p7b_n0p5_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-4B"
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_4b_n0p5_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-8B"
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_8b_n0p5_100steps_8GPU.yaml
+```
 
 ## 双卡验证命令：必须有 tmux
 
