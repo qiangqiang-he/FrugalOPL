@@ -72,6 +72,14 @@ Qwen3-4B、8B 各补齐 n=0.1 八卡配置；既有 n=0.2 配置继续使用：
 | Qwen3-4B | [配置](../configs/training/tra/qwen3_4b_n0p1_100steps_8GPU.yaml)／30 | [已有配置](../configs/training/tra/qwen3_4b_n0p2_100steps_8GPU.yaml)／18 |
 | Qwen3-8B | [配置](../configs/training/tra/qwen3_8b_n0p1_100steps_8GPU.yaml)／31 | [已有配置](../configs/training/tra/qwen3_8b_n0p2_100steps_8GPU.yaml)／19 |
 
+三个模型均新增 n=0.05 的八卡同题 solution TRA 配置，其他参数沿用既有 TRA：
+
+| 模型 | n=0.05 八卡配置 | 清单编号／状态 |
+| --- | --- | --- |
+| Qwen3-1.7B | [配置](../configs/training/tra/qwen3_1p7b_n0p05_100steps_8GPU.yaml) | 32／待运行 |
+| Qwen3-4B | [配置](../configs/training/tra/qwen3_4b_n0p05_100steps_8GPU.yaml) | 33／待运行 |
+| Qwen3-8B | [配置](../configs/training/tra/qwen3_8b_n0p05_100steps_8GPU.yaml) | 34／待运行 |
+
 新增 Qwen3-1.7B 的两组四卡空答案对照，均为 No thinking、n=1、100 steps、batch 16×8、训练 8192／评测 32768、Avg@16：
 
 | 实验 | 配置 | 清单编号／状态 |
