@@ -56,6 +56,13 @@ Qwen3-4B、Qwen3-8B 的同题 solution TRA 和 Clip-OPSD 已于 2026-11-26 由�
 | Qwen3-4B | [8 卡配置](../configs/training/tra/qwen3_4b_n0p5_100steps_8GPU.yaml) | 18 |
 | Qwen3-8B | [8 卡配置](../configs/training/tra/qwen3_8b_n0p5_100steps_8GPU.yaml) | 19 |
 
+新增 Qwen3-1.7B 的两组四卡空答案对照，均为 No thinking、n=1、100 steps、batch 16×8、训练 8192／评测 32768、Avg@16：
+
+| 实验 | 配置 | 清单编号／状态 |
+| --- | --- | --- |
+| TRA-match-answer：提取不到自身答案时用 `""` | [4 卡配置](../configs/training/tra_match_answer/qwen3_1p7b_empty_fallback_100steps_4GPU.yaml) | 20／待运行 |
+| TRA-mismatch-answer：无可用不匹配答案时用 `""` | [4 卡配置](../configs/training/tra_mismatch_answer/qwen3_1p7b_empty_fallback_100steps_4GPU.yaml) | 21／待运行 |
+
 ## 正式服务器启动：无 tmux
 
 先激活训练环境。模型路径通过环境变量覆盖 YAML 的 Hugging Face 名称；SwanLab 凭据文件位于仓库外。
