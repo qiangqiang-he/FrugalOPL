@@ -1,0 +1,10 @@
+extends: qwen3_1p7b_100steps_4GPU.yaml
+run:
+  name: tra_match_answer_empty_fallback_Qwen3-1.7B_no-thinking_100steps_4gpus
+  redis:
+    key_prefix: tra_match_answer_empty_fallback_qwen3_1p7b_100steps_4gpu
+learner:
+  distributed:
+    master_port: 29947
+algorithm:
+  match_answer_fallback: empty

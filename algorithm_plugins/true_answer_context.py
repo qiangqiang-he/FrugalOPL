@@ -22,7 +22,10 @@ class TrueAnswerTeacherMixin:
         return records
 
     def _render_teacher_record(self, record):
-        if record.get('answer') is None or not str(record['answer']).strip():
+        return self._render_answer_teacher_record(record)
+
+    def _render_answer_teacher_record(self, record, *, allow_empty=False):
+        if record.get('answer') is None or (not allow_empty and not str(record['answer']).strip()):
             raise ValueError('True-answer Teacher requires the current question correct answer.')
         prompt = render_prompt_from_record(TRA_TRUE_ANSWER_PROMPT,
             {'student_prompt': render_prompt_from_record(self._train_template, record),

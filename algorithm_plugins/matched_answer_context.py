@@ -13,7 +13,14 @@ class MatchedAnswerTeacherMixin:
     def __init__(self, *, tokenizer, runtime):
         if runtime.algorithm.get('answer_context', 'single_turn') != 'single_turn':
             raise ValueError('Answer privileges require answer_context: single_turn.')
+        fallback = runtime.algorithm.get('match_answer_fallback', 'gold')
+        if fallback not in ('gold', 'empty'):
+            raise ValueError('match_answer_fallback must be gold or empty.')
+        self._match_answer_fallback = fallback
         super().__init__(tokenizer=tokenizer, runtime=runtime)
+
+    def _render_teacher_record(self, record):
+        return self._render_answer_teacher_record(record, allow_empty=self._match_answer_fallback == 'empty')
 
     def collect_actor_signals(self, signals):
         request = super().collect_actor_signals(signals)
@@ -41,7 +48,8 @@ class MatchedAnswerTeacherMixin:
         answers, extracted = [], []
         for index, response in zip(indices, responses):
             answer, found = extract_final_answer(response)
-            answers.append(answer if found else str(records[index]['answer']).strip())
+            fallback = '' if self._match_answer_fallback == 'empty' else str(records[index]['answer']).strip()
+            answers.append(answer if found else fallback)
             extracted.append(found)
         return {
             'teacher_prompts': [self._render_privileged_prompt({**records[index], 'answer': answer})
@@ -55,10 +63,13 @@ class MatchedAnswerTeacherMixin:
         extracted = batch['match_answer_extracted'].float()
         prefix = self._match_metric_prefix + '_match_'
         metrics = {**result.metrics, prefix + 'extracted_fraction': extracted.mean(),
-                   prefix + 'gold_fallback_fraction': (1 - extracted).mean()}
+                   prefix + 'gold_fallback_fraction': (1 - extracted).mean() * (self._match_answer_fallback == 'gold')}
+        if self._match_answer_fallback == 'empty':
+            metrics[prefix + 'empty_fallback_fraction'] = (1 - extracted).mean()
         return ObjectiveResult(result.objective, metrics, result.valid_token_count,
                                result.token_weighted_metrics, result.requires_optimizer_step)
 
     def training_state_dict(self):
         return {**super().training_state_dict(), 'answer_context': 'single_turn',
-                'answer_extraction_version': 1, 'answer_source': 'own_rollout_with_gold_fallback'}
+                'answer_extraction_version': 1,
+                'answer_source': 'own_rollout_with_' + self._match_answer_fallback + '_fallback'}

@@ -26,11 +26,11 @@ _FIELDS = {
     ('learner', 'execution'): 'gradient_checkpointing clip_grad_norm offload_frozen_base_between_turns',
     ('learner', 'optimizer'): 'type lr betas eps weight_decay',
     ('learner', 'scheduler'): 'type',
-    ('algorithm',): 'plugin algo_name answer_context kl_top_k loss_aggregation enable_thinking self_shot_format teacher_sync_interval kl_temperature kl_token_clip tra_plausible_fraction tra_ratio_power ratio_plausible_fraction tca_plausible_fraction tcdo_plausible_fraction tcdo_incorrect_weight tcdo_truncated_weight tcpo_objective_version tcpo_plausible_fraction tcpo_alpha_plus tcpo_alpha_minus tcpo_alpha_tru',
+    ('algorithm',): 'plugin algo_name answer_context match_answer_fallback kl_top_k loss_aggregation enable_thinking self_shot_format teacher_sync_interval kl_temperature kl_token_clip tra_plausible_fraction tra_ratio_power ratio_plausible_fraction tca_plausible_fraction tcdo_plausible_fraction tcdo_incorrect_weight tcdo_truncated_weight tcpo_objective_version tcpo_plausible_fraction tcpo_alpha_plus tcpo_alpha_minus tcpo_alpha_tru',
     ('algorithm', 'training_sampling'): 'temperature top_p top_k max_tokens n seed',
 }
 _ENUMS = frozenset({'bfloat16', 'float16', 'float32', 'bf16', 'fp16', 'fp32',
-                   'token', 'sequence', 'conversation', 'prompt', 'single_turn', 'adam', 'adamw',
+                   'token', 'sequence', 'conversation', 'prompt', 'single_turn', 'gold', 'empty', 'adam', 'adamw',
                    'constant', 'linear', 'cosine'})
 _LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.+ -]{0,159}\Z')
 _PRIVATE_KEY = re.compile(r'(?:^|[_./-])(?:path|dir|directory|hostname|username|password|secret|credential|api_key|apikey|access_token|auth_token|url|uri|address|host|ip)(?:$|[_./-])', re.I)
