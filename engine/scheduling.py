@@ -83,7 +83,7 @@ def resolve_scheduling(config: Mapping[str, object]) -> SchedulingPlan:
                      "FKLPlugin", "FKLTrueAnswerPlugin", "FKLMismatchedAnswerPlugin", "FKLMatchedAnswerPlugin",
                      "ClipOPSDPlugin", "TRAPlugin",
                      "TRASelfShotPlugin", "TRARandomShotPlugin", "TRATrueAnswerPlugin", "TRAMismatchedAnswerPlugin",
-                     "TRAMatchedAnswerPlugin",
+                     "TRAMatchedAnswerPlugin", "TRAMismatchedSolutionPlugin",
                      "TCPOV1Plugin", "TCDOPlugin", "RewardGuidedOPSDPlugin", "GRPOPlugin"}
         if plugin not in supported:
             raise ValueError(f"Actor/Learner overlap has no group-streaming contract for {plugin!r}.")

@@ -52,6 +52,8 @@ Qwen3、Qwen3.5、Gemma4 使用 No thinking；DeepSeek Distill 使用其原生�
 
 Qwen3-1.7B 的基础 TRA 现明确命名为 `tra_self_shot`，现有配置路径保留。另有两份八卡特权对照：[tra_random_shot](../configs/training/tra_random_shot/qwen3_1p7b_100steps_8GPU.yaml)、[tra_true_answer](../configs/training/tra_true_answer/qwen3_1p7b_100steps_8GPU.yaml)。三者优化相同目标，只改变冻结 Teacher 的特权上下文。
 
+Qwen3-4B、Qwen3-8B 的同题 solution TRA 和 Clip-OPSD 已于 2026-11-26 由用户确认完成。新增两份八卡 TRA 不匹配 solution one-shot 配置：[Qwen3-4B](../configs/training/tra_mismatch_solution/qwen3_4b_100steps_8GPU.yaml)、[Qwen3-8B](../configs/training/tra_mismatch_solution/qwen3_8b_100steps_8GPU.yaml)。示例从训练集中严格排除当前题后随机抽取，保留示例题与其 solution 的配对，其他训练及评测超参数与原 TRA 一致。
+
 ## 正式服务器启动：无 tmux
 
 先激活训练环境。模型路径通过环境变量覆盖 YAML 的 Hugging Face 名称；SwanLab 凭据文件位于仓库外。

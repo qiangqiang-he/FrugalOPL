@@ -1,0 +1,11 @@
+extends: ../tra/qwen3_4b_100steps_8GPU.yaml
+run:
+  name: tra_mismatch_solution_Qwen3-4B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: tra_mismatch_solution_qwen3_4b_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29942
+algorithm:
+  plugin: TRAMismatchedSolutionPlugin
+  algo_name: tra_mismatch_solution
