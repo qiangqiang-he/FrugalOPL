@@ -1,0 +1,10 @@
+extends: qwen3_8b_100steps_8GPU.yaml
+run:
+  name: TRA_n0p1_Qwen3-8B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: tra_qwen3_8b_n0p1_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29958
+algorithm:
+  tra_ratio_power: 0.1
