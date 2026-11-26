@@ -8,3 +8,6 @@ run:
 learner:
   distributed:
     master_port: 29953
+algorithm:
+  # Official scripts/run_opsd_8b_nonthink.sh: --jsd_token_clip 1e-7.
+  kl_token_clip: 1.0e-7

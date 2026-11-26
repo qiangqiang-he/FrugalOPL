@@ -13,7 +13,7 @@ FKL、Clip-OPSD 和 TRA 的基础配置共用同一冻结基础 Teacher：关闭
 | FKL | Qwen3-4B / 8B：8；其余：4 | 最小化普通 Forward KL：`KL(q || p)`，无 CLIP |
 | Clip-OPSD | Qwen3-4B / 8B：8；其余：4 | 对每个词表项的 `q_i log(q_i / p_i)` 做上界截断，epsilon=`1e-7` |
 | TRA | 8 | 拟合停止梯度的 `r ∝ p × (p/q)^n × 1[p ≥ 0.01 p_max]`，默认 `n=1` |
-| standard_OPSD | 8 | 单轮 reference solution 上下文；逐词表项截断 Forward KL，epsilon=`1e-7` |
+| standard_OPSD | Qwen3-1.7B：4；4B／8B：8 | 单轮 reference solution 上下文；1.7B／4B epsilon=`1e-6`，8B epsilon=`1e-7` |
 | standard_FKL | 8 | 与 standard_OPSD 相同的单轮 reference solution 上下文；普通 Forward KL，无 CLIP |
 
 上述算法默认在 Student 每个位置选择的 top-512 上，将 Student/Teacher 分布分别归一化后构造损失，按原有 token 方式归约。训练记录的 Student/Teacher 熵也在该支持集上计算。TRA 的 `tra_plausible_fraction` 默认 `0.01`，`tra_ratio_power` 对应指数 `n`、默认 `1.0`。
@@ -72,11 +72,11 @@ Qwen3-1.7B 另增加 n=0.1、n=0.3 两份八卡同题 solution one-shot 配置�
 | TRA-match-answer：提取不到自身答案时用 `""` | [4 卡配置](../configs/training/tra_match_answer/qwen3_1p7b_empty_fallback_100steps_4GPU.yaml) | 20／待运行 |
 | TRA-mismatch-answer：无可用不匹配答案时用 `""` | [4 卡配置](../configs/training/tra_mismatch_answer/qwen3_1p7b_empty_fallback_100steps_4GPU.yaml) | 21／待运行 |
 
-新增 `standard_OPSD` 使用官方单轮 Teacher 上下文（题目一次＋solution＋transition），保留 CLIP、top-512，均为八卡；其他训练／评测设置沿用上述协议。详见 [实现与验证说明](standard_opsd.md)。
+新增 `standard_OPSD` 使用官方单轮 Teacher 上下文（题目一次＋solution＋transition），保留 CLIP、top-512；Qwen3-1.7B 为四卡、epsilon=1e-6，4B 为八卡、epsilon=1e-6，8B 为八卡、epsilon=1e-7。其他训练／评测设置沿用上述协议。详见 [实现与验证说明](standard_opsd.md)。
 
 | 模型 | standard_OPSD 配置 | 清单编号／状态 |
 | --- | --- | --- |
-| Qwen3-1.7B | [8 卡配置](../configs/training/standard_opsd/qwen3_1p7b_100steps_8GPU.yaml) | 24／待运行 |
+| Qwen3-1.7B | [4 卡配置](../configs/training/standard_opsd/qwen3_1p7b_100steps_4GPU.yaml) | 24／待运行 |
 | Qwen3-4B | [8 卡配置](../configs/training/standard_opsd/qwen3_4b_100steps_8GPU.yaml) | 25／待运行 |
 | Qwen3-8B | [8 卡配置](../configs/training/standard_opsd/qwen3_8b_100steps_8GPU.yaml) | 26／待运行 |
 
