@@ -1,8 +1,8 @@
-# 九模型 × 三算法及 TRA 特权对照：全部启动命令
+# 当前三模型 × 三算法及 TRA 特权对照：启动命令
 
-当前启动优先级以 [实验优先级与启动清单](实验优先级与启动清单.md) 为准：第一阶段仅运行 Qwen3-1.7B、Qwen3-4B、Qwen3-8B 的九组主实验，新增的 8B 和答案不匹配配置也在该清单中。以下保留原有配置索引。
+当前启动优先级以 [实验优先级与启动清单](实验优先级与启动清单.md) 为准：第一阶段仅运行 Qwen3-1.7B、Qwen3-4B、Qwen3-8B 的九组主实验，新增的 8B 和答案不匹配配置也在该清单中。以下仅列出这三个模型的启动配置。
 
-分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、其他模型使用 **4 卡**，Teacher reverse align（TRA）使用 **8 卡**；正式服务器均通过 `--no-tmux` 在前台启动。以下包含 27 个基础实验和 4 个 TRA 特权对照，分别在相应卡数的服务器上选择运行。
+分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、其他模型使用 **4 卡**，Teacher reverse align（TRA）使用 **8 卡**；正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验和 4 个 TRA 特权对照，分别在相应卡数的服务器上选择运行。
 
 所有配置默认训练 100 次更新，全局 batch 为 32 题 × 每题 8 个回复，训练生成上限 8192；初始及每 10 步依次评测 AMC23、AIME24，Avg@16，生成上限 32768。LoRA r=64、alpha=128，分布损失使用 Student top-512。
 
@@ -16,9 +16,9 @@ SDK 的终端采集、运行环境、主机信息、Git、依赖快照和 SwanLa
 
 - `FKL_Qwen3-1.7B_no-thinking_100steps_4gpus`
 - `tra_self_shot_Qwen3-1.7B_no-thinking_100steps_8gpus`
-- `TRA_deepseek-7b_100steps_8gpus`
+- `TRA_Qwen3-8B_no-thinking_100steps_8gpus`
 
-Qwen3、Qwen3.5、Gemma4 的当前配置均为 No thinking。若修改 `algorithm.enable_thinking: true`，SwanLab 名称会自动改为 `thinking`。DeepSeek Distill 使用原生推理模板，名称省略模式标签。
+当前三个 Qwen3 模型均为 No thinking。若修改 `algorithm.enable_thinking: true`，SwanLab 名称会自动改为 `thinking`。
 
 ## 公共环境变量
 
@@ -64,78 +64,6 @@ bash scripts/start_train.sh --no-tmux configs/training/fkl/qwen3_8b_100steps_8GP
 bash scripts/start_train.sh --no-tmux configs/training/clip_opsd/qwen3_8b_100steps_8GPU.yaml
 # 8 卡 TRA
 bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_8b_100steps_8GPU.yaml
-```
-
-## Qwen3.5-4B · No thinking
-
-```bash
-export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3.5-4B"
-# 4 卡 FKL
-bash scripts/start_train.sh --no-tmux configs/training/fkl/qwen3_5_4b_100steps_4GPU.yaml
-# 4 卡 Clip-OPSD
-bash scripts/start_train.sh --no-tmux configs/training/clip_opsd/qwen3_5_4b_100steps_4GPU.yaml
-# 8 卡 TRA
-bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_5_4b_100steps_8GPU.yaml
-```
-
-## Qwen3.5-2B · No thinking
-
-```bash
-export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3.5-2B"
-# 4 卡 FKL
-bash scripts/start_train.sh --no-tmux configs/training/fkl/qwen3_5_2b_100steps_4GPU.yaml
-# 4 卡 Clip-OPSD
-bash scripts/start_train.sh --no-tmux configs/training/clip_opsd/qwen3_5_2b_100steps_4GPU.yaml
-# 8 卡 TRA
-bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_5_2b_100steps_8GPU.yaml
-```
-
-## Gemma4-E2B-it · No thinking
-
-```bash
-export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/gemma-4-E2B-it"
-# 4 卡 FKL
-bash scripts/start_train.sh --no-tmux configs/training/fkl/gemma4_e2b_it_100steps_4GPU.yaml
-# 4 卡 Clip-OPSD
-bash scripts/start_train.sh --no-tmux configs/training/clip_opsd/gemma4_e2b_it_100steps_4GPU.yaml
-# 8 卡 TRA
-bash scripts/start_train.sh --no-tmux configs/training/tra/gemma4_e2b_it_100steps_8GPU.yaml
-```
-
-## Gemma4-E4B-it · No thinking
-
-```bash
-export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/gemma-4-E4B-it"
-# 4 卡 FKL
-bash scripts/start_train.sh --no-tmux configs/training/fkl/gemma4_e4b_it_100steps_4GPU.yaml
-# 4 卡 Clip-OPSD
-bash scripts/start_train.sh --no-tmux configs/training/clip_opsd/gemma4_e4b_it_100steps_4GPU.yaml
-# 8 卡 TRA
-bash scripts/start_train.sh --no-tmux configs/training/tra/gemma4_e4b_it_100steps_8GPU.yaml
-```
-
-## DeepSeek-R1-Distill-Qwen-1.5B
-
-```bash
-export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/DeepSeek-R1-Distill-Qwen-1.5B"
-# 4 卡 FKL
-bash scripts/start_train.sh --no-tmux configs/training/fkl/deepseek_1p5b_100steps_4GPU.yaml
-# 4 卡 Clip-OPSD
-bash scripts/start_train.sh --no-tmux configs/training/clip_opsd/deepseek_1p5b_100steps_4GPU.yaml
-# 8 卡 TRA
-bash scripts/start_train.sh --no-tmux configs/training/tra/deepseek_1p5b_100steps_8GPU.yaml
-```
-
-## DeepSeek-R1-Distill-Qwen-7B
-
-```bash
-export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/DeepSeek-R1-Distill-Qwen-7B"
-# 4 卡 FKL
-bash scripts/start_train.sh --no-tmux configs/training/fkl/deepseek_7b_100steps_4GPU.yaml
-# 4 卡 Clip-OPSD
-bash scripts/start_train.sh --no-tmux configs/training/clip_opsd/deepseek_7b_100steps_4GPU.yaml
-# 8 卡 TRA
-bash scripts/start_train.sh --no-tmux configs/training/tra/deepseek_7b_100steps_8GPU.yaml
 ```
 
 ## TRA 指数参数 n
@@ -202,7 +130,7 @@ bash scripts/start_train.sh --tmux tests/configs/swanlab_privacy/qwen3_1p7b.yaml
 bash scripts/start_train.sh --tmux tests/configs/swanlab_privacy/qwen3_1p7b_n2.yaml
 ```
 
-正式 4/8 卡服务器使用上方的 `--no-tmux` 命令。基础八模型 × 三算法的双卡验证与吞吐见 [配置和验证总表](teacher_alignment_matrix.md)。
+正式 4/8 卡服务器使用上方的 `--no-tmux` 命令。当前模型的配置和验证记录见 [配置和验证总表](teacher_alignment_matrix.md)。
 
 ## 本次验证（2026-11-25）
 

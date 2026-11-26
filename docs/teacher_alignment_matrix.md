@@ -1,8 +1,8 @@
-# FKL、Clip-OPSD、TRA：九模型训练配置
+# FKL、Clip-OPSD、TRA：当前三模型训练配置
 
 三种算法正式命名为 **FKL**、**Clip-OPSD** 和 **Teacher reverse align（TRA）**。新配置、插件、训练状态和 SwanLab 指标使用这些名称；旧 TCA 入口继续兼容已有运行和检查点。
 
-所有新实验记录到公开项目 [qhe/TCPO](https://swanlab.cn/@qhe/TCPO)。`run.group` 使用模型名；`run.name` 包含算法、模型、thinking 模式、训练步数和 GPU 数。DeepSeek 的 run name 分别使用 `deepseek-1p5b`、`deepseek-7b`，省略模式标签，group 保留完整模型名。
+所有新实验记录到公开项目 [qhe/TCPO](https://swanlab.cn/@qhe/TCPO)。`run.group` 使用模型名；`run.name` 包含算法、模型、thinking 模式、训练步数和 GPU 数。
 
 [基础实验及 TRA 特权对照启动命令、SwanLab 隐私边界及 TRA 指数参数](teacher_alignment_launch_commands.md)。当前优先级与连续实验编号见 [实验优先级与启动清单](实验优先级与启动清单.md)。
 
@@ -32,23 +32,17 @@
 | 运行方式 | 每卡 Actor/Learner 交接；评测末尾预取下一训练 batch，全部评测完成后才开放 Learner |
 | vLLM | CUDA Graph 开启，enforce_eager=false |
 
-Qwen3、Qwen3.5、Gemma4 使用 No thinking；DeepSeek Distill 使用其原生推理模板。Qwen3.5 的 LoRA 包含线性注意力投影；Gemma 的 LoRA 仅作用于实际存在的文本注意力和 MLP 层。
+当前三个 Qwen3 模型均使用 No thinking，LoRA 作用于文本注意力及 MLP 的七类投影层。
 
-## 27 份配置
+## 九组主实验配置
 
 | 模型 / SwanLab group | FKL · 4/8 GPU | Clip-OPSD · 4/8 GPU | TRA · 8 GPU |
 | --- | --- | --- | --- |
 | Qwen3-1.7B | [配置](../configs/training/fkl/qwen3_1p7b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/qwen3_1p7b_100steps_4GPU.yaml) | [配置](../configs/training/tra/qwen3_1p7b_100steps_8GPU.yaml) |
 | Qwen3-4B | [8 卡配置](../configs/training/fkl/qwen3_4b_100steps_8GPU.yaml) | [8 卡配置](../configs/training/clip_opsd/qwen3_4b_100steps_8GPU.yaml) | [配置](../configs/training/tra/qwen3_4b_100steps_8GPU.yaml) |
 | Qwen3-8B | [8 卡配置](../configs/training/fkl/qwen3_8b_100steps_8GPU.yaml) | [8 卡配置](../configs/training/clip_opsd/qwen3_8b_100steps_8GPU.yaml) | [配置](../configs/training/tra/qwen3_8b_100steps_8GPU.yaml) |
-| Qwen3.5-4B | [配置](../configs/training/fkl/qwen3_5_4b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/qwen3_5_4b_100steps_4GPU.yaml) | [配置](../configs/training/tra/qwen3_5_4b_100steps_8GPU.yaml) |
-| Qwen3.5-2B | [配置](../configs/training/fkl/qwen3_5_2b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/qwen3_5_2b_100steps_4GPU.yaml) | [配置](../configs/training/tra/qwen3_5_2b_100steps_8GPU.yaml) |
-| Gemma4-E2B-it | [配置](../configs/training/fkl/gemma4_e2b_it_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/gemma4_e2b_it_100steps_4GPU.yaml) | [配置](../configs/training/tra/gemma4_e2b_it_100steps_8GPU.yaml) |
-| Gemma4-E4B-it | [配置](../configs/training/fkl/gemma4_e4b_it_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/gemma4_e4b_it_100steps_4GPU.yaml) | [配置](../configs/training/tra/gemma4_e4b_it_100steps_8GPU.yaml) |
-| DeepSeek-R1-Distill-Qwen-1.5B | [配置](../configs/training/fkl/deepseek_1p5b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/deepseek_1p5b_100steps_4GPU.yaml) | [配置](../configs/training/tra/deepseek_1p5b_100steps_8GPU.yaml) |
-| DeepSeek-R1-Distill-Qwen-7B | [配置](../configs/training/fkl/deepseek_7b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/deepseek_7b_100steps_4GPU.yaml) | [配置](../configs/training/tra/deepseek_7b_100steps_8GPU.yaml) |
 
-例如：`FKL_deepseek-1p5b_100steps_4gpus`、`Clip-OPSD_Qwen3.5-4B_no-thinking_100steps_4gpus`、`TRA_Gemma4-E4B-it_no-thinking_100steps_8gpus`。
+例如：`FKL_Qwen3-4B_no-thinking_100steps_8gpus`、`Clip-OPSD_Qwen3-8B_no-thinking_100steps_8gpus`。
 
 Qwen3-1.7B 的基础 TRA 现明确命名为 `tra_self_shot`，现有配置路径保留。另有两份八卡特权对照：[tra_random_shot](../configs/training/tra_random_shot/qwen3_1p7b_100steps_8GPU.yaml)、[tra_true_answer](../configs/training/tra_true_answer/qwen3_1p7b_100steps_8GPU.yaml)。三者优化相同目标，只改变冻结 Teacher 的特权上下文。
 
@@ -87,35 +81,10 @@ bash scripts/start_train.sh --tmux tests/configs/teacher_alignment/tra_qwen3_1p7
 
 双卡大模型验证使用冻结基座 CPU/GPU 交接，正式 80GB 配置保留基座常驻。测试配置、代码、日志和结果仅保留在本地 `tests/`，不提交 GitHub。每组验证完毕清理临时适配器和检查点，基础模型保留。
 
-## 基础矩阵验证（2026-11-25，提交 b1033d7）
+## 验证记录
 
-CPU 检查 **114 项通过**，覆盖全部配置、算法注册、Controller 启动、三种目标的独立梯度核对、原生模型 LoRA 结构及聊天模板。远程双 RTX 4090 上 **24/24 组通过**：每组使用完整 BF16 基础权重，执行 2 次实际优化更新，单批 2 题 × 4 回复。
+当前三个模型的基础算法已有双卡轻量验证记录，每组执行两次实际更新并检查评测、LoRA 热加载及各数据集截断率。证据保存在本地 `tests/outputs/teacher_alignment_matrix_20261125/` 和 `tests/outputs/stage1_priority_20261125/`。
 
-每组都完成两轮 AMC23 → AIME24 双卡评测，核实更新后的 LoRA 热加载、各数据集截断率上传、评测期间下一批 rollout 预取，以及全部评测结束后的 Learner 放行。梯度和优化器状态均为有限值；每个目标层的 LoRA A/B 形状均与基础权重匹配，所有 B 权重和模块更新均非零。服务端按 group 筛选核实了全部八个模型分组及公开项目 TCPO。
+新增两组不匹配 solution TRA 已通过 113 项 CPU 检查，覆盖严格排除同题、示例题与 solution 配对、跨 Worker 一致性、恢复检查及实际 CPU Learner 更新。本轮远程双卡不可用，未进行新的 GPU 实测；证据保存在本地 `tests/outputs/tra_mismatched_solution_20261126/`。
 
-正式 4/8 卡配置通过解析与协议检查；实际 GPU 验证使用上述双卡轻量覆盖，未在 4/8 卡服务器上运行完整 100 步或 8192/32768 长度实验。95 个生产源码及配置文件的指纹与远程实测版本一致。
-
-### 双卡吞吐
-
-下表每格为 **Actor 生成 / 训练流水线**，单位均为 response tok/s，两批合并后按总 token 数除以总耗时计算。流水线耗时从训练任务派发到更新结果回收，包含显存交接和等待。生成上限 256，每批最多 2048 个回复 token。
-
-| 模型 | LoRA 目标层数 | FKL | Clip-OPSD | TRA |
-| --- | ---: | ---: | ---: | ---: |
-| Qwen3-1.7B | 196 | 1289.4 / 292.6 | 1271.5 / 290.4 | 1277.4 / 291.0 |
-| Qwen3-4B | 252 | 685.9 / 127.4 | 688.6 / 124.6 | 685.8 / 125.9 |
-| Qwen3.5-4B | 248 | 598.7 / 84.3 | 609.6 / 85.4 | 609.7 / 85.0 |
-| Qwen3.5-2B | 186 | 934.4 / 136.0 | 1100.0 / 139.3 | 1109.5 / 132.6 |
-| Gemma4-E2B-it | 205 | 560.0 / 104.0 | 934.0 / 114.3 | 931.3 / 115.5 |
-| Gemma4-E4B-it | 258 | 563.7 / 75.9 | 564.1 / 74.8 | 564.0 / 75.1 |
-| DeepSeek-R1-Distill-Qwen-1.5B | 196 | 1314.2 / 300.7 | 1304.5 / 299.3 | 1307.5 / 298.4 |
-| DeepSeek-R1-Distill-Qwen-7B | 196 | 454.1 / 77.8 | 454.9 / 79.0 | 454.6 / 78.9 |
-
-短批次结果存在首批波动。例如 Gemma4-E2B-it 的 FKL 首批生成 427.5、第二批 811.6 tok/s；同模型 Clip-OPSD、TRA 第二批分别为 822.6、823.7 tok/s。逐批生成、Learner 和流水线吞吐保留在本地 CSV/JSON 中。
-
-Qwen3-1.7B、DeepSeek-1.5B 的测试基座常驻显存，其余模型使用冻结基座 CPU/GPU 交接。正式 80GB 配置采用基座常驻，吞吐需按正式 batch 和长度实测。Qwen3.5 Learner 在本次环境中使用原生 PyTorch GatedDeltaNet 路径，环境未安装 `fla`、`causal_conv1d`。
-
-GPU 验证环境：PyTorch `2.10.0+cu129`、Transformers `5.9.0`、PEFT `0.21.0`、vLLM `0.19.1`、DeepSpeed `0.19.7`、SwanLab `0.10.4`。
-
-完整证据保留在本地 `tests/outputs/teacher_alignment_matrix_20261125/`：`gpu_validation_summary.json`、`throughput.csv`、各组 LoRA/梯度检查、云端分组核验及日志。测试结束后已清理临时 LoRA、检查点和优化器状态，八个基础模型保留，双卡显存已释放。
-
-该轮 24 条旧云端测试记录已按用户要求删除，本地指标和报告保留。隐私修复后的验证另存于 `tests/outputs/swanlab_privacy_20261125/`。
+正式八卡训练由用户在服务器启动。
