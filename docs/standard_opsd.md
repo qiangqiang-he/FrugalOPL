@@ -25,6 +25,14 @@ SwanLab 使用公开的 `TCPO` Project，group 为模型名；继续过滤本地
 
 ## 八卡启动命令：无 tmux
 
+编号与[实验优先级与启动清单](实验优先级与启动清单.md)一致：
+
+| 编号 | 模型 | 算法 | GPU 数 | 状态 |
+| --- | --- | --- | ---: | --- |
+| **24** | Qwen3-1.7B | standard_OPSD | 8 | 待运行 |
+| **25** | Qwen3-4B | standard_OPSD | 8 | 待运行 |
+| **26** | Qwen3-8B | standard_OPSD | 8 | 待运行 |
+
 先激活训练环境并进入项目根目录，设置仓库外的凭据文件和模型根目录。
 
 ```bash
@@ -35,18 +43,27 @@ export FRUGALOPL_SWANLAB_ENV_FILE="/path/outside/repo/swanlab.env"
 
 每份配置在对应的八卡服务器上独立启动：
 
+### 编号 24｜Qwen3-1.7B｜standard_OPSD｜8 卡
+
 ```bash
 export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
+# 编号 24
 bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_1p7b_100steps_8GPU.yaml
 ```
 
+### 编号 25｜Qwen3-4B｜standard_OPSD｜8 卡
+
 ```bash
 export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-4B"
+# 编号 25
 bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_4b_100steps_8GPU.yaml
 ```
 
+### 编号 26｜Qwen3-8B｜standard_OPSD｜8 卡
+
 ```bash
 export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-8B"
+# 编号 26
 bash scripts/start_train.sh --no-tmux configs/training/standard_opsd/qwen3_8b_100steps_8GPU.yaml
 ```
 
