@@ -3,6 +3,10 @@ run:
   name: tra_match_answer_empty_fallback_Qwen3-1.7B_no-thinking_100steps_4gpus
   redis:
     key_prefix: tra_match_answer_empty_fallback_qwen3_1p7b_100steps_4gpu
+actor:
+  evaluation:
+    generation:
+      max_response_length: 32768
 learner:
   distributed:
     master_port: 29947

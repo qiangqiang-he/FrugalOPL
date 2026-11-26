@@ -11,8 +11,15 @@ class MismatchedAnswerTeacherMixin:
     _mismatch_metric_prefix = 'fkl'
 
     def __init__(self, *, tokenizer, runtime):
+        fallback = runtime.algorithm.get('mismatch_answer_fallback', 'perturb_gold')
+        if fallback not in ('perturb_gold', 'empty'):
+            raise ValueError('mismatch_answer_fallback must be perturb_gold or empty.')
+        self._mismatch_answer_fallback = fallback
         super().__init__(tokenizer=tokenizer, runtime=runtime)
         self._answer_selection_seed = runtime.seed
+
+    def _render_teacher_record(self, record):
+        return self._render_answer_teacher_record(record, allow_empty=self._mismatch_answer_fallback == 'empty')
 
     def collect_actor_signals(self, signals):
         request = super().collect_actor_signals(signals)
@@ -39,7 +46,7 @@ class MismatchedAnswerTeacherMixin:
         if not isinstance(batch_id, str) or not batch_id:
             raise ValueError('Answer-conflict alignment requires a stable batch_id.')
         choices = choose_mismatched_answers(records, indices, responses, seed=self._answer_selection_seed,
-            batch_id=batch_id, expected_replies=int(self._sampling['n']))
+            batch_id=batch_id, expected_replies=int(self._sampling['n']), fallback=self._mismatch_answer_fallback)
         return {
             'teacher_prompts': [self._render_privileged_prompt({**records[index], 'answer': choice['answer']})
                                 for index, choice in zip(indices, choices)],
@@ -60,9 +67,14 @@ class MismatchedAnswerTeacherMixin:
             prefix + 'gold_escape_fraction': (source == 2).float().mean(),
             prefix + 'missing_own_answer_fraction': batch['mismatch_own_missing'].float().mean(),
             prefix + 'candidate_count': batch['mismatch_candidate_count'].float().mean()}
+        if self._mismatch_answer_fallback == 'empty':
+            metrics[prefix + 'empty_fallback_fraction'] = (source == 3).float().mean()
         return ObjectiveResult(result.objective, metrics, result.valid_token_count,
                                result.token_weighted_metrics, result.requires_optimizer_step)
 
     def training_state_dict(self):
-        return {**super().training_state_dict(), 'answer_selection_version': 1,
+        state = {**super().training_state_dict(), 'answer_selection_version': 1,
                 'answer_selection_seed': self._answer_selection_seed}
+        if self._mismatch_answer_fallback == 'empty':
+            state['answer_fallback'] = 'empty'
+        return state

@@ -113,8 +113,11 @@ def perturb_gold_answer(question, gold, own_answer):
     raise ValueError('Could not construct an answer different from this rollout.')
 
 
-def choose_mismatched_answers(records, indices, responses, *, seed, batch_id, expected_replies):
+def choose_mismatched_answers(records, indices, responses, *, seed, batch_id, expected_replies,
+                              fallback='perturb_gold'):
     """Select from complete same-question groups before rollout-level sharding."""
+    if fallback not in ('perturb_gold', 'empty'):
+        raise ValueError('Answer-conflict fallback must be perturb_gold or empty.')
     if len(indices) != len(responses) or not indices:
         raise ValueError('Answer-conflict responses must align with rollout prompt indices.')
     if any(isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(records) for index in indices):
@@ -139,8 +142,8 @@ def choose_mismatched_answers(records, indices, responses, *, seed, batch_id, ex
             answer, source = extracted[peer], 0
         else:
             peer = -1
-            answer, source = perturb_gold_answer(question, record['answer'], own)
-        if own is not None and answers_match(question, answer, own):
+            answer, source = ('', 3) if fallback == 'empty' else perturb_gold_answer(question, record['answer'], own)
+        if own is not None and answer and answers_match(question, answer, own):
             raise RuntimeError('Answer-conflict selection produced a matching answer.')
         selected.append({'answer': answer, 'source': source, 'peer_index': peer,
                          'candidate_count': len(eligible), 'own_missing': own is None})
