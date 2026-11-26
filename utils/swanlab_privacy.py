@@ -26,7 +26,7 @@ _FIELDS = {
     ('learner', 'execution'): 'gradient_checkpointing clip_grad_norm offload_frozen_base_between_turns',
     ('learner', 'optimizer'): 'type lr betas eps weight_decay',
     ('learner', 'scheduler'): 'type',
-    ('algorithm',): 'plugin algo_name answer_context match_answer_fallback mismatch_answer_fallback kl_top_k loss_aggregation enable_thinking self_shot_format teacher_sync_interval kl_temperature kl_token_clip tra_plausible_fraction tra_ratio_power ratio_plausible_fraction tca_plausible_fraction tcdo_plausible_fraction tcdo_incorrect_weight tcdo_truncated_weight tcpo_objective_version tcpo_plausible_fraction tcpo_alpha_plus tcpo_alpha_minus tcpo_alpha_tru',
+    ('algorithm',): 'plugin algo_name answer_context match_answer_fallback mismatch_answer_fallback kl_top_k loss_aggregation enable_thinking self_shot_format teacher_sync_interval kl_temperature kl_token_clip tra_plausible_fraction tra_ratio_power tra_loss_alpha ratio_plausible_fraction tca_plausible_fraction tcdo_plausible_fraction tcdo_incorrect_weight tcdo_truncated_weight tcpo_objective_version tcpo_alpha_plus tcpo_alpha_minus tcpo_alpha_tru',
     ('algorithm', 'training_sampling'): 'temperature top_p top_k max_tokens n seed',
 }
 _ENUMS = frozenset({'bfloat16', 'float16', 'float32', 'bf16', 'fp16', 'fp32',

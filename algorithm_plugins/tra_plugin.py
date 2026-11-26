@@ -20,6 +20,11 @@ class TRAPlugin(RatioOPSDPlugin):
         if isinstance(power, bool) or not isinstance(power, (int, float)) or not math.isfinite(power):
             raise ValueError('tra_ratio_power must be a finite real number.')
         self._ratio_power = float(power)
+        alpha = runtime.algorithm.get('tra_loss_alpha', 1.0)
+        if (isinstance(alpha, bool) or not isinstance(alpha, (int, float))
+                or not math.isfinite(alpha) or not 0 <= alpha <= 1):
+            raise ValueError('tra_loss_alpha must be a finite real number in [0,1].')
+        self._loss_alpha = float(alpha)
 
     def compute_objective(self, batch):
         values = self.compute_ratio_kl(
@@ -28,17 +33,26 @@ class TRAPlugin(RatioOPSDPlugin):
             ratio_power=self._ratio_power,
         )
         mask = batch['response_mask'].bool()
-        loss = masked_token_mean(values['ratio_kl_loss'], mask)
+        raw_loss = masked_token_mean(values['ratio_kl_loss'], mask)
+        loss = self._loss_alpha * raw_loss
         metrics = {name: masked_token_mean(value, mask).detach() for name, value in values.items()}
-        metrics['tra_loss'] = metrics.pop('ratio_kl_loss')
+        metrics['tra_raw_loss'] = metrics.pop('ratio_kl_loss')
+        metrics['tra_loss'] = loss.detach()
         metrics['tra_ratio_power'] = loss.detach().new_tensor(self._ratio_power)
-        return ObjectiveResult(-loss, metrics, mask.sum().detach(), frozenset(metrics))
+        metrics['tra_loss_alpha'] = loss.detach().new_tensor(self._loss_alpha)
+        return ObjectiveResult(-loss, metrics, mask.sum().detach(), frozenset(metrics),
+                               requires_optimizer_step=self._loss_alpha > 0)
 
     def training_state_dict(self):
         return {**super().training_state_dict(), 'algorithm': 'TRA',
-                'ratio_power': self._ratio_power, 'target_power': 1 + self._ratio_power}
+                'ratio_power': self._ratio_power, 'target_power': 1 + self._ratio_power,
+                'loss_alpha': self._loss_alpha}
 
     def load_training_state_dict(self, state, *, step):
+        # Historical checkpoints had implicit alpha=1. Never silently load
+        # them into a run that uses a different loss scale.
+        if isinstance(state, Mapping) and state and self._loss_alpha == 1.0 and 'loss_alpha' not in state:
+            state = {**state, 'loss_alpha': 1.0}
         # Existing TRA checkpoints used fixed n=1 and had no ratio_power field.
         if isinstance(state, Mapping) and self._ratio_power == 1.0 and state.get('algorithm') == 'TRA' and 'ratio_power' not in state:
             state = {**state, 'ratio_power': 1.0, 'target_power': float(state.get('target_power', 2))}

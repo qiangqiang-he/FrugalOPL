@@ -12,7 +12,7 @@ FKL、Clip-OPSD 和 TRA 的基础配置共用同一冻结基础 Teacher：关闭
 | --- | ---: | --- |
 | FKL | Qwen3-4B / 8B：8；其余：4 | 最小化普通 Forward KL：`KL(q || p)`，无 CLIP |
 | Clip-OPSD | Qwen3-4B / 8B：8；其余：4 | 对每个词表项的 `q_i log(q_i / p_i)` 做上界截断，epsilon=`1e-7` |
-| TRA | 8 | 拟合停止梯度的 `r ∝ p × (p/q)^n × 1[p ≥ 0.01 p_max]`，默认 `n=1` |
+| TRA | 8 | 拟合停止梯度的 `r ∝ p × (p/q)^n × 1[p ≥ 0.01 p_max]`；损失为 `alpha × KL(r || p)`，默认 `n=1`、`alpha=1` |
 | standard_OPSD | Qwen3-1.7B：4；4B／8B：8 | 单轮 reference solution 上下文；1.7B／4B epsilon=`1e-6`，8B epsilon=`1e-7` |
 | standard_FKL | 8 | 与 standard_OPSD 相同的单轮 reference solution 上下文；普通 Forward KL，无 CLIP |
 
@@ -79,6 +79,14 @@ Qwen3-4B、8B 各补齐 n=0.1 八卡配置；既有 n=0.2 配置继续使用：
 | Qwen3-1.7B | [配置](../configs/training/tra/qwen3_1p7b_n0p05_100steps_8GPU.yaml) | 32／待运行 |
 | Qwen3-4B | [配置](../configs/training/tra/qwen3_4b_n0p05_100steps_8GPU.yaml) | 33／待运行 |
 | Qwen3-8B | [配置](../configs/training/tra/qwen3_8b_n0p05_100steps_8GPU.yaml) | 34／待运行 |
+
+三个模型各新增一份八卡 TRA 损失缩放配置，alpha=0.5、n=0.1，其他参数沿用对应 n=0.1 的配置；详见 [参数与验证说明](tra_loss_alpha.md)。
+
+| 模型 | alpha=0.5、n=0.1 八卡配置 | 清单编号／状态 |
+| --- | --- | --- |
+| Qwen3-1.7B | [配置](../configs/training/tra/qwen3_1p7b_n0p1_alpha0p5_100steps_8GPU.yaml) | 35／待运行 |
+| Qwen3-4B | [配置](../configs/training/tra/qwen3_4b_n0p1_alpha0p5_100steps_8GPU.yaml) | 36／待运行 |
+| Qwen3-8B | [配置](../configs/training/tra/qwen3_8b_n0p1_alpha0p5_100steps_8GPU.yaml) | 37／待运行 |
 
 新增 Qwen3-1.7B 的两组四卡空答案对照，均为 No thinking、n=1、100 steps、batch 16×8、训练 8192／评测 32768、Avg@16：
 

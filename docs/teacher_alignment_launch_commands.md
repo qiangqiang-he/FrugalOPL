@@ -2,7 +2,7 @@
 
 当前启动优先级以 [实验优先级与启动清单](实验优先级与启动清单.md) 为准：第一阶段仅运行 Qwen3-1.7B、Qwen3-4B、Qwen3-8B 的九组主实验，新增的 8B 和答案不匹配配置也在该清单中。以下仅列出这三个模型的启动配置。
 
-分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**；基础 Teacher reverse align（TRA）使用 **8 卡**。Qwen3-1.7B 的 n=0.2 指数对照使用 **4 卡**；所有 n=0.05、Qwen3-1.7B 的 n=0.1／0.3 以及 Qwen3-4B、8B 的 n=0.1／0.2 使用 **8 卡**。正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照、10 个指数对照（n=0.05／0.1／0.2／0.3）、2 个四卡空答案对照、3 个 standard_OPSD（1.7B 四卡、4B／8B 八卡）及 3 个八卡 standard_FKL 实验，分别在相应卡数的服务器上选择运行。
+分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**；基础 Teacher reverse align（TRA）使用 **8 卡**。Qwen3-1.7B 的 n=0.2 指数对照使用 **4 卡**；所有 n=0.05、Qwen3-1.7B 的 n=0.1／0.3 以及 Qwen3-4B、8B 的 n=0.1／0.2 使用 **8 卡**。新增三组 TRA alpha=0.5、n=0.1 也均为 **8 卡**。正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照、10 个指数对照、3 个损失系数对照、2 个四卡空答案对照、3 个 standard_OPSD（1.7B 四卡、4B／8B 八卡）及 3 个八卡 standard_FKL 实验。
 
 所有配置默认训练 100 次更新，全局 batch 为 32 题 × 每题 8 个回复，训练生成上限 8192；初始及每 10 步依次评测 AMC23、AIME24，Avg@16，生成上限 32768。LoRA r=64、alpha=128，分布损失使用 Student top-512。
 
@@ -72,18 +72,21 @@ bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_8b_100steps_8GP
 
 \[
 r_i=\frac{p_i(p_i/q_i)^n\,\mathbf 1[p_i\ge f p_{\max}]}{\sum_j p_j(p_j/q_j)^n\,\mathbf 1[p_j\ge f p_{\max}]},
-\qquad L=\mathrm{KL}(\operatorname{stopgrad}(r)\Vert p).
+\qquad L=\alpha\,\mathrm{KL}(\operatorname{stopgrad}(r)\Vert p).
 \]
 
-参数在 `configs/common/tra_8GPU.yaml` 中定义，全部八份 TRA 配置继承：
+参数在 `configs/common/tra_8GPU.yaml` 中定义，当前 TRA 配置继承：
 
 ```yaml
 algorithm:
   tra_ratio_power: 1.0          # n，有限实数；默认目标 p²/q
+  tra_loss_alpha: 1.0           # alpha，范围 [0,1]，整体缩放 KL loss
   tra_plausible_fraction: 0.01  # f，支持集阈值
 ```
 
 若只调整一个模型，在对应 TRA 配置末尾覆盖 `algorithm.tra_ratio_power`，例如 `0.5` 或 `2.0`。云端配置记录该参数，每次更新还在对应算法命名空间下记录 `tra_ratio_power`。检查点保存指数，恢复时核对一致性；旧的固定 n=1 TRA 检查点可以按默认值恢复。
+
+损失系数使用 `algorithm.tra_loss_alpha`，默认 1 保持原损失和梯度；每步记录 `tra_raw_loss`、`tra_loss` 和 `tra_loss_alpha`。旧检查点未记录 alpha 时按 1 兼容恢复；alpha=0 时跳过优化器更新。详见 [TRA 损失系数](tra_loss_alpha.md)。
 
 ## Qwen3-1.7B：三种 TRA 特权
 
@@ -250,6 +253,28 @@ bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_4b_n0p05_100ste
 export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-8B"
 # 编号 34：n=0.05
 bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_8b_n0p05_100steps_8GPU.yaml
+```
+
+## 三个模型：八卡 TRA alpha=0.5，n=0.1（35–37）
+
+沿用同题 solution one-shot、No thinking、100 steps、batch 32×8、训练 8192／评测 32768、AMC23 和 AIME24 Avg@16；只将 TRA loss 整体乘以 alpha=0.5，n 仍为 0.1。配置与测试说明见 [损失系数文档](tra_loss_alpha.md)。
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
+# 编号 35
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_1p7b_n0p1_alpha0p5_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-4B"
+# 编号 36
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_4b_n0p1_alpha0p5_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-8B"
+# 编号 37
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_8b_n0p1_alpha0p5_100steps_8GPU.yaml
 ```
 
 ## 双卡验证命令：必须有 tmux
