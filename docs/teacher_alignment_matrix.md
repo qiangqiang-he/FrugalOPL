@@ -56,6 +56,13 @@ Qwen3-4B、Qwen3-8B 的同题 solution TRA 和 Clip-OPSD 已于 2026-11-26 由�
 | Qwen3-4B | [8 卡配置](../configs/training/tra/qwen3_4b_n0p2_100steps_8GPU.yaml) | 18 |
 | Qwen3-8B | [8 卡配置](../configs/training/tra/qwen3_8b_n0p2_100steps_8GPU.yaml) | 19 |
 
+Qwen3-1.7B 另增加 n=0.1、n=0.3 两份八卡同题 solution one-shot 配置；除卡数和指数外，训练参数与编号 17 的 n=0.2 配置一致：
+
+| 指数 | 八卡配置 | 清单编号／状态 |
+| --- | --- | --- |
+| n=0.1 | [配置](../configs/training/tra/qwen3_1p7b_n0p1_100steps_8GPU.yaml) | 22／待运行 |
+| n=0.3 | [配置](../configs/training/tra/qwen3_1p7b_n0p3_100steps_8GPU.yaml) | 23／待运行 |
+
 新增 Qwen3-1.7B 的两组四卡空答案对照，均为 No thinking、n=1、100 steps、batch 16×8、训练 8192／评测 32768、Avg@16：
 
 | 实验 | 配置 | 清单编号／状态 |
