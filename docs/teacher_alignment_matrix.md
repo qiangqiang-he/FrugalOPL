@@ -48,13 +48,13 @@ Qwen3-1.7B 的基础 TRA 现明确命名为 `tra_self_shot`，现有配置路径
 
 Qwen3-4B、Qwen3-8B 的同题 solution TRA 和 Clip-OPSD 已于 2026-11-26 由用户确认完成。新增两份八卡 TRA 不匹配 solution one-shot 配置：[Qwen3-4B](../configs/training/tra_mismatch_solution/qwen3_4b_100steps_8GPU.yaml)、[Qwen3-8B](../configs/training/tra_mismatch_solution/qwen3_8b_100steps_8GPU.yaml)。示例从训练集中严格排除当前题后随机抽取，保留示例题与其 solution 的配对，其他训练及评测超参数与原 TRA 一致。
 
-三份同题 solution TRA 指数对照均为 n=0.5；Qwen3-1.7B 使用四卡，Qwen3-4B、Qwen3-8B 使用八卡，其余参数沿用对应模型的 n=1 配置：
+三份同题 solution TRA 指数对照均为 n=0.2；Qwen3-1.7B 使用四卡，Qwen3-4B、Qwen3-8B 使用八卡，其余参数沿用对应模型的 n=1 配置：
 
-| 模型 | n=0.5 配置 | 清单编号／状态 |
+| 模型 | n=0.2 配置 | 清单编号／状态 |
 | --- | --- | --- |
-| Qwen3-1.7B | [4 卡配置](../configs/training/tra/qwen3_1p7b_n0p5_100steps_4GPU.yaml) | 17／已启动 |
-| Qwen3-4B | [8 卡配置](../configs/training/tra/qwen3_4b_n0p5_100steps_8GPU.yaml) | 18 |
-| Qwen3-8B | [8 卡配置](../configs/training/tra/qwen3_8b_n0p5_100steps_8GPU.yaml) | 19 |
+| Qwen3-1.7B | [4 卡配置](../configs/training/tra/qwen3_1p7b_n0p2_100steps_4GPU.yaml) | 17／待重启 |
+| Qwen3-4B | [8 卡配置](../configs/training/tra/qwen3_4b_n0p2_100steps_8GPU.yaml) | 18 |
+| Qwen3-8B | [8 卡配置](../configs/training/tra/qwen3_8b_n0p2_100steps_8GPU.yaml) | 19 |
 
 新增 Qwen3-1.7B 的两组四卡空答案对照，均为 No thinking、n=1、100 steps、batch 16×8、训练 8192／评测 32768、Avg@16：
 
