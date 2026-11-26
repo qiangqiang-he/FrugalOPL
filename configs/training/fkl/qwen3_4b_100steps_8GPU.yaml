@@ -1,0 +1,10 @@
+extends:
+  - ../../common/fkl_8GPU.yaml
+  - ../../models/qwen3_4b.yaml
+run:
+  name: FKL_Qwen3-4B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: fkl_qwen3_4b_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29903

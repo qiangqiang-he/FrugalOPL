@@ -10,7 +10,7 @@
 
 | 算法 | GPU 数 | 目标 |
 | --- | ---: | --- |
-| FKL | 4 | 最小化普通 Forward KL：`KL(q || p)`，无 CLIP |
+| FKL | Qwen3-4B / 8B：8；其余：4 | 最小化普通 Forward KL：`KL(q || p)`，无 CLIP |
 | Clip-OPSD | Qwen3-4B / 8B：8；其余：4 | 对每个词表项的 `q_i log(q_i / p_i)` 做上界截断，epsilon=`1e-7` |
 | TRA | 8 | 拟合停止梯度的 `r ∝ p × (p/q)^n × 1[p ≥ 0.01 p_max]`，默认 `n=1` |
 
@@ -36,11 +36,11 @@ Qwen3、Qwen3.5、Gemma4 使用 No thinking；DeepSeek Distill 使用其原生�
 
 ## 27 份配置
 
-| 模型 / SwanLab group | FKL · 4 GPU | Clip-OPSD · 4/8 GPU | TRA · 8 GPU |
+| 模型 / SwanLab group | FKL · 4/8 GPU | Clip-OPSD · 4/8 GPU | TRA · 8 GPU |
 | --- | --- | --- | --- |
 | Qwen3-1.7B | [配置](../configs/training/fkl/qwen3_1p7b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/qwen3_1p7b_100steps_4GPU.yaml) | [配置](../configs/training/tra/qwen3_1p7b_100steps_8GPU.yaml) |
-| Qwen3-4B | [配置](../configs/training/fkl/qwen3_4b_100steps_4GPU.yaml) | [8 卡配置](../configs/training/clip_opsd/qwen3_4b_100steps_8GPU.yaml) | [配置](../configs/training/tra/qwen3_4b_100steps_8GPU.yaml) |
-| Qwen3-8B | [配置](../configs/training/fkl/qwen3_8b_100steps_4GPU.yaml) | [8 卡配置](../configs/training/clip_opsd/qwen3_8b_100steps_8GPU.yaml) | [配置](../configs/training/tra/qwen3_8b_100steps_8GPU.yaml) |
+| Qwen3-4B | [8 卡配置](../configs/training/fkl/qwen3_4b_100steps_8GPU.yaml) | [8 卡配置](../configs/training/clip_opsd/qwen3_4b_100steps_8GPU.yaml) | [配置](../configs/training/tra/qwen3_4b_100steps_8GPU.yaml) |
+| Qwen3-8B | [8 卡配置](../configs/training/fkl/qwen3_8b_100steps_8GPU.yaml) | [8 卡配置](../configs/training/clip_opsd/qwen3_8b_100steps_8GPU.yaml) | [配置](../configs/training/tra/qwen3_8b_100steps_8GPU.yaml) |
 | Qwen3.5-4B | [配置](../configs/training/fkl/qwen3_5_4b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/qwen3_5_4b_100steps_4GPU.yaml) | [配置](../configs/training/tra/qwen3_5_4b_100steps_8GPU.yaml) |
 | Qwen3.5-2B | [配置](../configs/training/fkl/qwen3_5_2b_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/qwen3_5_2b_100steps_4GPU.yaml) | [配置](../configs/training/tra/qwen3_5_2b_100steps_8GPU.yaml) |
 | Gemma4-E2B-it | [配置](../configs/training/fkl/gemma4_e2b_it_100steps_4GPU.yaml) | [配置](../configs/training/clip_opsd/gemma4_e2b_it_100steps_4GPU.yaml) | [配置](../configs/training/tra/gemma4_e2b_it_100steps_8GPU.yaml) |
