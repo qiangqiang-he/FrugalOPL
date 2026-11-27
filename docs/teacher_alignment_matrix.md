@@ -120,6 +120,16 @@ Qwen3-4B、8B 各补齐 n=0.1 八卡配置；既有 n=0.2 配置继续使用：
 
 2026-11-27：新增两组通过 227 项 WSL CPU 检查及各 2 次真实双卡更新、短评测；共卡教师保持冻结，196 个学生 LoRA 层均更新，CUDA Graph 和评测预取屏障通过。临时检查点已清理，双卡已释放；正式八卡实验待用户部署。
 
+新增三组八卡 Thinking TRA，沿用同题 solution one-shot、n=0.1，设置 loss alpha=0.1、整体梯度裁剪 0.05。学生、特权教师和评测均为 Thinking，其他设置保持 100 steps、batch 32×8、训练 8192／评测 32768、AMC23 和 AIME24 Avg@16，LoRA r=64／alpha=128。
+
+| 模型 | Thinking、alpha=0.1、grad clip=0.05 八卡配置 | 清单编号／状态 |
+| --- | --- | --- |
+| Qwen3-1.7B | [配置](../configs/training/tra/qwen3_1p7b_thinking_n0p1_alpha0p1_100steps_8GPU.yaml) | 40／待运行 |
+| Qwen3-4B | [配置](../configs/training/tra/qwen3_4b_thinking_n0p1_alpha0p1_100steps_8GPU.yaml) | 41／待运行 |
+| Qwen3-8B | [配置](../configs/training/tra/qwen3_8b_thinking_n0p1_alpha0p1_100steps_8GPU.yaml) | 42／待运行 |
+
+验证：145 项 WSL CPU 检查通过；1.7B 完成原生 Thinking 的双卡 2 次实际更新及短评测，覆盖三种提示角色、196 个 LoRA 层、CUDA Graph 和预取屏障。4B、8B 完成配置与 CPU 链路检查。正式八卡三组均待运行；临时检查点已清理，双卡已释放。
+
 ## 正式服务器启动：无 tmux
 
 先激活训练环境。模型路径通过环境变量覆盖 YAML 的 Hugging Face 名称；SwanLab 凭据文件位于仓库外。

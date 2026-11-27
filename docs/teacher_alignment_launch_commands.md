@@ -2,7 +2,7 @@
 
 当前启动优先级以 [实验优先级与启动清单](实验优先级与启动清单.md) 为准：第一阶段仅运行 Qwen3-1.7B、Qwen3-4B、Qwen3-8B 的九组主实验，新增的 8B 和答案不匹配配置也在该清单中。以下仅列出这三个模型的启动配置。
 
-分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**；基础 Teacher reverse align（TRA）使用 **8 卡**。Qwen3-1.7B 的 n=0.2 指数对照使用 **4 卡**；所有 n=0.05、Qwen3-1.7B 的 n=0.1／0.3 以及 Qwen3-4B、8B 的 n=0.1／0.2 使用 **8 卡**。新增三组 TRA alpha=0.5、n=0.1 也均为 **8 卡**。正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照、10 个指数对照、3 个损失系数对照、2 个四卡空答案对照、3 个 standard_OPSD（1.7B 四卡、4B／8B 八卡）、3 个八卡 standard_FKL，以及 2 个八卡外部 Qwen3-4B-Instruct-2507 教师对照（编号 38、39）。
+分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**；基础 Teacher reverse align（TRA）使用 **8 卡**。Qwen3-1.7B 的 n=0.2 指数对照使用 **4 卡**；所有 n=0.05、Qwen3-1.7B 的 n=0.1／0.3 以及 Qwen3-4B、8B 的 n=0.1／0.2 使用 **8 卡**。新增三组 TRA alpha=0.5、n=0.1 也均为 **8 卡**。正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照、10 个指数对照、3 个损失系数对照、2 个四卡空答案对照、3 个 standard_OPSD（1.7B 四卡、4B／8B 八卡）、3 个八卡 standard_FKL，以及 2 个八卡外部 Qwen3-4B-Instruct-2507 教师对照（编号 38、39），以及 3 个八卡 Thinking TRA 对照（编号 40–42）。
 
 所有配置默认训练 100 次更新，全局 batch 为 32 题 × 每题 8 个回复，训练生成上限 8192；初始及每 10 步依次评测 AMC23、AIME24，Avg@16，生成上限 32768。LoRA r=64、alpha=128，分布损失使用 Student top-512。
 
@@ -18,7 +18,7 @@ SDK 的终端采集、运行环境、主机信息、Git、依赖快照和 SwanLa
 - `tra_self_shot_Qwen3-1.7B_no-thinking_100steps_8gpus`
 - `TRA_Qwen3-8B_no-thinking_100steps_8gpus`
 
-当前三个 Qwen3 模型均为 No thinking。若修改 `algorithm.enable_thinking: true`，SwanLab 名称会自动改为 `thinking`。
+基础配置为 No thinking；新增编号 40–42 明确启用 Thinking，学生、特权教师与评测共用 `algorithm.enable_thinking: true`，SwanLab run 名含 `thinking`。
 
 ## 公共环境变量
 
@@ -296,6 +296,35 @@ bash scripts/start_train.sh --no-tmux configs/training/external_opd/qwen3_1p7b_t
 ```
 
 切回普通自蒸馏配置前执行 `unset FRUGALOPL_TEACHER_MODEL_PATH`，避免误用外部教师路径。
+
+## 三个模型：八卡 Thinking TRA，alpha=0.1、n=0.1（40–42）
+
+均为同题 solution one-shot，学生／教师／评测全部 Thinking。设置 `tra_loss_alpha=0.1`、`clip_grad_norm=0.05`，n 继续为 0.1；LoRA alpha=128。沿用 100 steps、batch 32×8、训练 8192／评测 32768、初始及每 10 步 AMC23、AIME24 Avg@16，其他参数保持不变。
+
+```bash
+unset FRUGALOPL_TEACHER_MODEL_PATH
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
+# 编号 40
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_1p7b_thinking_n0p1_alpha0p1_100steps_8GPU.yaml
+```
+
+```bash
+unset FRUGALOPL_TEACHER_MODEL_PATH
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-4B"
+# 编号 41
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_4b_thinking_n0p1_alpha0p1_100steps_8GPU.yaml
+```
+
+```bash
+unset FRUGALOPL_TEACHER_MODEL_PATH
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-8B"
+# 编号 42
+bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_8b_thinking_n0p1_alpha0p1_100steps_8GPU.yaml
+```
+
+本地双卡验证使用 tmux 和轻量配置：`bash scripts/start_train.sh --tmux tests/configs/tra_thinking/qwen3_1p7b.yaml`。测试配置与结果只保留在本地，不提交 GitHub。
+
+145 项 WSL CPU 检查通过；Qwen3-1.7B 完成双卡 2 次实际更新及短评测，确认训练学生、特权教师和评测均为原生 Thinking 模板，loss 缩放为 0.1 倍，196 个 LoRA 层均更新。4B、8B 完成配置和 CPU 链路检查；正式八卡由用户部署。
 
 ## 双卡验证命令：必须有 tmux
 

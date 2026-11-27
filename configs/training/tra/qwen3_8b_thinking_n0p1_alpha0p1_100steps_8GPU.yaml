@@ -1,0 +1,14 @@
+extends: qwen3_8b_n0p1_100steps_8GPU.yaml
+run:
+  name: tra_self_shot_n0p1_alpha0p1_Qwen3-8B_thinking_100steps_8gpus
+  redis:
+    key_prefix: tra_qwen3_8b_thinking_n0p1_alpha0p1_100steps_8gpu
+learner:
+  execution:
+    clip_grad_norm: 0.05
+  distributed:
+    master_port: 29971
+algorithm:
+  enable_thinking: true
+  tra_ratio_power: 0.1
+  tra_loss_alpha: 0.1
