@@ -420,6 +420,17 @@ def load_merged_config(
     framework = load_yaml_config_tree(framework_config_path)
     algorithm = load_yaml_config_tree(algorithm_config_path) if algorithm_config_path is not None else None
     config = merge_configs(framework, algorithm)
+    teacher_override = os.environ.get('FRUGALOPL_TEACHER_MODEL_PATH')
+    if teacher_override is not None:
+        if not teacher_override.strip():
+            raise ValueError('FRUGALOPL_TEACHER_MODEL_PATH must name an existing local model directory.')
+        external = config.get('learner', {}).get('external_teacher', {})
+        if external.get('enabled') is not True:
+            raise ValueError('FRUGALOPL_TEACHER_MODEL_PATH requires an enabled external Teacher.')
+        teacher_path = Path(teacher_override).expanduser().resolve()
+        if not teacher_path.is_dir():
+            raise FileNotFoundError('FRUGALOPL_TEACHER_MODEL_PATH directory does not exist.')
+        external['model_name_or_path'] = str(teacher_path)
     model_override = os.environ.get("FRUGALOPL_MODEL_PATH")
     if model_override is not None:
         if not model_override.strip():

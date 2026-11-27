@@ -111,6 +111,15 @@ Qwen3-4B、8B 各补齐 n=0.1 八卡配置；既有 n=0.2 配置继续使用：
 | Qwen3-4B | [8 卡配置](../configs/training/standard_fkl/qwen3_4b_100steps_8GPU.yaml) | 28／待运行 |
 | Qwen3-8B | [8 卡配置](../configs/training/standard_fkl/qwen3_8b_100steps_8GPU.yaml) | 29／待运行 |
 
+新增外部冻结教师的两组八卡共卡训练，学生均为 Qwen3-1.7B，教师均为 Qwen3-4B-Instruct-2507，双方 No thinking、无 CLIP FKL。100 steps、batch 32×8、训练 8192／评测 32768、初始及每 10 步 AMC23／AIME24 Avg@16；其余沿用既有 FKL。每张 GPU 部署教师和学生，只训练学生 LoRA。详见 [独立教师实现与启动说明](external_teacher_fkl.md)。
+
+| 教师上下文 | 八卡配置 | 清单编号／状态 |
+| --- | --- | --- |
+| 仅当前题目，无特权 | [FKL_external](../configs/training/external_fkl/qwen3_1p7b_teacher_qwen3_4b_2507_100steps_8GPU.yaml) | 38／待运行 |
+| 同题 solution one-shot | [OPD_external_self_shot](../configs/training/external_opd/qwen3_1p7b_teacher_qwen3_4b_2507_100steps_8GPU.yaml) | 39／待运行 |
+
+2026-11-27：新增两组通过 227 项 WSL CPU 检查及各 2 次真实双卡更新、短评测；共卡教师保持冻结，196 个学生 LoRA 层均更新，CUDA Graph 和评测预取屏障通过。临时检查点已清理，双卡已释放；正式八卡实验待用户部署。
+
 ## 正式服务器启动：无 tmux
 
 先激活训练环境。模型路径通过环境变量覆盖 YAML 的 Hugging Face 名称；SwanLab 凭据文件位于仓库外。

@@ -554,6 +554,11 @@ class Learner:
         self.model_engine: object | None = None
         self.optimizer: object | None = None
         self.lr_scheduler: object | None = None
+        from utils.external_teacher import FrozenExternalTeacher, external_teacher_config
+        external_cfg = external_teacher_config(self.config)
+        controller_data = self.config.get('controller', {}).get('data', {})
+        self.external_teacher = (FrozenExternalTeacher(external_cfg, self.device,
+                                 controller_data.get('max_prompt_length')) if external_cfg else None)
         self.lora_enabled = bool(_mapping(self.policy_cfg.get("lora", {}), "run.policy.lora").get("enabled", False))
         self.offload_frozen_base_between_turns = self.execution_cfg.get("offload_frozen_base_between_turns", False)
         if not isinstance(self.offload_frozen_base_between_turns, bool):
@@ -622,6 +627,8 @@ class Learner:
             raise TypeError("plugin must inherit AlgorithmPlugin.")
         if plugin.requires_frozen_reference and not self.lora_enabled:
             raise ValueError(f"{type(plugin).__name__} requires LoRA to keep its reference Teacher fixed.")
+        if plugin.requires_external_teacher and self.external_teacher is None:
+            raise ValueError('An external-Teacher plugin requires learner.external_teacher.')
         self.plugin = plugin
         self._restore_plugin_training_state()
 
@@ -746,6 +753,8 @@ class Learner:
             self._validate_runtime_memory_after_load()
         if self.cpu_offload or self.offload_frozen_base_between_turns:
             self._offload_model()
+        if self.external_teacher is not None:
+            self.external_teacher.initialize(self.tokenizer, self._module())
         self._initialized = True
 
     @staticmethod
@@ -1871,6 +1880,10 @@ class Learner:
                     for key, value in zip(keys, values, strict=True)}
         finally:
             module.train(prior_training)
+
+    def _plugin_compute_external_forward_kl(self, batch, *, teacher_messages, temperature=1.0):
+        from engine.external_distillation import external_forward_kl
+        return external_forward_kl(self, batch, teacher_messages=teacher_messages, temperature=temperature)
 
     def _plugin_compute_rado(self, batch, *, teacher_prompts, eta, scoring_only=False):
         from utils.rado import RADO_KEYS, rado_token_values
@@ -3644,6 +3657,8 @@ class Learner:
     def close(self) -> None:
         """Release model references on a worker retry or controlled shutdown."""
 
+        if self.external_teacher is not None:
+            self.external_teacher.close()
         self.model_engine = None
         self.optimizer = None
         self.lr_scheduler = None

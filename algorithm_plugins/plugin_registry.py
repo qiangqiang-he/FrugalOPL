@@ -146,6 +146,12 @@ def plugin_factory_from_config(config: Mapping[str, object]) -> ConfiguredPlugin
         raise TypeError("config must be a mapping.")
     plugin_name = _configured_plugin_name(config)
     plugin_class = plugin_class_from_name(plugin_name)
+    from utils.external_teacher import external_teacher_config
+    external = external_teacher_config(config)
+    if plugin_class.requires_external_teacher and external is None:
+        raise ValueError(f'{plugin_name} requires learner.external_teacher.enabled=true.')
+    if external is not None and not plugin_class.requires_external_teacher:
+        raise ValueError('learner.external_teacher may only be used by an external-Teacher plugin.')
     if plugin_class.requires_frozen_reference:
         run = config.get("run", {})
         policy = run.get("policy", {}) if isinstance(run, Mapping) else {}

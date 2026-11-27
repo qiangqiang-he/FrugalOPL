@@ -2,7 +2,7 @@
 
 当前启动优先级以 [实验优先级与启动清单](实验优先级与启动清单.md) 为准：第一阶段仅运行 Qwen3-1.7B、Qwen3-4B、Qwen3-8B 的九组主实验，新增的 8B 和答案不匹配配置也在该清单中。以下仅列出这三个模型的启动配置。
 
-分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**；基础 Teacher reverse align（TRA）使用 **8 卡**。Qwen3-1.7B 的 n=0.2 指数对照使用 **4 卡**；所有 n=0.05、Qwen3-1.7B 的 n=0.1／0.3 以及 Qwen3-4B、8B 的 n=0.1／0.2 使用 **8 卡**。新增三组 TRA alpha=0.5、n=0.1 也均为 **8 卡**。正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照、10 个指数对照、3 个损失系数对照、2 个四卡空答案对照、3 个 standard_OPSD（1.7B 四卡、4B／8B 八卡）及 3 个八卡 standard_FKL 实验。
+分支：`TCPO_v1`。FKL、Clip-OPSD 的 Qwen3-4B、Qwen3-8B 使用 **8 卡**、Qwen3-1.7B 使用 **4 卡**；基础 Teacher reverse align（TRA）使用 **8 卡**。Qwen3-1.7B 的 n=0.2 指数对照使用 **4 卡**；所有 n=0.05、Qwen3-1.7B 的 n=0.1／0.3 以及 Qwen3-4B、8B 的 n=0.1／0.2 使用 **8 卡**。新增三组 TRA alpha=0.5、n=0.1 也均为 **8 卡**。正式服务器均通过 `--no-tmux` 在前台启动。以下包含 9 个基础实验、4 个 TRA 特权对照、10 个指数对照、3 个损失系数对照、2 个四卡空答案对照、3 个 standard_OPSD（1.7B 四卡、4B／8B 八卡）、3 个八卡 standard_FKL，以及 2 个八卡外部 Qwen3-4B-Instruct-2507 教师对照（编号 38、39）。
 
 所有配置默认训练 100 次更新，全局 batch 为 32 题 × 每题 8 个回复，训练生成上限 8192；初始及每 10 步依次评测 AMC23、AIME24，Avg@16，生成上限 32768。LoRA r=64、alpha=128，分布损失使用 Student top-512。
 
@@ -276,6 +276,26 @@ export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-8B"
 # 编号 37
 bash scripts/start_train.sh --no-tmux configs/training/tra/qwen3_8b_n0p1_alpha0p5_100steps_8GPU.yaml
 ```
+
+## 外部 4B 教师 → 1.7B 学生，八卡共卡（38–39）
+
+双方 No thinking，教师冻结，Student top-512、无 CLIP Forward KL；100 steps，batch 32×8，训练 8192／AMC23、AIME24 评测 32768 Avg@16。两组独立启动。每个 GPU 都部署教师和学生，只有学生 LoRA 更新。详见 [说明与验证](external_teacher_fkl.md)。
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
+export FRUGALOPL_TEACHER_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-4B-Instruct-2507"
+# 编号 38：无特权，双方只看题目
+bash scripts/start_train.sh --no-tmux configs/training/external_fkl/qwen3_1p7b_teacher_qwen3_4b_2507_100steps_8GPU.yaml
+```
+
+```bash
+export FRUGALOPL_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-1.7B"
+export FRUGALOPL_TEACHER_MODEL_PATH="${FRUGALOPL_MODELS_ROOT}/Qwen3-4B-Instruct-2507"
+# 编号 39：教师额外接受同题 solution one-shot
+bash scripts/start_train.sh --no-tmux configs/training/external_opd/qwen3_1p7b_teacher_qwen3_4b_2507_100steps_8GPU.yaml
+```
+
+切回普通自蒸馏配置前执行 `unset FRUGALOPL_TEACHER_MODEL_PATH`，避免误用外部教师路径。
 
 ## 双卡验证命令：必须有 tmux
 

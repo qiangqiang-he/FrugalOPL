@@ -1,0 +1,10 @@
+extends:
+  - ../../common/external_fkl_8GPU.yaml
+  - ../../models/qwen3_1p7b.yaml
+run:
+  name: FKL_external_Qwen3-1.7B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: fkl_external_qwen3_1p7b_teacher_4b_2507_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29965

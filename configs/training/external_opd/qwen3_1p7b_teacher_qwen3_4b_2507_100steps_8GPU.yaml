@@ -1,0 +1,14 @@
+extends:
+  - ../../common/external_fkl_8GPU.yaml
+  - ../../models/qwen3_1p7b.yaml
+run:
+  name: OPD_external_self_shot_Qwen3-1.7B_no-thinking_100steps_8gpus
+  redis:
+    key_prefix: opd_external_qwen3_1p7b_teacher_4b_2507_100steps_8gpu
+learner:
+  distributed:
+    master_port: 29966
+algorithm:
+  plugin: ExternalPrivilegedFKLPlugin
+  algo_name: OPD_external_self_shot
+  self_shot_format: conversation

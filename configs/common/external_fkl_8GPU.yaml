@@ -1,0 +1,15 @@
+extends: fkl_8GPU.yaml
+learner:
+  external_teacher:
+    enabled: true
+    model_name: Qwen3-4B-Instruct-2507
+    model_name_or_path: Qwen/Qwen3-4B-Instruct-2507
+    dtype: bfloat16
+    trust_remote_code: false
+    enable_thinking: false
+algorithm:
+  plugin: ExternalFKLPlugin
+  algo_name: FKL_external
+  teacher_model_name: Qwen3-4B-Instruct-2507
+  self_shot_format: null
+  kl_token_clip: null

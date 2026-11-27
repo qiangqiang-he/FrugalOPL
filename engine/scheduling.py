@@ -82,6 +82,7 @@ def resolve_scheduling(config: Mapping[str, object]) -> SchedulingPlan:
         supported = {"KLOPSDPlugin", "SelfShotOPSDPlugin", "RatioOPSDPlugin", "TCAPlugin",
                      "FKLPlugin", "FKLTrueAnswerPlugin", "FKLMismatchedAnswerPlugin", "FKLMatchedAnswerPlugin",
                      "ClipOPSDPlugin", "StandardOPSDPlugin", "StandardFKLPlugin", "TRAPlugin",
+                     "ExternalFKLPlugin", "ExternalPrivilegedFKLPlugin",
                      "TRASelfShotPlugin", "TRARandomShotPlugin", "TRATrueAnswerPlugin", "TRAMismatchedAnswerPlugin",
                      "TRAMatchedAnswerPlugin", "TRAMismatchedSolutionPlugin",
                      "TCPOV1Plugin", "TCDOPlugin", "RewardGuidedOPSDPlugin", "GRPOPlugin"}

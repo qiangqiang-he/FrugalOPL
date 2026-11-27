@@ -143,6 +143,11 @@ class _PluginRuntime(Protocol):
         plausible_fraction: float, chunk_size: int | None, ratio_power: float = 1.0,
     ) -> Signals: ...
 
+    def _plugin_compute_external_forward_kl(
+        self, batch: Signals, *, teacher_messages: Sequence[Sequence[Mapping[str, str]]],
+        temperature: float = 1.0,
+    ) -> Signals: ...
+
     def _plugin_compute_tcdo(self, batch: Signals, *, teacher_prompts: Sequence[str], state: int,
                              temperature: float, plausible_fraction: float, chunk_size: int | None) -> Signals: ...
 
@@ -211,6 +216,7 @@ class AlgorithmPlugin:
     """
 
     requires_frozen_reference: bool = False
+    requires_external_teacher: bool = False
     computes_actor_question_accuracy: bool = False
 
     @classmethod
@@ -427,6 +433,14 @@ class AlgorithmPlugin:
             dict(batch), teacher_prompts=prompts, temperature=temperature,
             token_clip=token_clip, chunk_size=chunk_size,
         )
+
+    def compute_external_forward_kl(self, batch: Signals, *, teacher_messages, temperature=1.0) -> Signals:
+        """Score a frozen independent Teacher on the same Learner device."""
+        scope = _ACTIVE_PLUGIN_SCOPE.get()
+        if scope is None or scope.worker != 'learner' or scope.phase != 'objective':
+            raise RuntimeError('compute_external_forward_kl() is only available inside a Learner objective.')
+        return scope.runtime._plugin_compute_external_forward_kl(
+            dict(batch), teacher_messages=teacher_messages, temperature=temperature)
 
     def compute_ratio_kl(
         self, batch: Signals, *, teacher_prompts: Sequence[str],
